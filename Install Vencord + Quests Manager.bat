@@ -3,7 +3,6 @@ setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 title Vencord + Quests Manager Installer
 
-REM Do not elevate the whole script - Vencord rule
 net session >nul 2>&1
 if %errorlevel% EQU 0 goto :err_admin
 
@@ -24,7 +23,6 @@ if errorlevel 1 goto :err_winget
 
 goto :step1
 
-REM ============================================================
 :step1
 call :step 1 9 "Checking Node.js ..."
 call :refresh_path
@@ -46,7 +44,6 @@ if errorlevel 1 goto :err_node
 for /f "delims=" %%V in ('node --version 2^>nul') do call :ok "Node.js %%V installed"
 goto :step2
 
-REM ============================================================
 :step2
 call :step 2 9 "Checking Git ..."
 call :refresh_path
@@ -68,7 +65,6 @@ if errorlevel 1 goto :err_git
 for /f "tokens=3 delims= " %%V in ('git --version 2^>nul') do call :ok "Git %%V installed"
 goto :step3
 
-REM ============================================================
 :step3
 call :step 3 9 "Checking pnpm ..."
 call :refresh_path
@@ -98,7 +94,6 @@ if errorlevel 1 goto :err_pnpm
 for /f "delims=" %%V in ('pnpm --version 2^>nul') do call :ok "pnpm %%V"
 goto :step4
 
-REM ============================================================
 :step4
 call :step 4 9 "Toolchain ready"
 for /f "delims=" %%V in ('node --version 2^>nul') do call :ok "node %%V"
@@ -107,7 +102,6 @@ for /f "delims=" %%V in ('git --version 2^>nul') do call :ok "%%V"
 echo.
 goto :step5
 
-REM ============================================================
 :step5
 call :step 5 9 "Preparing Vencord source ..."
 if not exist "%USERPROFILE%\Documents" mkdir "%USERPROFILE%\Documents"
@@ -133,7 +127,6 @@ if errorlevel 1 goto :err_clone
 call :ok "Vencord cloned"
 goto :step6
 
-REM ============================================================
 :step6
 call :step 6 9 "Downloading Quests Manager assets ..."
 if exist "%DL_DIR%" rmdir /s /q "%DL_DIR%" >nul 2>&1
@@ -183,7 +176,6 @@ if not exist "%VEN_DIR%\src\userplugins\questsManager\index.tsx" goto :err_plugi
 call :ok "Plugin installed"
 goto :step7
 
-REM ============================================================
 :step7
 call :step 7 9 "Installing dependencies and building ..."
 cd /d "%VEN_DIR%"
@@ -197,7 +189,6 @@ if not exist "%VEN_DIR%\dist\patcher.js" goto :err_patcherjs
 call :ok "Build complete"
 goto :step8
 
-REM ============================================================
 :step8
 call :step 8 9 "Checking existing Vencord patch ..."
 taskkill /f /im Discord.exe >nul 2>&1
@@ -225,7 +216,6 @@ for /d %%D in ("%LOCALAPPDATA%\Discord\app-*") do (
 call :ok "Previous patch removed"
 goto :step9
 
-REM ============================================================
 :step9
 call :step 9 9 "Installing into Discord ..."
 
@@ -268,9 +258,6 @@ call :done
 pause >nul
 exit /b 0
 
-REM ============================================================
-REM Errors
-REM ============================================================
 :err_admin
 echo.
 call :fail "Do not run this script as Administrator. Close this window and double-click the .bat as a normal user."
@@ -313,9 +300,6 @@ call :fail "Patch did not create resources\_app.asar. Close Discord and retry."
 
 goto :eof
 
-REM ============================================================
-REM UI helpers - colors via PowerShell so cmd never parses ESC sequences
-REM ============================================================
 :banner
 echo.
 powershell -NoProfile -Command "Write-Host '============================================================' -ForegroundColor Cyan; Write-Host '        Vencord + Quests Manager Installer' -ForegroundColor Cyan; Write-Host '           Discord Quest Auto Completer setup' -ForegroundColor White; Write-Host '============================================================' -ForegroundColor Cyan"
