@@ -1,0 +1,48 @@
+#dqm-launcher-btn {
+    position: fixed;
+    bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    right: calc(16px + env(safe-area-inset-right, 0px));
+    z-index: 999998;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    font-family: "gg sans", "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    color: #fff;
+    background: var(--dqm-accent, #5865F2);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.08);
+    user-select: none;
+}
+#dqm-launcher-btn:active {
+    background: var(--dqm-accent-hover, #4752c4);
+    transform: scale(0.98);
+}
+@media (hover: hover) {
+    #dqm-launcher-btn:hover {
+        background: var(--dqm-accent-hover, #4752c4);
+    }
+}
+@media (max-width: 768px) {
+    #dqm-gui {
+        top: 60px !important;
+        left: 8px !important;
+        right: 8px !important;
+        width: calc(100vw - 16px) !important;
+        min-width: unset !important;
+        height: calc(100dvh - 100px) !important;
+        max-height: calc(100dvh - 60px);
+        resize: none;
+    }
+    #dqm-launcher-btn {
+        bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+        right: calc(12px + env(safe-area-inset-right, 0px));
+        font-size: 13px;
+        padding: 12px 14px;
+    }
+}

@@ -1,0 +1,5228 @@
+// ==UserScript==
+// @name         Quests Manager
+// @namespace    https://discord.gg/btRCeujadA
+// @version      1.0.0
+// @description  Discord Quest Auto Completer — rework by X2 Salah
+// @author       X2 Salah
+// @match        https://discord.com/*
+// @match        https://canary.discord.com/*
+// @match        https://ptb.discord.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+//
+// Mobile: video/watch quests work; Launch Quest (CDP) and play/stream need desktop Discord.
+
+(function() {
+"use strict";
+/*
+ * Quests Manager console runtime — webpack shim, CDP activity bridge, CSS injection.
+ * Bundled into Quests Manager.txt by build-console-script.mjs
+ */
+
+const STORAGE_CDP_PORT_KEY = "questHelper_cdpPort";
+const DEFAULT_CDP_PORT = 9223;
+const API_VALIDATE_TIMEOUT_MS = 5000;
+
+let _discordModules = null;
+
+function getWpRequire() {
+    try {
+        if (typeof webpackChunkdiscord_app === "undefined") return null;
+        const req = webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
+        webpackChunkdiscord_app.pop();
+        return req;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function validateRestApi(api) {
+    try {
+        const res = await Promise.race([
+            api.get({ url: "/quests/@me" }),
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("timeout")), API_VALIDATE_TIMEOUT_MS)
+            ),
+        ]);
+        if (!res || typeof res !== "object") return false;
+        if (res.locale != null || res.ast !== undefined) return false;
+        const body = res.body;
+        if (typeof body === "string" && /^\s*</.test(body)) return false;
+        return body != null && (
+            Array.isArray(body) ||
+            Array.isArray(body?.quests) ||
+            typeof body === "object"
+        );
+    } catch (_) {
+        return false;
+    }
+}
+
+async function initializeDiscordModules() {
+    const empty = {
+        QuestsStore: null,
+        RunningGameStore: null,
+        ApplicationStreamingStore: null,
+        ChannelStore: null,
+        GuildChannelStore: null,
+        FluxDispatcher: null,
+        api: null,
+    };
+
+    try {
+        const wpRequire = getWpRequire();
+        if (!wpRequire?.c) {
+            return { ok: false, missing: ["webpackChunkdiscord_app"] };
+        }
+
+        const modules = { ...empty };
+        const apiCandidates = [];
+        const apiSeen = new Set();
+
+        for (const m of Object.values(wpRequire.c)) {
+            try {
+                const exp = m?.exports;
+                if (!exp) continue;
+
+                for (const key of Object.keys(exp)) {
+                    try {
+                        const val = exp[key];
+                        if (!val) continue;
+
+                        if (!modules.FluxDispatcher && val?.__proto__?.flushWaitQueue) {
+                            modules.FluxDispatcher = val;
+                        }
+
+                        if (!modules.ApplicationStreamingStore && val?.__proto__?.getStreamerActiveStreamMetadata) {
+                            modules.ApplicationStreamingStore = val;
+                        }
+
+                        if (!modules.RunningGameStore && typeof val?.getRunningGames === "function") {
+                            try {
+                                const games = val.getRunningGames();
+                                if (Array.isArray(games)) {
+                                    modules.RunningGameStore = val;
+                                }
+                            } catch (_) {}
+                        }
+
+                        if (!modules.QuestsStore && val?.__proto__?.getQuest) {
+                            modules.QuestsStore = val;
+                        }
+
+                        if (!modules.ChannelStore && typeof val?.getChannel === "function" && val?.__proto__?.getChannel) {
+                            modules.ChannelStore = val;
+                        }
+
+                        if (!modules.GuildChannelStore && typeof val?.getGuild === "function" && val?.__proto__?.getGuild) {
+                            modules.GuildChannelStore = val;
+                        }
+
+                        if (typeof val?.get === "function" && typeof val?.post === "function") {
+                            if (apiSeen.has(val)) continue;
+                            apiSeen.add(val);
+                            apiCandidates.push(val);
+                        }
+                    } catch (_) {}
+                }
+            } catch (_) {}
+        }
+
+        const swallowInitRejections = (e) => e.preventDefault();
+        window.addEventListener("unhandledrejection", swallowInitRejections);
+        try {
+            for (const candidate of apiCandidates) {
+                if (await validateRestApi(candidate)) {
+                    modules.api = candidate;
+                    break;
+                }
+            }
+        } finally {
+            window.removeEventListener("unhandledrejection", swallowInitRejections);
+        }
+
+        const required = ["QuestsStore", "api", "FluxDispatcher"];
+        const missing = required.filter(name => !modules[name]);
+
+        _discordModules = modules;
+        return { ok: missing.length === 0, missing, modules };
+    } catch (e) {
+        return { ok: false, missing: [String(e?.message || e)] };
+    }
+}
+
+function resolveStores() {
+    const m = _discordModules ?? {
+        QuestsStore: null,
+        RunningGameStore: null,
+        ApplicationStreamingStore: null,
+        ChannelStore: null,
+        GuildChannelStore: null,
+        FluxDispatcher: null,
+        api: null,
+    };
+    return {
+        QuestsStore: m.QuestsStore,
+        RunningGameStore: m.RunningGameStore,
+        ApplicationStreamingStore: m.ApplicationStreamingStore,
+        ChannelStore: m.ChannelStore,
+        GuildChannelStore: m.GuildChannelStore,
+        FluxDispatcher: m.FluxDispatcher,
+        api: m.api,
+    };
+}
+
+function getCdpPort() {
+    try {
+        const saved = localStorage.getItem(STORAGE_CDP_PORT_KEY);
+        const parsed = Number.parseInt(String(saved), 10);
+        if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) return parsed;
+    } catch (_) {}
+    return DEFAULT_CDP_PORT;
+}
+
+function extractApplicationIdFromUrl(url) {
+    try {
+        const parsed = new URL(url);
+        const host = parsed.hostname;
+        const suffix = ".discordsays.com";
+        if (host.endsWith(suffix) && host !== "discordsays.com") {
+            const appId = host.slice(0, -suffix.length);
+            if (appId) return appId;
+        }
+        const fromQuery = parsed.searchParams.get("application_id")
+            || parsed.searchParams.get("applicationId");
+        if (fromQuery) return fromQuery;
+        const pathMatch = parsed.pathname.match(/\/(\d{17,20})(?:\/|$)/);
+        if (pathMatch) return pathMatch[1];
+    } catch (_) {}
+    return null;
+}
+
+function isActivityTarget(target) {
+    const url = target?.url || "";
+    return url.includes("discordsays.com");
+}
+
+function targetMatchesApplication(target, applicationId) {
+    if (!isActivityTarget(target)) return false;
+    const url = target.url || "";
+    if (extractApplicationIdFromUrl(url) === String(applicationId)) return true;
+    return url.includes(String(applicationId));
+}
+
+async function fetchCdpTargets() {
+    const port = getCdpPort();
+    const res = await fetch(`http://127.0.0.1:${port}/json`);
+    if (!res.ok) throw new Error(`CDP HTTP ${res.status}`);
+    return await res.json();
+}
+
+async function findActivityCdpTarget(applicationId) {
+    const targets = await fetchCdpTargets();
+    const activityTargets = targets.filter(isActivityTarget);
+    if (!activityTargets.length) return null;
+    if (applicationId) {
+        const matched = activityTargets.filter(t => targetMatchesApplication(t, applicationId));
+        if (matched.length) return matched[matched.length - 1];
+        return null;
+    }
+    return activityTargets[activityTargets.length - 1];
+}
+
+async function cdpEvaluateOnTarget(wsUrl, jsCode, awaitPromise = true, timeoutMs = 20000) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (fn, arg) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try { ws.close(); } catch (_) {}
+            fn(arg);
+        };
+        let ws;
+        const timer = setTimeout(() => finish(reject, new Error("CDP evaluate timed out")), timeoutMs);
+        try {
+            ws = new WebSocket(wsUrl);
+        } catch (e) {
+            finish(reject, new Error("CDP WebSocket failed: " + (e?.message || e)));
+            return;
+        }
+        ws.onopen = () => {
+            ws.send(JSON.stringify({
+                id: 1,
+                method: "Runtime.evaluate",
+                params: {
+                    expression: jsCode,
+                    returnByValue: true,
+                    awaitPromise: !!awaitPromise
+                }
+            }));
+        };
+        ws.onmessage = (ev) => {
+            let json;
+            try { json = JSON.parse(ev.data); } catch (_) { return; }
+            if (json.id !== 1) return;
+            if (json.error) {
+                finish(reject, new Error(json.error.message || "CDP error"));
+                return;
+            }
+            if (json.result?.exceptionDetails) {
+                const text = json.result.exceptionDetails.text || "JavaScript exception";
+                finish(reject, new Error(text));
+                return;
+            }
+            const val = json.result?.result?.value;
+            if (typeof val === "string") finish(resolve, val);
+            else if (val != null) finish(resolve, JSON.stringify(val));
+            else finish(resolve, null);
+        };
+        ws.onerror = () => finish(reject, new Error("CDP WebSocket error"));
+    });
+}
+
+let _cdpReachableCache = { at: 0, value: null };
+
+async function probeCdpReachable() {
+    if (Date.now() - _cdpReachableCache.at < 8000 && _cdpReachableCache.value != null) {
+        return _cdpReachableCache.value;
+    }
+    try {
+        await fetchCdpTargets();
+        _cdpReachableCache = { at: Date.now(), value: true };
+        return true;
+    } catch (_) {
+        _cdpReachableCache = { at: Date.now(), value: false };
+        return false;
+    }
+}
+
+const CDP_SETUP_MESSAGE = "Launch Quest requires Discord started with --remote-debugging-port="
+    + DEFAULT_CDP_PORT + " (or set localStorage questHelper_cdpPort).";
+
+function getNative() {
+    return {
+        async hasActivityFrame(applicationId) {
+            try {
+                return !!(await findActivityCdpTarget(applicationId));
+            } catch (_) {
+                return false;
+            }
+        },
+        async execInActivityFrame(applicationId, jsCode) {
+            const reachable = await probeCdpReachable();
+            if (!reachable) return null;
+            const target = await findActivityCdpTarget(applicationId);
+            if (!target?.webSocketDebuggerUrl) return null;
+            return await cdpEvaluateOnTarget(target.webSocketDebuggerUrl, jsCode, true, 25000);
+        }
+    };
+}
+
+function injectDqmStyles(cssText) {
+    const id = "dqm-styles";
+    let el = document.getElementById(id);
+    if (!el) {
+        el = document.createElement("style");
+        el.id = id;
+        document.head.appendChild(el);
+    }
+    el.textContent = cssText;
+}
+
+
+/*
+ * Tampermonkey bootstrap — launcher button, Discord readiness, SPA persistence.
+ * Bundled into Quests Manager.user.js by build-console-script.mjs
+ */
+
+const LAUNCHER_ID = "dqm-launcher-btn";
+const DISCORD_READY_TIMEOUT_MS = 120000;
+const DISCORD_READY_POLL_MS = 500;
+
+let _modulesReady = false;
+let _modulesInitPromise = null;
+
+function waitForDiscordReady() {
+    return new Promise((resolve) => {
+        const start = Date.now();
+        const check = () => {
+            if (typeof webpackChunkdiscord_app !== "undefined") {
+                resolve(true);
+                return;
+            }
+            if (Date.now() - start >= DISCORD_READY_TIMEOUT_MS) {
+                console.warn("[Quests Manager] Timed out waiting for Discord webpack. Launcher shown; click to retry.");
+                resolve(false);
+                return;
+            }
+            setTimeout(check, DISCORD_READY_POLL_MS);
+        };
+        check();
+    });
+}
+
+async function ensureQuestsManagerReady() {
+    if (_modulesReady && globalThis.QuestsManager) return true;
+
+    if (!_modulesInitPromise) {
+        _modulesInitPromise = (async () => {
+            const { ok, missing } = await initializeDiscordModules();
+            if (!ok) {
+                console.error("[Quests Manager] Failed to resolve Discord modules:", missing.join(", "));
+                _modulesInitPromise = null;
+                return false;
+            }
+            globalThis.QuestsManager = {
+                mount: mountQuestsManager,
+                unmount: unmountQuestsManager,
+                toggle: toggleQuestsManager,
+                open: isQuestsManagerOpen
+            };
+            _modulesReady = true;
+            return true;
+        })();
+    }
+
+    return _modulesInitPromise;
+}
+
+async function onLauncherActivate(event) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    const ready = await ensureQuestsManagerReady();
+    if (!ready) return;
+    globalThis.QuestsManager.toggle();
+}
+
+function injectLauncherButton() {
+    if (document.getElementById(LAUNCHER_ID)) return;
+
+    const btn = document.createElement("button");
+    btn.id = LAUNCHER_ID;
+    btn.type = "button";
+    btn.textContent = "Quests Manager";
+    btn.setAttribute("aria-label", "Quests Manager");
+    btn.addEventListener("click", onLauncherActivate);
+
+    (document.body || document.documentElement).appendChild(btn);
+}
+
+function setupLauncherPersistence() {
+    const ensure = () => {
+        if (!document.getElementById(LAUNCHER_ID)) injectLauncherButton();
+    };
+
+    window.addEventListener("popstate", ensure);
+
+    const observer = new MutationObserver(() => ensure());
+    const root = document.body || document.documentElement;
+    if (root) {
+        observer.observe(root, { childList: true, subtree: true });
+    }
+}
+
+
+globalThis.__DQM_REGIONS_SNAPSHOT = {"1545205635577290893":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1546582362035453952":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1545511262308278434":{"isGlobal":false,"include":["JP"],"exclude":[],"mode":"include","primary":"JP","extra":0,"code":"JP"},"1545514693555392603":{"isGlobal":false,"include":["KR"],"exclude":[],"mode":"include","primary":"KR","extra":0,"code":"KR"},"1545515895353385011":{"isGlobal":false,"include":[],"exclude":["KR","JP"],"mode":"exclude","primary":"","extra":0,"code":""},"1547328231630446672":{"isGlobal":false,"include":["BR"],"exclude":[],"mode":"include","primary":"BR","extra":0,"code":"BR"},"1547321906695372921":{"isGlobal":false,"include":["ES"],"exclude":[],"mode":"include","primary":"ES","extra":0,"code":"ES"},"1547326208948052060":{"isGlobal":false,"include":["IT"],"exclude":[],"mode":"include","primary":"IT","extra":0,"code":"IT"},"1547334999844323390":{"isGlobal":false,"include":["PH"],"exclude":[],"mode":"include","primary":"PH","extra":0,"code":"PH"},"1547330988177236008":{"isGlobal":false,"include":["KR"],"exclude":[],"mode":"include","primary":"KR","extra":0,"code":"KR"},"1546355323118420009":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1547693277430423594":{"isGlobal":false,"include":["IN"],"exclude":[],"mode":"include","primary":"IN","extra":0,"code":"IN"},"1547688577440157808":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1547667360964542526":{"isGlobal":false,"include":["ES"],"exclude":[],"mode":"include","primary":"ES","extra":0,"code":"ES"},"1544785839341445243":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1540111729902751795":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1544804366295375903":{"isGlobal":false,"include":["AE"],"exclude":[],"mode":"include","primary":"AE","extra":0,"code":"AE"},"1547366212022046751":{"isGlobal":false,"include":["IT"],"exclude":[],"mode":"include","primary":"IT","extra":0,"code":"IT"},"1544810991022374933":{"isGlobal":false,"include":["SA"],"exclude":[],"mode":"include","primary":"SA","extra":0,"code":"SA"},"1546343004569084006":{"isGlobal":false,"include":["HK"],"exclude":[],"mode":"include","primary":"HK","extra":0,"code":"HK"},"1545075418489553016":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1547289460910329926":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1544779869295091763":{"isGlobal":false,"include":["MX"],"exclude":[],"mode":"include","primary":"MX","extra":0,"code":"MX"},"1544433774492655637":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1544804322213232822":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1544412209935814758":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1544426987215527988":{"isGlobal":false,"include":["MX"],"exclude":[],"mode":"include","primary":"MX","extra":0,"code":"MX"},"1544416823662088333":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1541517876953878650":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1542927566568956095":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1539692903037796422":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1541855122747953324":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1544127680528781423":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1544130689316691989":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1536465227946926190":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1537932527795183658":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1534598499134472324":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1542308634728464455":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1541514077845717034":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1539402909740044360":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1540124165225324656":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1539057611297792060":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1516889218218197062":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1539267237561503815":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1540036377146556556":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1539407814785499267":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1541360124457779283":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1541369647985594369":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1541366408632475670":{"isGlobal":false,"include":["FR"],"exclude":[],"mode":"include","primary":"FR","extra":0,"code":"FR"},"1541363735791280209":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1539708932245692476":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1542164786190622741":{"isGlobal":false,"include":["JP"],"exclude":[],"mode":"include","primary":"JP","extra":0,"code":"JP"},"1537189839588294657":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1540487682805731389":{"isGlobal":false,"include":[],"exclude":["AU","GB"],"mode":"exclude","primary":"","extra":0,"code":""},"1537900603328434257":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1540491844360736810":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1540493527136342047":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1539533765070553089":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1539528344608182353":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1532567061241528410":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1540167642952761424":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1540204098790494268":{"isGlobal":false,"include":["US","GB","CA"],"exclude":[],"mode":"include","primary":"US","extra":2,"code":"US"},"1537145020958900394":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1537161325170532412":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1535350172480053308":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1539838784705798294":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1534593692739043348":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1529450273515245618":{"isGlobal":false,"include":["FR"],"exclude":[],"mode":"include","primary":"FR","extra":0,"code":"FR"},"1539602832150364182":{"isGlobal":false,"include":["ES"],"exclude":[],"mode":"include","primary":"ES","extra":0,"code":"ES"},"1535352137792487624":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1537137394975772693":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1534613925767676096":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1532794643526193372":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1537163738577117337":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1535343840557539408":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1538813720396955708":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1537517701982064721":{"isGlobal":false,"include":["AU","FR"],"exclude":[],"mode":"include","primary":"AU","extra":1,"code":"AU"},"1529174839141597276":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1536670919660142672":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1536472460059349192":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1534276813554061433":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1516888752536948938":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1533946165811351723":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1532175086281424976":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1532150126540361938":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1523842681770475550":{"isGlobal":false,"include":["US","GB","AU","FR","DE"],"exclude":[],"mode":"include","primary":"US","extra":4,"code":"US"},"1521297240402956400":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1532531590243287131":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1522414544247591072":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1531766277742264513":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1527723974925090826":{"isGlobal":false,"include":["FR"],"exclude":[],"mode":"include","primary":"FR","extra":0,"code":"FR"},"1531312585922707571":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1529066589305966662":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1530231567459287251":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1528874818114420746":{"isGlobal":false,"include":["JP"],"exclude":[],"mode":"include","primary":"JP","extra":0,"code":"JP"},"1528828032289341562":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1523814132816678983":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1529229208340140092":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1524650868962758696":{"isGlobal":false,"include":["KR"],"exclude":[],"mode":"include","primary":"KR","extra":0,"code":"KR"},"1528852067656007920":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1529230500151955649":{"isGlobal":false,"include":["MX"],"exclude":[],"mode":"include","primary":"MX","extra":0,"code":"MX"},"1529226655300714687":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1529177760612880465":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1528814066599071825":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1527386268546367488":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1525222987165597817":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1527408960137592933":{"isGlobal":false,"include":["DE","FR","GB"],"exclude":[],"mode":"include","primary":"DE","extra":2,"code":"DE"},"1527003925650083910":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1526986140928708638":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1527379212791709878":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1521294642631409845":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1527781624270295223":{"isGlobal":false,"include":["PT"],"exclude":[],"mode":"include","primary":"PT","extra":0,"code":"PT"},"1527788098535030895":{"isGlobal":false,"include":["SG"],"exclude":[],"mode":"include","primary":"SG","extra":0,"code":"SG"},"1527791132938080326":{"isGlobal":false,"include":["MX"],"exclude":[],"mode":"include","primary":"MX","extra":0,"code":"MX"},"1527777102110265364":{"isGlobal":false,"include":["BE"],"exclude":[],"mode":"include","primary":"BE","extra":0,"code":"BE"},"1519693428148015284":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1524064492705681432":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1524071421465333912":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1517297856287997984":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1524205438760128623":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1526313972947488949":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1524983562133307432":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1525240906611949598":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1524110116436185188":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1524060064422432778":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1516884151209427004":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1522398262143746079":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1524491311938273340":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1522097661828927589":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1521556927497375846":{"isGlobal":false,"include":["BR"],"exclude":[],"mode":"include","primary":"BR","extra":0,"code":"BR"},"1524857938517299230":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1523830532302045285":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1521935381434466505":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1521260970586931220":{"isGlobal":false,"include":["ES"],"exclude":[],"mode":"include","primary":"ES","extra":0,"code":"ES"},"1523763717672800276":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1523782263291252816":{"isGlobal":false,"include":["FR"],"exclude":[],"mode":"include","primary":"FR","extra":0,"code":"FR"},"1517649310353719406":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1521343000699994172":{"isGlobal":false,"include":["AT"],"exclude":[],"mode":"include","primary":"AT","extra":0,"code":"AT"},"1521361423765078106":{"isGlobal":false,"include":["NL"],"exclude":[],"mode":"include","primary":"NL","extra":0,"code":"NL"},"1521347425359364106":{"isGlobal":false,"include":["HK"],"exclude":[],"mode":"include","primary":"HK","extra":0,"code":"HK"},"1521363717386928168":{"isGlobal":false,"include":["BE"],"exclude":[],"mode":"include","primary":"BE","extra":0,"code":"BE"},"1521342038828912840":{"isGlobal":false,"include":["IN"],"exclude":[],"mode":"include","primary":"IN","extra":0,"code":"IN"},"1521338347816222911":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1521344353472086097":{"isGlobal":false,"include":["SG"],"exclude":[],"mode":"include","primary":"SG","extra":0,"code":"SG"},"1521348224038994050":{"isGlobal":false,"include":["DK"],"exclude":[],"mode":"include","primary":"DK","extra":0,"code":"DK"},"1521352248033153044":{"isGlobal":false,"include":["FR"],"exclude":[],"mode":"include","primary":"FR","extra":0,"code":"FR"},"1521350413746704535":{"isGlobal":false,"include":["SE"],"exclude":[],"mode":"include","primary":"SE","extra":0,"code":"SE"},"1521362183911506171":{"isGlobal":false,"include":["PL"],"exclude":[],"mode":"include","primary":"PL","extra":0,"code":"PL"},"1521349567696605324":{"isGlobal":false,"include":["CH"],"exclude":[],"mode":"include","primary":"CH","extra":0,"code":"CH"},"1521364362391060580":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1521364963959111860":{"isGlobal":false,"include":["KR"],"exclude":[],"mode":"include","primary":"KR","extra":0,"code":"KR"},"1521353001951039578":{"isGlobal":false,"include":["JP"],"exclude":[],"mode":"include","primary":"JP","extra":0,"code":"JP"},"1521351568933257348":{"isGlobal":false,"include":["ES"],"exclude":[],"mode":"include","primary":"ES","extra":0,"code":"ES"},"1521362926911623298":{"isGlobal":false,"include":["MX"],"exclude":[],"mode":"include","primary":"MX","extra":0,"code":"MX"},"1521359000250220554":{"isGlobal":false,"include":["IT"],"exclude":[],"mode":"include","primary":"IT","extra":0,"code":"IT"},"1521359959730688081":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1521339594166239403":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1521345302236233838":{"isGlobal":false,"include":["BR"],"exclude":[],"mode":"include","primary":"BR","extra":0,"code":"BR"},"1519390085399838740":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1519078661171445771":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1521613302831120536":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1521602598174724137":{"isGlobal":false,"include":["FI"],"exclude":[],"mode":"include","primary":"FI","extra":0,"code":"FI"},"1521652470898757874":{"isGlobal":false,"include":["KR"],"exclude":[],"mode":"include","primary":"KR","extra":0,"code":"KR"},"1521604131435843767":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1521257596403712182":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1517305167756787893":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1515086576235843594":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1518710044856815737":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1521223322346455134":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1520115809693864037":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1515075342941818972":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1520190459530707096":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1517593127303512194":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1520181992006619207":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1520186290597925067":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1518683615360319568":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1519897790417731634":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1519102841594187796":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1519101313168838726":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1518816988942700715":{"isGlobal":false,"include":["AT","BE","BR"],"exclude":["AU","CA","CH","DE","FR","HK","IT","JP","KR","NL","PL","SG","GB","VN"],"mode":"include","primary":"AT","extra":2,"code":"AT"},"1518805059205464125":{"isGlobal":false,"include":["AU","CA","CH","DE","FR","HK","IT","JP","KR","NL","PL","SG","GB","VN"],"exclude":["AT","BE","BR"],"mode":"include","primary":"AU","extra":13,"code":"AU"},"1519050473745682662":{"isGlobal":false,"include":["AT","BE","BR"],"exclude":["AU","CA","CH","DE","FR","HK","IT","JP","KR","NL","PL","SG","GB","VN"],"mode":"include","primary":"AT","extra":2,"code":"AT"},"1517198835024400514":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1516572242660687892":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1517635116254499068":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1517295523512455208":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1516908293681844456":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1516176546988298411":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1516889996525568120":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1516561474498203728":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1516563706262196244":{"isGlobal":false,"include":["MX"],"exclude":[],"mode":"include","primary":"MX","extra":0,"code":"MX"},"1516567810669805718":{"isGlobal":false,"include":["BR"],"exclude":[],"mode":"include","primary":"BR","extra":0,"code":"BR"},"1516569975031333004":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1516570869911126167":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1516565812302057503":{"isGlobal":false,"include":["ES"],"exclude":[],"mode":"include","primary":"ES","extra":0,"code":"ES"},"1516569133238456510":{"isGlobal":false,"include":["IT"],"exclude":[],"mode":"include","primary":"IT","extra":0,"code":"IT"},"1516110246811275284":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1514724833353797733":{"isGlobal":false,"include":["BR"],"exclude":[],"mode":"include","primary":"BR","extra":0,"code":"BR"},"1514718506887676036":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1516006204722122932":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1511835214585008128":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1511347416199336096":{"isGlobal":false,"include":["US","GB"],"exclude":[],"mode":"include","primary":"US","extra":1,"code":"US"},"1514107091491491930":{"isGlobal":false,"include":["DE","HK","CA","AU","CH","FR","GB","IT","JP","KR","NL","PL","SG","VN"],"exclude":["BR","US"],"mode":"include","primary":"DE","extra":13,"code":"DE"},"1514325405803483258":{"isGlobal":false,"include":["BR","US"],"exclude":["DE","HK","CA","AU","CH","FR","GB","IT","JP","KR","NL","PL","SG","VN"],"mode":"include","primary":"BR","extra":1,"code":"BR"},"1513998819908386887":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1509761239226519612":{"isGlobal":false,"include":[],"exclude":["CA"],"mode":"exclude","primary":"","extra":0,"code":""},"1509757944697327706":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1511102193103802548":{"isGlobal":false,"include":[],"exclude":["DE"],"mode":"exclude","primary":"","extra":0,"code":""},"1512312534802108517":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1511370504378908704":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1512541042157682698":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1511110943873171456":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1511153398618132580":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1508905642612625650":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1509314613630603397":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1506578496946962564":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1509770712234066022":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1511089574988873969":{"isGlobal":false,"include":[],"exclude":["BR"],"mode":"exclude","primary":"","extra":0,"code":""},"1511073242142474351":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1508940810387853372":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1511073863214170153":{"isGlobal":false,"include":[],"exclude":["CA","US"],"mode":"exclude","primary":"","extra":0,"code":""},"1507504717528432740":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1506770769999433830":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1506952646613925928":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1486800972150870016":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1506947327024169000":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1509318566103617727":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1504560724574339284":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1504788660673839134":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1508936896972066927":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1504658919157403762":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1507417562055442432":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1504975599389900943":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1507417166549483680":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1507414550088126638":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1507414022511656970":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1507416559763591188":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1507415251908432002":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1507413449393832008":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1507415776620187738":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1504404395624894494":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1504974058511401021":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1506410821838700635":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499938629387030638":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1503853078712156230":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1503878119743029389":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1503493096116326591":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1500986472675672094":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1501983549387968512":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1501986553201954826":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1498445420731437097":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1502102122492071958":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1502164508033155162":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499200708291858492":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499389610009034832":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1499243911531728996":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499240931906551959":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499242205804495041":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499235534411923566":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499240116567281764":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499246075637399552":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499234777952161833":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499239480891019314":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499248423545606304":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499868469930496180":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499247068013789284":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499238238949347448":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499245520336715868":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499237556712374383":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499244476722577508":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499243327046811658":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499242748358688951":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499246595445755914":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499247776582864927":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499230967913644063":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499245042534060192":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499225994798698546":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1499238913951268934":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1498340338211885066":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1486799371478634708":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1496645830361223358":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1491934739605622935":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1496570375306481844":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1496572086049837187":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1496621389275205782":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1496607015856898078":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1494781738923327558":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1496894379804065975":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1494447059980386496":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1493913264050929694":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1496284835436822558":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1492228867836870748":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1488708666533085354":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1489357913633063022":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1491886123969155232":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1487237961253654701":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1486804654976274576":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1488707047598981270":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1486873092692250734":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1486788595154161754":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1488241916586758184":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1488226421137473592":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1486803786054897704":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1487922385007935499":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1483553667750690836":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1483876544622629067":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1484667592487731271":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1481052453335076926":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1484633127614939326":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1483177638242549883":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1449210798336639007":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1449211250973081724":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1445164127202050158":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1445164182034059315":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1448075031556133026":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1440083047205834872":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1471627613574533173":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1481703146219770007":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1482077690449104947":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1481682156442091590":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1479533798306611281":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1478526278440321174":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1479538233627906118":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1479563144895533307":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1479540375348576417":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1474437726668328960":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1479195401532735640":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1479908639048470708":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1478155979362275500":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1476648302115291418":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1475549063108890664":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1463558755621929219":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1476286335697555526":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1471628590096318597":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1463568772538564628":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1440110322147917884":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1440778023438909671":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1445124247273078935":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1450624721040445621":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1450185202675617844":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1450624032323014819":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1450914567172653117":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1450914304231473252":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1450987508581273601":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1445135030124019954":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1452740320717443233":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1450572529465950399":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1450981455332245638":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1458872372676399337":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1458153385391030302":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1460336171178791083":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1460339320714952945":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1458528776060276757":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1458595355766558813":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1461427517775675493":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1461494895163478208":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1464020497141334119":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1467940930215743757":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1465435141861277759":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1471589719186870377":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1468777737341763815":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1473383175639007332":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1469018683555840299":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1473407935970410724":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1470867572370051225":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1469016962607878401":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1440784653471453227":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1440818151955759144":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1440802449563582494":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1441138638703300698":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1440808748263411793":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1440783598776225994":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1440813676654362816":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1436408444071444584":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1435329773197987961":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1433542422268350574":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1430319105034027078":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1427829905323724922":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1428862922020618290":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1427811805065121875":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1427802437347053668":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1427820398283722833":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1428092429030129755":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1423051598787121242":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1425291943302398073":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1425921949665591336":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1425263680571834399":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1425272488287408250":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1422745038999261294":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1412491570820812933":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1421280952591843438":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1419728074467049642":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1416175237439160450":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1413610443729145966":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1412571090240278528":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1410331802383683594":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1407146649637359628":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1407401199359098910":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1399849088043847771":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1399470213967380533":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1396926597692395620":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1377415518797172856":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1377423871732617276":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1547360739918880860":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1547364836017578086":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1547367413320777830":{"isGlobal":false,"include":["MX"],"exclude":[],"mode":"include","primary":"MX","extra":0,"code":"MX"},"1537132225999413298":{"isGlobal":false,"include":["BE"],"exclude":[],"mode":"include","primary":"BE","extra":0,"code":"BE"},"1547744067990061116":{"isGlobal":false,"include":["ES"],"exclude":[],"mode":"include","primary":"ES","extra":0,"code":"ES"},"1547752239555285002":{"isGlobal":false,"include":["MX"],"exclude":[],"mode":"include","primary":"MX","extra":0,"code":"MX"},"1547757450760036362":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1547747355267170454":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1547748594604441680":{"isGlobal":false,"include":["BR"],"exclude":[],"mode":"include","primary":"BR","extra":0,"code":"BR"},"1547741852612952114":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1547745463153721354":{"isGlobal":false,"include":["IT"],"exclude":[],"mode":"include","primary":"IT","extra":0,"code":"IT"},"1547374341073674290":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1547372701981605899":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1549472153454387273":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1548013708163285023":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1547897426755457146":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1544963709678522439":{"isGlobal":false,"include":["TW"],"exclude":[],"mode":"include","primary":"TW","extra":0,"code":"TW"},"1547065378205736991":{"isGlobal":false,"include":["TW"],"exclude":[],"mode":"include","primary":"TW","extra":0,"code":"TW"},"1547678204398014494":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1545527302681661540":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1539750562176696320":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1524461100614160435":{"isGlobal":false,"include":["US","GB","CA"],"exclude":[],"mode":"include","primary":"US","extra":2,"code":"US"},"1539360322421268627":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1529273018927415296":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1533861934078890124":{"isGlobal":false,"include":["US","GB","AU","FR","DE"],"exclude":[],"mode":"include","primary":"US","extra":4,"code":"US"},"1532492483009712168":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1526440558577582090":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1524107612398944376":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1519095881025191966":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1514104077842387115":{"isGlobal":false,"include":["BR","US"],"exclude":["DE","HK","CA","AU","CH","FR","GB","IT","JP","KR","NL","PL","SG","VN"],"mode":"include","primary":"BR","extra":1,"code":"BR"},"1511513281775538216":{"isGlobal":false,"include":[],"exclude":["CA"],"mode":"exclude","primary":"","extra":0,"code":""},"1506575466969043055":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1509675158363963444":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1499513010161713273":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1502134928924475452":{"isGlobal":false,"include":[],"exclude":[],"mode":"unknown","primary":"","extra":0,"code":""},"1496630865160048702":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1492232347620344070":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1491898129728143410":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1488234117593043056":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1484660849892397298":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1484276366345113882":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1449115287021555722":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1448074094426718403":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1440059727005614090":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1471974996158189755":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1482078151872876544":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1552026570229813258":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1551969525602451497":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1552793125028634754":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1551983210601382063":{"isGlobal":false,"include":["SA"],"exclude":[],"mode":"include","primary":"SA","extra":0,"code":"SA"},"1551982502347022347":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1552029588132200532":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1550471494721871962":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1549194407641747487":{"isGlobal":false,"include":["BR"],"exclude":[],"mode":"include","primary":"BR","extra":0,"code":"BR"},"1549194280432566313":{"isGlobal":false,"include":["ES"],"exclude":[],"mode":"include","primary":"ES","extra":0,"code":"ES"},"1549194460854878219":{"isGlobal":false,"include":["IT"],"exclude":[],"mode":"include","primary":"IT","extra":0,"code":"IT"},"1549194520128782357":{"isGlobal":false,"include":["PH"],"exclude":[],"mode":"include","primary":"PH","extra":0,"code":"PH"},"1549194337928224929":{"isGlobal":false,"include":["KR"],"exclude":[],"mode":"include","primary":"KR","extra":0,"code":"KR"},"1549897603712286810":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1549903747918991411":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1541854877850796113":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1546582811790675998":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"},"1550283830823231518":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1549871018477092965":{"isGlobal":false,"include":["JP"],"exclude":[],"mode":"include","primary":"JP","extra":0,"code":"JP"},"1549870356624445583":{"isGlobal":false,"include":["KR"],"exclude":[],"mode":"include","primary":"KR","extra":0,"code":"KR"},"1548002983260725379":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1549631107102810162":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1548035526555074641":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1554147252065411133":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1552891135125622834":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1552900191751905280":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1556984508107063417":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1556983453541601361":{"isGlobal":false,"include":["FR"],"exclude":[],"mode":"include","primary":"FR","extra":0,"code":"FR"},"1554797166101405738":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1556982617587318897":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1554166577207709767":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1555086009878978620":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1555090985086881834":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1554676841879441438":{"isGlobal":false,"include":["BR"],"exclude":[],"mode":"include","primary":"BR","extra":0,"code":"BR"},"1555082242319974420":{"isGlobal":false,"include":["FR"],"exclude":[],"mode":"include","primary":"FR","extra":0,"code":"FR"},"1555088679192633418":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1555682587819643052":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1555684816882499675":{"isGlobal":false,"include":["FR"],"exclude":[],"mode":"include","primary":"FR","extra":0,"code":"FR"},"1555709543579783198":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1552406144067043438":{"isGlobal":false,"include":["GB"],"exclude":[],"mode":"include","primary":"GB","extra":0,"code":"GB"},"1552407794634727635":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1554270669267537930":{"isGlobal":false,"include":["FI"],"exclude":[],"mode":"include","primary":"FI","extra":0,"code":"FI"},"1553186976419807282":{"isGlobal":false,"include":["JP"],"exclude":[],"mode":"include","primary":"JP","extra":0,"code":"JP"},"1554249650012164207":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1552897885883072582":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1554264699301007411":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1554258925073993850":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1547370886645026876":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1545504106955808900":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1552790924445356043":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1552763854692290630":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1554438460041863280":{"isGlobal":true,"include":[],"exclude":[],"mode":"global","primary":"","extra":0,"code":""},"1553392150924890112":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1549819328193364061":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1552782554845806643":{"isGlobal":false,"include":["US"],"exclude":[],"mode":"include","primary":"US","extra":0,"code":"US"},"1552698676017766541":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1552370451727261738":{"isGlobal":false,"include":["CA"],"exclude":[],"mode":"include","primary":"CA","extra":0,"code":"CA"},"1552101830807265300":{"isGlobal":false,"include":["DE"],"exclude":[],"mode":"include","primary":"DE","extra":0,"code":"DE"},"1546583178230235336":{"isGlobal":false,"include":["AU"],"exclude":[],"mode":"include","primary":"AU","extra":0,"code":"AU"}};
+
+/*
+ * Launch Quest / Activity quest completion — ported from Discord Quest Helper
+ */
+
+const DEFAULT_CHECKPOINT_MIN_SECS = 60;
+const DEFAULT_CHECKPOINT_MAX_SECS = 120;
+const CHECKPOINT_MIN_LIMIT = 30;
+const CHECKPOINT_MAX_LIMIT = 600;
+const STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY = "questHelper_activityCheckpointMin";
+const STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY = "questHelper_activityCheckpointMax";
+
+/** @deprecated Use getActivityCheckpointAvgSecs() */
+const ACTIVITY_CHECKPOINT_INTERVAL_SECS = DEFAULT_CHECKPOINT_MIN_SECS;
+const IFRAME_WAIT_MS = 90000;
+const HEARTBEAT_INTERVAL_MS = 20000;
+const NATIVE_EXEC_RETRIES = 5;
+const NATIVE_EXEC_RETRY_MS = 500;
+const INIT_RETRY_ATTEMPTS = 18;
+const INIT_RETRY_DELAY_MS = 5000;
+const TIMER_RETRY_ATTEMPTS = 6;
+const TIMER_RETRY_DELAY_MS = 5000;
+const CHECKPOINT_WAIT_FEEDBACK_MS = 30000;
+const SERVER_PROGRESS_POLL_MS = 2000;
+const SERVER_PROGRESS_POLL_MAX_MS = 10000;
+
+const ActivityFrameErrorCode = {
+    NATIVE_REQUIRED: "NATIVE_REQUIRED",
+    FRAME_NOT_READY: "FRAME_NOT_READY"
+};
+
+function clampCheckpointSecs(value, fallback, min, max) {
+    const parsed = Number.parseInt(String(value), 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, parsed));
+}
+
+function getActivityCheckpointSettings() {
+    let minSecs = DEFAULT_CHECKPOINT_MIN_SECS;
+    let maxSecs = DEFAULT_CHECKPOINT_MAX_SECS;
+    try {
+        const savedMin = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY);
+        const savedMax = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY);
+        if (savedMin != null) {
+            minSecs = clampCheckpointSecs(savedMin, DEFAULT_CHECKPOINT_MIN_SECS, CHECKPOINT_MIN_LIMIT, CHECKPOINT_MAX_LIMIT);
+        }
+        if (savedMax != null) {
+            maxSecs = clampCheckpointSecs(savedMax, DEFAULT_CHECKPOINT_MAX_SECS, CHECKPOINT_MIN_LIMIT, CHECKPOINT_MAX_LIMIT);
+        }
+    } catch (_) {}
+    if (maxSecs < minSecs) maxSecs = minSecs;
+    return { minSecs, maxSecs };
+}
+
+function setActivityCheckpointSettings(minSecs, maxSecs) {
+    let min = clampCheckpointSecs(minSecs, DEFAULT_CHECKPOINT_MIN_SECS, CHECKPOINT_MIN_LIMIT, CHECKPOINT_MAX_LIMIT);
+    let max = clampCheckpointSecs(maxSecs, DEFAULT_CHECKPOINT_MAX_SECS, CHECKPOINT_MIN_LIMIT, CHECKPOINT_MAX_LIMIT);
+    if (max < min) max = min;
+    try {
+        localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY, String(min));
+        localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY, String(max));
+    } catch (_) {}
+    return { minSecs: min, maxSecs: max };
+}
+
+function getActivityCheckpointAvgSecs() {
+    const { minSecs, maxSecs } = getActivityCheckpointSettings();
+    return (minSecs + maxSecs) / 2;
+}
+
+function readActivityCheckpointProgress(quest, taskName) {
+    if (!quest) return 0;
+    const progress = quest.userStatus?.progress;
+    if (taskName && progress?.[taskName]?.value != null) {
+        return Math.floor(progress[taskName].value);
+    }
+    const first = Object.values(progress ?? {})[0];
+    return Math.floor(first?.value ?? 0);
+}
+
+function getFreshQuest(questId, QuestsStore) {
+    return QuestsStore?.getQuest?.(questId) ?? QuestsStore?.quests?.get(questId);
+}
+
+function resolveCompletedCheckpoints(questId, taskName, checkpointCount, QuestsStore) {
+    const quest = getFreshQuest(questId, QuestsStore);
+    const raw = readActivityCheckpointProgress(quest, taskName);
+    return Math.min(checkpointCount, Math.max(0, raw));
+}
+
+function pickStatusField(status, camel, snake) {
+    if (!status || typeof status !== "object") return null;
+    return status[camel] ?? status[snake] ?? null;
+}
+
+function normalizeQuestUserStatus(quest) {
+    if (!quest) return null;
+    const raw = quest.userStatus ?? quest.user_status;
+    if (!raw) return quest;
+    return {
+        ...quest,
+        userStatus: {
+            ...raw,
+            progress: raw.progress ?? {},
+            completedAt: pickStatusField(raw, "completedAt", "completed_at"),
+            claimedAt: pickStatusField(raw, "claimedAt", "claimed_at"),
+            enrolledAt: pickStatusField(raw, "enrolledAt", "enrolled_at")
+        }
+    };
+}
+
+function getQuestExpiresAt(quest) {
+    const cfg = quest?.config;
+    return cfg?.expiresAt ?? cfg?.expires_at ?? null;
+}
+
+function isQuestExpired(quest, now = Date.now()) {
+    const expires = getQuestExpiresAt(quest);
+    if (!expires) return false;
+    const ts = new Date(expires).getTime();
+    return Number.isFinite(ts) && ts <= now;
+}
+
+function getQuestCompletionFlags(quest) {
+    const normalized = normalizeQuestUserStatus(quest);
+    const status = normalized?.userStatus;
+    const completedAt = status?.completedAt ?? null;
+    const claimedAt = status?.claimedAt ?? null;
+    const enrolledAt = status?.enrolledAt ?? null;
+    return {
+        enrolledAt,
+        completedAt,
+        claimedAt,
+        isEnrolled: !!enrolledAt,
+        isCompleted: !!completedAt,
+        isClaimed: !!claimedAt,
+        isClaimable: !!completedAt && !claimedAt
+    };
+}
+
+async function fetchQuestProgressFromApi(questId, apiGet) {
+    if (!apiGet) return 0;
+    try {
+        const res = await apiGet({ url: "/quests/@me" });
+        const body = res?.body;
+        const quests = Array.isArray(body)
+            ? body
+            : Array.isArray(body?.quests)
+                ? body.quests
+                : [];
+        const found = quests.find(q => q.id === questId);
+        if (!found) return 0;
+        const normalized = normalizeQuestUserStatus(found);
+        return readActivityCheckpointProgress(normalized, null);
+    } catch (_) {
+        return 0;
+    }
+}
+
+async function fetchBestProgressForGroup(questIds, apiGet) {
+    if (!apiGet || !questIds?.length) return 0;
+    let best = 0;
+    for (const id of questIds) {
+        best = Math.max(best, await fetchQuestProgressFromApi(id, apiGet));
+    }
+    return best;
+}
+
+function resolveGroupCompletedCheckpoints(questIds, taskName, checkpointCount, QuestsStore) {
+    let best = 0;
+    for (const id of questIds) {
+        best = Math.max(best, resolveCompletedCheckpoints(id, taskName, checkpointCount, QuestsStore));
+    }
+    return Math.min(checkpointCount, best);
+}
+
+async function resolveCompletedCheckpointsAsync(
+    questId, taskName, checkpointCount, QuestsStore, apiGet, extraQuestIds = []
+) {
+    const ids = [...new Set([questId, ...(extraQuestIds ?? [])])];
+    let best = resolveGroupCompletedCheckpoints(ids, taskName, checkpointCount, QuestsStore);
+    if (apiGet) {
+        const apiCount = await fetchBestProgressForGroup(ids, apiGet);
+        best = Math.max(best, Math.min(checkpointCount, apiCount));
+    }
+    return best;
+}
+
+const JS_ACTIVITY_HELPERS = `
+    const DQH_SDK_WAIT_TIMEOUT_MS = 12000;
+    const DQH_SDK_READY_TIMEOUT_MS = 5000;
+    const DQH_COMMAND_TIMEOUT_MS = 5000;
+    const DQH_QUEST_START_TIMER_TIMEOUT_MS = 10000;
+
+    function withTimeout(promise, timeoutMs, label) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                reject(new Error(label + " timed out after " + timeoutMs + "ms"));
+            }, timeoutMs);
+            Promise.resolve(promise).then(
+                value => { clearTimeout(timer); resolve(value); },
+                error => { clearTimeout(timer); reject(error); }
+            );
+        });
+    }
+
+    function sanitizeScalar(value) {
+        return String(value).replace(/\\b\\d{17,19}\\b/g, "[ID]");
+    }
+
+    function describeError(error) {
+        if (error && typeof error === "object") {
+            const details = {};
+            for (const key of ["name", "message", "code", "type", "status", "statusCode", "reason"]) {
+                if (error[key] !== undefined) {
+                    details[key] = typeof error[key] === "string" ? sanitizeScalar(error[key]) : error[key];
+                }
+            }
+            if (Object.keys(details).length > 0) return JSON.stringify(details);
+        }
+        return sanitizeScalar(error);
+    }
+
+    function commandNames(sdk) {
+        try {
+            return Object.keys(sdk?.commands || {})
+                .filter(key => typeof sdk.commands[key] === "function")
+                .sort();
+        } catch (_) { return []; }
+    }
+
+    function isKnownBenignQuestStartTimerError(value) {
+        return !!value
+            && typeof value === "object"
+            && value.code === 4002
+            && String(value.message || "").includes("Quest not found");
+    }
+`;
+
+function getTaskConfig(quest) {
+    const cfg = quest?.config;
+    if (!cfg) return null;
+    return cfg.taskConfig
+        ?? cfg.taskConfigV2
+        ?? cfg.task_config
+        ?? cfg.task_config_v2
+        ?? null;
+}
+
+function getActivityTaskEntry(quest) {
+    const tasks = getTaskConfig(quest)?.tasks;
+    if (!tasks) return null;
+    for (const [key, task] of Object.entries(tasks)) {
+        const type = String(task?.type || key || "").toUpperCase();
+        if (
+            type === "ACHIEVEMENT_IN_ACTIVITY"
+            || type === "PLAY_ACTIVITY"
+            || type.includes("ACHIEVEMENT")
+            || (type.includes("ACTIVITY") && type.includes("PLAY"))
+        ) {
+            return { key, task, type: task?.type || key };
+        }
+    }
+    return null;
+}
+
+function isPlayActivityTask(taskName, taskConfig) {
+    if (taskName === "PLAY_ACTIVITY") return true;
+    const task = taskConfig?.tasks?.[taskName];
+    return (task?.type || taskName) === "PLAY_ACTIVITY";
+}
+
+function isAchievementActivityTask(taskName, taskConfig) {
+    if (taskName === "ACHIEVEMENT_IN_ACTIVITY") return true;
+    const task = taskConfig?.tasks?.[taskName];
+    const type = String(task?.type || taskName || "").toUpperCase();
+    return type === "ACHIEVEMENT_IN_ACTIVITY" || type.includes("ACHIEVEMENT");
+}
+
+function isLaunchQuestTask(taskName, taskConfig) {
+    return isAchievementActivityTask(taskName, taskConfig) || isPlayActivityTask(taskName, taskConfig);
+}
+
+function isBatchRunnableActivity(taskName, taskConfig) {
+    return isPlayActivityTask(taskName, taskConfig);
+}
+
+function resolveQuestApplicationId(quest, taskName = null, taskConfig = null) {
+    const config = quest?.config;
+    const directId = config?.application?.id;
+    if (directId) return String(directId);
+
+    const tasks = (taskConfig ?? getTaskConfig(quest))?.tasks;
+    if (tasks) {
+        const keys = taskName ? [taskName] : Object.keys(tasks);
+        for (const key of keys) {
+            const task = tasks[key];
+            if (!task) continue;
+            const fromApplications = task.applications?.[0]?.id;
+            if (fromApplications) return String(fromApplications);
+        }
+    }
+
+    const activityEntry = getActivityTaskEntry(quest);
+    const fromActivityTask = activityEntry?.task?.applications?.[0]?.id;
+    if (fromActivityTask) return String(fromActivityTask);
+
+    return "";
+}
+
+function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
+    const safeQuestId = JSON.stringify(String(questId));
+    const allowed = [...new Set([String(questId), ...allowedQuestIds.map(String)])];
+    const safeAllowed = JSON.stringify(allowed);
+    return `
+(async () => {
+    const requestedQuestId = ${safeQuestId};
+    const allowedQuestIds = ${safeAllowed};
+    const allowedSet = new Set(allowedQuestIds.map(String));
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    ${JS_ACTIVITY_HELPERS}
+
+    async function waitForSdk() {
+        const startedAt = Date.now();
+        let lastState = "window.discordSDK missing";
+        while (Date.now() - startedAt < DQH_SDK_WAIT_TIMEOUT_MS) {
+            const sdk = window.discordSDK;
+            if (sdk && sdk.commands) {
+                const commands = commandNames(sdk);
+                if (typeof sdk.commands.questStartTimer === "function") {
+                    return { sdk, commands, waitedMs: Date.now() - startedAt };
+                }
+                lastState = "questStartTimer missing; commands=[" + commands.join(", ") + "]";
+            } else if (sdk) {
+                lastState = "window.discordSDK present but commands missing";
+            }
+            await sleep(250);
+        }
+        throw new Error("Discord SDK not ready: " + lastState);
+    }
+
+    try {
+        let sdkState;
+        try { sdkState = await waitForSdk(); }
+        catch (e) { return JSON.stringify({ success: false, error: describeError(e) }); }
+
+        const sdk = sdkState.sdk;
+        const commands = sdkState.commands;
+        const waitedMs = sdkState.waitedMs;
+
+        if (typeof sdk.ready === "function") {
+            try {
+                await withTimeout(sdk.ready(), DQH_SDK_READY_TIMEOUT_MS, "discordSDK.ready");
+            } catch (e) {
+                return JSON.stringify({ success: false, error: "discordSDK.ready failed: " + describeError(e), commands, waitedMs });
+            }
+        }
+
+        try {
+            if (typeof sdk.commands.setActivity === "function") {
+                await withTimeout(sdk.commands.setActivity({
+                    activity: { state: "Playing", details: "Completing Quest" }
+                }), DQH_COMMAND_TIMEOUT_MS, "setActivity");
+            }
+        } catch (_) {}
+
+        let questInfoBefore = null;
+        if (typeof sdk.commands.getQuest === "function") {
+            try {
+                questInfoBefore = await withTimeout(sdk.commands.getQuest(), DQH_COMMAND_TIMEOUT_MS, "getQuest");
+            } catch (_) {}
+        }
+
+        const boundQuestId = String(questInfoBefore?.quest_id || "");
+        let effectiveQuestId = requestedQuestId;
+        if (boundQuestId && allowedSet.has(boundQuestId)) {
+            effectiveQuestId = boundQuestId;
+        }
+
+        let enrollmentStatusBefore = null;
+        if (typeof sdk.commands.getQuestEnrollmentStatus === "function") {
+            try {
+                enrollmentStatusBefore = await withTimeout(
+                    sdk.commands.getQuestEnrollmentStatus({ quest_id: effectiveQuestId }),
+                    DQH_COMMAND_TIMEOUT_MS,
+                    "getQuestEnrollmentStatus"
+                );
+            } catch (_) {}
+        }
+
+        const questInfoBeforeMatches = boundQuestId !== "" && allowedSet.has(boundQuestId);
+        const enrollmentStatusBeforeMatches = String(enrollmentStatusBefore?.quest_id || "") === String(effectiveQuestId);
+        const enrollmentStatusBeforeEnrolled = enrollmentStatusBeforeMatches && enrollmentStatusBefore?.is_enrolled === true;
+        const hasRetryableQuestContext = questInfoBeforeMatches || enrollmentStatusBeforeEnrolled;
+
+        let startTimerResult = null;
+        let startTimerError = null;
+        try {
+            startTimerResult = await withTimeout(
+                sdk.commands.questStartTimer({ quest_id: effectiveQuestId }),
+                DQH_QUEST_START_TIMER_TIMEOUT_MS,
+                "questStartTimer"
+            );
+        } catch (e) {
+            startTimerError = describeError(e);
+            if (isKnownBenignQuestStartTimerError(e) && hasRetryableQuestContext) {
+                return JSON.stringify({
+                    success: false,
+                    errorCode: "QUEST_PENDING",
+                    error: "questStartTimer failed: " + startTimerError,
+                    effectiveQuestId,
+                    boundQuestId,
+                    commands,
+                    waitedMs
+                });
+            }
+            return JSON.stringify({
+                success: false,
+                error: "questStartTimer failed: " + startTimerError,
+                effectiveQuestId,
+                boundQuestId,
+                commands,
+                waitedMs
+            });
+        }
+
+        if (startTimerResult && typeof startTimerResult === "object" && startTimerResult.success === false) {
+            startTimerError = describeError(startTimerResult);
+            if (isKnownBenignQuestStartTimerError(startTimerResult) && hasRetryableQuestContext) {
+                return JSON.stringify({
+                    success: false,
+                    errorCode: "QUEST_PENDING",
+                    error: "questStartTimer returned failure: " + startTimerError,
+                    effectiveQuestId,
+                    boundQuestId,
+                    commands,
+                    waitedMs
+                });
+            }
+            return JSON.stringify({
+                success: false,
+                error: "questStartTimer returned failure: " + startTimerError,
+                effectiveQuestId,
+                boundQuestId,
+                commands,
+                waitedMs
+            });
+        }
+
+        return JSON.stringify({
+            success: true,
+            waitedMs,
+            effectiveQuestId,
+            boundQuestId,
+            startTimerError: null,
+            startTimerIgnored: false
+        });
+    } catch (e) {
+        return JSON.stringify({ success: false, error: describeError(e) });
+    }
+})()
+`;
+}
+
+function buildQuestStartTimerOnlyJs(questId) {
+    const safeQuestId = JSON.stringify(questId);
+    return `
+(async () => {
+    const questId = ${safeQuestId};
+    ${JS_ACTIVITY_HELPERS}
+    try {
+        const sdk = window.discordSDK;
+        if (!sdk?.commands?.questStartTimer) {
+            return JSON.stringify({ success: false, error: "questStartTimer unavailable" });
+        }
+        const result = await withTimeout(
+            sdk.commands.questStartTimer({ quest_id: questId }),
+            DQH_QUEST_START_TIMER_TIMEOUT_MS,
+            "questStartTimer"
+        );
+        if (result && typeof result === "object" && result.success === false) {
+            return JSON.stringify({ success: false, error: describeError(result) });
+        }
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ success: false, error: describeError(e) });
+    }
+})()
+`;
+}
+
+function buildClickActivityStartJs() {
+    return `(function() {
+        try {
+            const buttons = Array.from(document.querySelectorAll("button, [role=\\"button\\"], a"));
+            const start = buttons.find(b => /^\\s*start\\s*$/i.test((b.textContent || b.innerText || "").trim()));
+            if (start) {
+                start.click();
+                return JSON.stringify({ success: true, clicked: true });
+            }
+            return JSON.stringify({ success: true, clicked: false });
+        } catch (e) {
+            return JSON.stringify({ success: false, error: String(e) });
+        }
+    })()`;
+}
+
+function buildDispatchMessageEventJs(eventType, payloadJson) {
+    const safeType = JSON.stringify(eventType);
+    const safePayload = payloadJson ?? "null";
+    return `JSON.stringify((function() { try {
+        var payload = ${safePayload};
+        var evt = new MessageEvent("message", { data: { type: ${safeType}, payload: payload }, origin: window.location.origin });
+        window.dispatchEvent(evt);
+        return { success: true, dispatched: ${safeType}, payload: payload };
+    } catch(e) { return { success: false, error: String(e) }; } })())`;
+}
+
+function buildCheckActivityQuestStatusJs(questId) {
+    const safeQuestId = JSON.stringify(questId);
+    return `
+(async () => {
+    const questId = ${safeQuestId};
+    ${JS_ACTIVITY_HELPERS}
+    try {
+        const sdk = window.discordSDK;
+        if (!sdk || !sdk.commands) {
+            return JSON.stringify({ success: false, error: "Discord SDK not found" });
+        }
+        if (typeof sdk.commands.getQuest === "function") {
+            try {
+                const quest = await withTimeout(sdk.commands.getQuest(), DQH_COMMAND_TIMEOUT_MS, "getQuest");
+                const questIdMatches = String(quest?.quest_id || "") === String(questId);
+                if (questIdMatches) {
+                    return JSON.stringify({
+                        success: true,
+                        completedAt: quest.completed_at,
+                        completed: !!quest.completed_at,
+                        questIdMatches
+                    });
+                }
+            } catch (_) {}
+        }
+        if (typeof sdk.commands.getQuestEnrollmentStatus === "function") {
+            const enrollmentStatus = await sdk.commands.getQuestEnrollmentStatus({ quest_id: questId });
+            const enrollmentQuestIdMatches = String(enrollmentStatus?.quest_id || "") === String(questId);
+            return JSON.stringify({
+                success: enrollmentQuestIdMatches,
+                completed: false,
+                completedAt: null,
+                cannotVerifyCompletion: true,
+                enrollmentQuestIdMatches,
+                enrolled: enrollmentStatus?.is_enrolled === true
+            });
+        }
+        return JSON.stringify({ success: false, error: "No SDK command available to verify activity quest completion" });
+    } catch (e) {
+        return JSON.stringify({ success: false, error: describeError(e) });
+    }
+})()
+`;
+}
+
+function parseFrameResult(raw) {
+    if (raw == null) return null;
+    if (typeof raw === "object") return raw;
+    try { return JSON.parse(raw); } catch { return { success: false, error: String(raw) }; }
+}
+
+function findActivityIframe(applicationId) {
+    const iframes = document.querySelectorAll("iframe");
+    for (const iframe of iframes) {
+        const src = iframe.src || iframe.getAttribute("src") || "";
+        if (!src.includes("discordsays.com")) continue;
+        if (applicationId && !src.includes(applicationId)) continue;
+        return iframe;
+    }
+    return null;
+}
+
+function throwActivityFrameError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    throw error;
+}
+
+function isNativeAvailable() {
+    return true;
+}
+
+async function nativeHasActivityFrame(applicationId) {
+    try {
+        return await getNative()?.hasActivityFrame?.(applicationId) ?? false;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function execInActivityFrame(applicationId, jsCode) {
+    const reachable = await probeCdpReachable();
+    if (!reachable) {
+        throwActivityFrameError(
+            ActivityFrameErrorCode.NATIVE_REQUIRED,
+            CDP_SETUP_MESSAGE
+        );
+    }
+
+    const native = getNative();
+    let lastError = null;
+
+    for (let attempt = 0; attempt < NATIVE_EXEC_RETRIES; attempt++) {
+        try {
+            const raw = await native.execInActivityFrame(applicationId, jsCode);
+            if (raw != null) return parseFrameResult(raw);
+        } catch (e) {
+            lastError = e;
+            throw new Error("CDP activity frame execution failed: " + (e?.message || e));
+        }
+
+        if (attempt < NATIVE_EXEC_RETRIES - 1) {
+            await new Promise(r => setTimeout(r, NATIVE_EXEC_RETRY_MS));
+        }
+    }
+
+    if (lastError) {
+        throw new Error("CDP activity frame execution failed: " + (lastError?.message || lastError));
+    }
+
+    throwActivityFrameError(
+        ActivityFrameErrorCode.FRAME_NOT_READY,
+        "Activity frame not ready. Ensure the activity is fully loaded and authorized in Discord."
+    );
+}
+
+async function hasMatchingActivityFrame(applicationId) {
+    if (!applicationId?.trim()) return false;
+    if (!isNativeAvailable()) return false;
+    return nativeHasActivityFrame(applicationId);
+}
+
+async function launchQuestInDiscord(quest, log, t) {
+    const questName = quest.config.messages?.questName || quest.id;
+    await navigateToQuestPage(quest.id);
+    await new Promise(r => setTimeout(r, 1500));
+    if (clickLaunchQuestButton()) {
+        log.success(`[${questName}] ${t("logLaunchFound")}`);
+        return true;
+    }
+    log.warn(`[${questName}] ${t("logLaunchNotFound")}`);
+    return false;
+}
+
+async function waitForActivityIframe(applicationId, timeoutMs = IFRAME_WAIT_MS, isActive = () => true, opts = {}) {
+    if (!isNativeAvailable()) return null;
+
+    const { log, t, questName } = opts;
+    let domLogged = false;
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+        if (!isActive()) return null;
+
+        if (!domLogged && findActivityIframe(applicationId)) {
+            domLogged = true;
+            if (log && t && questName) {
+                log.info(`[${questName}] ${t("logActivityDomFound")}`);
+            }
+        }
+
+        if (await nativeHasActivityFrame(applicationId)) return true;
+        await new Promise(r => setTimeout(r, 500));
+    }
+    return null;
+}
+
+function formatActivityFrameError(error, t) {
+    if (error?.code === ActivityFrameErrorCode.NATIVE_REQUIRED) {
+        return t("logActivityNativeRequired");
+    }
+    if (error?.code === ActivityFrameErrorCode.FRAME_NOT_READY) {
+        return t("logActivityFrameNotReady");
+    }
+    return error?.message || "unknown";
+}
+
+async function navigateToQuestPage(questId) {
+    const targetPath = `/quest-home#${encodeURIComponent(questId)}`;
+    const currentFull = () => window.location.pathname + window.location.search + window.location.hash;
+
+    if (currentFull() === targetPath) return true;
+
+    let wpRequire = null;
+    try {
+        if (typeof webpackChunkdiscord_app !== "undefined") {
+            wpRequire = webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
+            webpackChunkdiscord_app.pop();
+        }
+    } catch (_) {}
+
+    const findRouter = () => {
+        if (!wpRequire?.c) return null;
+        const seen = new Set();
+        const inspect = value => {
+            if (!value || (typeof value !== "object" && typeof value !== "function") || seen.has(value)) return null;
+            seen.add(value);
+            if (typeof value.transitionTo === "function" && (
+                typeof value.replaceWith === "function" || typeof value.navigate === "function"
+            )) return value;
+            if (value.router?.transitionTo) return value.router;
+            return null;
+        };
+        for (const m of Object.values(wpRequire.c)) {
+            try {
+                const exp = m?.exports;
+                if (!exp) continue;
+                const direct = inspect(exp);
+                if (direct) return direct;
+                for (const key of Object.keys(exp)) {
+                    const result = inspect(exp[key]);
+                    if (result) return result;
+                }
+            } catch (_) {}
+        }
+        return null;
+    };
+
+    const router = findRouter();
+    if (router) {
+        for (const method of ["transitionTo", "replaceWith", "navigate"]) {
+            if (typeof router[method] === "function") {
+                try {
+                    await Promise.resolve(router[method](targetPath));
+                    await new Promise(r => setTimeout(r, 500));
+                    if (currentFull() === targetPath) return true;
+                } catch (_) {}
+            }
+        }
+    }
+
+    try {
+        window.history.pushState({}, "", targetPath);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+        await new Promise(r => setTimeout(r, 500));
+        return currentFull() === targetPath;
+    } catch (_) {
+        return false;
+    }
+}
+
+function isPluginButton(btn) {
+    return !!btn.closest("#dqm-gui, #dqm-mini-icon")
+        || btn.classList.contains("dqm-action-launch");
+}
+
+function clickLaunchQuestButton() {
+    const launchText = /launch\s*quest|start\s*quest|ouvrir\s*la\s*qu[eê]te|quest\s*starten|iniciar\s*misi[oó]n|iniciar\s*quest|퀘е?ст|запустить/i;
+
+    const allClickable = Array.from(document.querySelectorAll(
+        "button, a[role='button'], div[role='button'], [data-mana-component='button']"
+    )).filter(el => !isPluginButton(el));
+
+    const byAria = allClickable.find(el => {
+        const label = (el.getAttribute("aria-label") || "").trim();
+        return /launch\s*quest/i.test(label) || /start\s*quest/i.test(label);
+    });
+    if (byAria) {
+        byAria.click();
+        return true;
+    }
+
+    const byText = allClickable.find(el => launchText.test((el.innerText || el.textContent || "").trim()));
+    if (byText) {
+        byText.click();
+        return true;
+    }
+
+    // Fallback: any element with launch-quest-ish data attributes used by Discord quest-home
+    const byAttr = document.querySelector(
+        "[aria-label*='Launch Quest' i], [aria-label*='Start Quest' i]"
+    );
+    if (byAttr && !isPluginButton(byAttr)) {
+        byAttr.click();
+        return true;
+    }
+
+    return false;
+}
+
+function generateCheckpointTimes(checkpointCount, minSecs, maxSecs) {
+    const settings = getActivityCheckpointSettings();
+    const min = minSecs ?? settings.minSecs;
+    const max = maxSecs ?? settings.maxSecs;
+    const safeMin = Math.min(min, max);
+    const safeMax = Math.max(min, max);
+    const times = [];
+    for (let i = 0; i < checkpointCount; i++) {
+        times.push(Math.floor(Math.random() * (safeMax - safeMin + 1)) + safeMin);
+    }
+    return times;
+}
+
+function showActivityLaunchDialog(t, onNavigate, onConfirm, onCancel) {
+    const existing = document.getElementById("dqm-activity-launch-dialog");
+    existing?.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "dqm-activity-launch-dialog";
+    overlay.className = "dqm-modal-overlay";
+
+    const dialog = document.createElement("div");
+    dialog.className = "dqm-modal";
+
+    const title = document.createElement("h3");
+    title.className = "dqm-modal-title";
+    title.textContent = t("activityLaunchTitle");
+
+    const desc = document.createElement("p");
+    desc.className = "dqm-modal-desc";
+    desc.textContent = t("activityLaunchDesc");
+
+    const steps = document.createElement("ol");
+    steps.className = "dqm-modal-steps";
+    for (const key of ["activityLaunchStep1", "activityLaunchStep2", "activityLaunchStep3", "activityLaunchStep4", "activityLaunchStep5"]) {
+        const li = document.createElement("li");
+        li.textContent = t(key);
+        steps.appendChild(li);
+    }
+
+    const errorEl = document.createElement("div");
+    errorEl.className = "dqm-modal-error";
+    errorEl.hidden = true;
+
+    const footer = document.createElement("div");
+    footer.className = "dqm-modal-footer";
+
+    const close = () => overlay.remove();
+
+    const navBtn = document.createElement("button");
+    navBtn.className = "dqm-btn dqm-btn-gray";
+    navBtn.textContent = t("activityLaunchNavigate");
+    navBtn.onclick = async () => {
+        navBtn.disabled = true;
+        try {
+            await onNavigate();
+        } catch (e) {
+            errorEl.textContent = t("activityLaunchNavigateError");
+            errorEl.hidden = false;
+        } finally {
+            navBtn.disabled = false;
+        }
+    };
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "dqm-btn dqm-btn-gray";
+    cancelBtn.textContent = t("activityLaunchCancel");
+    cancelBtn.onclick = () => { close(); onCancel?.(); };
+
+    const startBtn = document.createElement("button");
+    startBtn.className = "dqm-btn dqm-btn-blurple";
+    startBtn.textContent = t("activityLaunchStart");
+    startBtn.onclick = () => { close(); onConfirm?.(); };
+
+    footer.append(navBtn, cancelBtn, startBtn);
+    dialog.append(title, desc, steps, errorEl, footer);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    return { close, setError: (msg) => { errorEl.textContent = msg; errorEl.hidden = !msg; } };
+}
+
+function promptActivityLaunch(quest, t, onNavigateToQuest) {
+    return new Promise((resolve, reject) => {
+        showActivityLaunchDialog(
+            t,
+            async () => {
+                if (onNavigateToQuest) {
+                    await onNavigateToQuest(quest);
+                    return;
+                }
+                const ok = await navigateToQuestPage(quest.id);
+                if (!ok) throw new Error("navigation failed");
+            },
+            () => resolve(true),
+            () => reject(new Error("cancelled"))
+        );
+    });
+}
+
+function formatInitResultError(initResult, t) {
+    if (initResult?.errorCode === "WRONG_ACTIVITY" || initResult?.questInfoMismatched) {
+        return t("logActivityWrongApp");
+    }
+    if (initResult?.errorCode === "AUTH_PENDING" || initResult?.errorCode === "QUEST_PENDING") {
+        return t("logActivityAuthPending");
+    }
+    return initResult?.error || "unknown";
+}
+
+function isSdkNotReadyError(initResult) {
+    const err = String(initResult?.error || "");
+    return /Discord SDK not ready|window\.discordSDK missing|questStartTimer missing/i.test(err);
+}
+
+function isQuestNotReadyError(initResult) {
+    if (initResult?.errorCode === "QUEST_PENDING") return true;
+    const err = String(initResult?.error || "");
+    return /Quest not found|"code":\s*4002/i.test(err);
+}
+
+function isInitRetryableError(initResult) {
+    if (!initResult || initResult.success) return false;
+    if (initResult.errorCode === "WRONG_ACTIVITY" || initResult.questInfoMismatched) return false;
+    if (initResult.errorCode === "AUTH_PENDING" || initResult.errorCode === "QUEST_PENDING") return true;
+    if (isSdkNotReadyError(initResult)) return true;
+    if (isQuestNotReadyError(initResult)) return true;
+    const err = String(initResult.error || "");
+    return /not authenticated|invalid scope|"code":\s*4006/i.test(err);
+}
+
+async function initActivityWithRetry(applicationId, questId, taskState, sleep, log, t, questName, allowedQuestIds = []) {
+    let initResult;
+    let authPendingLogged = false;
+    let lastRetryReason = null;
+
+    for (let attempt = 1; attempt <= INIT_RETRY_ATTEMPTS; attempt++) {
+        if (!taskState.active) return null;
+
+        if (attempt === 1) {
+            log.info(`[${questName}] ${t("logActivityInit")}`);
+        } else if (lastRetryReason === "sdk") {
+            log.info(`[${questName}] ${t("logActivitySdkWaiting")
+                .replace("{n}", String(attempt))
+                .replace("{max}", String(INIT_RETRY_ATTEMPTS))}`);
+        } else {
+            log.info(`[${questName}] ${t("logActivityInitRetry")
+                .replace("{n}", String(attempt))
+                .replace("{max}", String(INIT_RETRY_ATTEMPTS))}`);
+        }
+
+        try {
+            await execInActivityFrame(applicationId, buildClickActivityStartJs());
+        } catch (_) {}
+
+        try {
+            initResult = parseFrameResult(
+                await execInActivityFrame(applicationId, buildInitActivityQuestJs(questId, allowedQuestIds))
+            );
+        } catch (e) {
+            log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
+            return null;
+        }
+
+        if (initResult?.success) return initResult;
+
+        if (!isInitRetryableError(initResult)) {
+            log.error(`[${questName}] ${t("logActivityInitFailed")}${formatInitResultError(initResult, t)}`);
+            return null;
+        }
+
+        if (isSdkNotReadyError(initResult)) {
+            lastRetryReason = "sdk";
+        } else {
+            lastRetryReason = "auth";
+            if (!authPendingLogged) {
+                log.warn(`[${questName}] ${t("logActivityAuthPending")}`);
+                authPendingLogged = true;
+            }
+        }
+
+        if (attempt >= INIT_RETRY_ATTEMPTS) {
+            log.error(`[${questName}] ${t("logActivityInitFailed")}${formatInitResultError(initResult, t)}`);
+            return null;
+        }
+
+        await sleep(INIT_RETRY_DELAY_MS);
+    }
+
+    return null;
+}
+
+function getServerCheckpointProgress(questId, taskName, checkpointCount, QuestsStore) {
+    return resolveCompletedCheckpoints(questId, taskName, checkpointCount, QuestsStore);
+}
+
+async function pollServerCheckpointProgress(questId, taskName, checkpointCount, previousProgress, QuestsStore, sleep) {
+    const deadline = Date.now() + SERVER_PROGRESS_POLL_MAX_MS;
+    while (Date.now() < deadline) {
+        await sleep(SERVER_PROGRESS_POLL_MS);
+        const current = getServerCheckpointProgress(questId, taskName, checkpointCount, QuestsStore);
+        if (current > previousProgress) return current;
+    }
+    return getServerCheckpointProgress(questId, taskName, checkpointCount, QuestsStore);
+}
+
+async function retryQuestStartTimer(applicationId, questId, sleep, log, t, questName) {
+    for (let attempt = 1; attempt <= TIMER_RETRY_ATTEMPTS; attempt++) {
+        log.info(`[${questName}] ${t("logActivityTimerRetry")
+            .replace("{n}", String(attempt))
+            .replace("{max}", String(TIMER_RETRY_ATTEMPTS))}`);
+        try {
+            const result = parseFrameResult(
+                await execInActivityFrame(applicationId, buildQuestStartTimerOnlyJs(questId))
+            );
+            if (result?.success) {
+                log.info(`[${questName}] questStartTimer succeeded on retry.`);
+                return true;
+            }
+        } catch (_) {}
+        if (attempt < TIMER_RETRY_ATTEMPTS) await sleep(TIMER_RETRY_DELAY_MS);
+    }
+    return false;
+}
+
+function estimateRemainingCheckpointSecs(checkpointTimes, fromIndex, waitElapsedSecs) {
+    let total = Math.max(0, checkpointTimes[fromIndex] - waitElapsedSecs);
+    for (let i = fromIndex + 1; i < checkpointTimes.length; i++) {
+        total += checkpointTimes[i];
+    }
+    return total;
+}
+
+function createActivityExecutors(deps) {
+    const { apiPost, apiGet, sleep, log, t, updateQuestProgress, QuestsStore, FluxDispatcher } = deps;
+
+    return {
+        async playActivity(quest, taskState, taskName, secondsNeeded, secondsDone) {
+            const questName = quest.config.messages?.questName || quest.id;
+            const applicationId = resolveQuestApplicationId(quest, taskName);
+            if (!applicationId) {
+                log.error(`[${questName}] ${t("logActivityMissingAppId")}`);
+                return false;
+            }
+
+            let done = secondsDone;
+            while (taskState.active) {
+                try {
+                    const terminal = done >= secondsNeeded;
+                    const body = terminal
+                        ? { terminal: true }
+                        : { application_id: applicationId, terminal: false };
+
+                    const res = await apiPost({
+                        url: `/quests/${quest.id}/heartbeat`,
+                        body
+                    });
+
+                    const progress = Number(res.body?.progress?.PLAY_ACTIVITY?.value ?? 0);
+                    if (Number.isFinite(progress)) done = progress;
+
+                    log.running(`[${questName}] ${t("logActivity")}: ${Math.floor(done)}/${secondsNeeded}s`);
+                    updateQuestProgress(quest.id, done, secondsNeeded);
+
+                    if (res.body?.completed_at || done >= secondsNeeded) {
+                        if (!terminal && taskState.active) {
+                            await apiPost({
+                                url: `/quests/${quest.id}/heartbeat`,
+                                body: { terminal: true }
+                            });
+                        }
+                        break;
+                    }
+
+                    await sleep(HEARTBEAT_INTERVAL_MS);
+                } catch (e) {
+                    log.error(`${t("logAPIError")}${e?.message || e}`);
+                    throw e;
+                }
+            }
+            return taskState.active;
+        },
+
+        async achievementActivity(quest, taskState, taskName, checkpointCount, initialCompletedCheckpoints, duplicateQuestIds = []) {
+            const questName = quest.config.messages?.questName || quest.id;
+            const applicationId = resolveQuestApplicationId(quest, taskName);
+            let questId = quest.id;
+            let completedCheckpoints = initialCompletedCheckpoints;
+            const groupQuestIds = [...new Set([questId, ...(duplicateQuestIds ?? [])].map(String))];
+
+            const remaining = Math.max(0, checkpointCount - completedCheckpoints);
+            if (remaining === 0) {
+                log.warn(`[${questName}] ${t("logActivityCheckpointsDone")}`);
+                return true;
+            }
+
+            if (!applicationId) {
+                log.error(`[${questName}] ${t("logActivityMissingAppId")}`);
+                return false;
+            }
+
+            if (!isNativeAvailable()) {
+                log.error(`[${questName}] ${t("logActivityNativeRequired")}`);
+                return false;
+            }
+
+            log.info(`[${questName}] ${t("logWaitingForActivity")}${applicationId}`);
+            const iframeReady = await waitForActivityIframe(
+                applicationId,
+                IFRAME_WAIT_MS,
+                () => taskState.active,
+                { log, t, questName }
+            );
+            if (!iframeReady) {
+                log.error(`[${questName}] ${t("logActivityFrameNotReady")} (${applicationId}) ${t("logActivityWaitHint")}`);
+                return false;
+            }
+
+            const initResult = await initActivityWithRetry(
+                applicationId, questId, taskState, sleep, log, t, questName, groupQuestIds
+            );
+            if (!initResult) return false;
+
+            const effectiveFromInit = initResult.effectiveQuestId || initResult.boundQuestId;
+            if (effectiveFromInit && groupQuestIds.includes(String(effectiveFromInit))) {
+                questId = String(effectiveFromInit);
+            }
+
+            if (initResult.startTimerIgnored) {
+                log.warn(`[${questName}] ${t("logActivityStartTimerIgnored")}${initResult.startTimerError || ""}`);
+                const timerOk = await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
+                if (!timerOk) {
+                    log.error(`[${questName}] ${t("logActivityTimerRequired")}`);
+                    return false;
+                }
+            }
+
+            const freshCompleted = await resolveCompletedCheckpointsAsync(
+                questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
+            );
+            if (freshCompleted > completedCheckpoints) {
+                completedCheckpoints = freshCompleted;
+                log.info(`[${questName}] ${t("logActivityResumeCheckpoints")
+                    .replace("{done}", String(completedCheckpoints))
+                    .replace("{total}", String(checkpointCount))}`);
+                updateQuestProgress(quest.id, completedCheckpoints, checkpointCount);
+            }
+
+            const remainingAfterInit = Math.max(0, checkpointCount - completedCheckpoints);
+            if (remainingAfterInit === 0) {
+                log.warn(`[${questName}] ${t("logActivityCheckpointsDone")}`);
+                return true;
+            }
+
+            const { minSecs, maxSecs } = getActivityCheckpointSettings();
+            const allTimes = generateCheckpointTimes(checkpointCount, minSecs, maxSecs);
+            const checkpointTimes = allTimes.slice(completedCheckpoints);
+            const totalPlanSecs = checkpointTimes.reduce((sum, secs) => sum + secs, 0);
+            log.info(`[${questName}] ${t("logActivityCheckpointPlan")
+                .replace("{count}", String(checkpointTimes.length))
+                .replace("{min}", String(minSecs))
+                .replace("{max}", String(maxSecs))
+                .replace("{mins}", String(Math.ceil(totalPlanSecs / 60)))}`);
+
+            updateQuestProgress(quest.id, completedCheckpoints, checkpointCount, {
+                etaSecs: totalPlanSecs
+            });
+
+            let serverProgress = await resolveCompletedCheckpointsAsync(
+                questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
+            );
+            const progressAtStart = serverProgress;
+            let stalledDispatches = 0;
+
+            const onHeartbeat = (data) => {
+                if (!taskState.active) return;
+                const eventQuestId = data?.questId ?? data?.quest?.id ?? data?.quest_id;
+                if (eventQuestId && !groupQuestIds.some(id => String(id) === String(eventQuestId))) return;
+                const us = data?.userStatus ?? data?.user_status;
+                if (!us?.progress) return;
+                const vals = Object.values(us.progress);
+                const val = vals[0]?.value;
+                if (val == null) return;
+                const progress = Math.min(checkpointCount, Math.max(0, Math.floor(val)));
+                serverProgress = Math.max(serverProgress, progress);
+                updateQuestProgress(quest.id, serverProgress, checkpointCount);
+            };
+            if (FluxDispatcher?.subscribe) {
+                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
+                taskState.addUnsub(() => {
+                    try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat); } catch (_) {}
+                });
+            }
+
+            for (let i = 0; i < checkpointTimes.length; i++) {
+                if (!taskState.active) return false;
+
+                const checkpointNum = completedCheckpoints + i + 1;
+                const isLast = checkpointNum >= checkpointCount;
+                const waitSecs = checkpointTimes[i];
+
+                log.info(`[${questName}] ${t("logCheckpointWait")}${checkpointNum}/${checkpointCount} (${waitSecs}s)`);
+
+                const waitStart = Date.now();
+                let lastFeedbackAt = waitStart;
+                while (Date.now() - waitStart < waitSecs * 1000) {
+                    if (!taskState.active) return false;
+
+                    const elapsedSecs = Math.floor((Date.now() - waitStart) / 1000);
+                    const remainingSecs = Math.max(0, waitSecs - elapsedSecs);
+                    const etaSecs = estimateRemainingCheckpointSecs(checkpointTimes, i, elapsedSecs);
+
+                    if (Date.now() - lastFeedbackAt >= CHECKPOINT_WAIT_FEEDBACK_MS) {
+                        lastFeedbackAt = Date.now();
+                        log.info(`[${questName}] ${t("logCheckpointWaitRemaining")
+                            .replace("{n}", String(checkpointNum))
+                            .replace("{total}", String(checkpointCount))
+                            .replace("{secs}", String(remainingSecs))}`);
+                        updateQuestProgress(
+                            quest.id,
+                            Math.max(completedCheckpoints, serverProgress),
+                            checkpointCount,
+                            { etaSecs }
+                        );
+                    }
+
+                    await sleep(1000);
+                }
+
+                if (!taskState.active) return false;
+
+                log.running(`[${questName}] ${t("logCheckpoint")}${checkpointNum}/${checkpointCount}`);
+
+                let dispatchResult;
+                try {
+                    if (isLast) {
+                        const completedPayload = JSON.stringify({ quest_id: questId, completed: true });
+                        const completedJs = buildDispatchMessageEventJs("quest-completed", completedPayload);
+                        dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, completedJs));
+                    } else {
+                        const progressJs = buildDispatchMessageEventJs("quest-progress", String(checkpointNum));
+                        dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, progressJs));
+                    }
+                } catch (e) {
+                    log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
+                    return false;
+                }
+
+                if (dispatchResult?.success) {
+                    log.info(`[${questName}] ${t("logActivityDispatchOk")}`);
+                } else {
+                    log.warn(`[${questName}] ${t("logActivityDispatchFailed")}${dispatchResult?.error || "unknown"}`);
+                }
+
+                const progressBeforePoll = serverProgress;
+                let polledProgress = progressBeforePoll;
+                for (const id of groupQuestIds) {
+                    polledProgress = Math.max(
+                        polledProgress,
+                        await pollServerCheckpointProgress(
+                            id, taskName, checkpointCount, polledProgress, QuestsStore, sleep
+                        )
+                    );
+                }
+                const apiPolled = await fetchBestProgressForGroup(groupQuestIds, apiGet);
+                const confirmedProgress = Math.max(polledProgress, apiPolled);
+                if (dispatchResult?.success) {
+                    const displayProgress = Math.max(serverProgress, confirmedProgress);
+                    serverProgress = displayProgress;
+                    updateQuestProgress(quest.id, displayProgress, checkpointCount);
+                    if (confirmedProgress > progressBeforePoll) {
+                        stalledDispatches = 0;
+                        log.info(`[${questName}] ${t("logActivityServerProgress")
+                            .replace("{n}", String(confirmedProgress))
+                            .replace("{total}", String(checkpointCount))}`);
+                    } else {
+                        stalledDispatches += 1;
+                        log.warn(`[${questName}] ${t("logActivityServerProgressPending")}`);
+                        if (stalledDispatches >= 2 && confirmedProgress <= progressAtStart) {
+                            log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            if (serverProgress >= checkpointCount) {
+                updateQuestProgress(quest.id, checkpointCount, checkpointCount);
+                return true;
+            }
+
+            log.info(`[${questName}] ${t("logActivityVerify")}`);
+            for (let attempt = 0; attempt < 6; attempt++) {
+                if (!taskState.active) return false;
+
+                let status;
+                try {
+                    status = parseFrameResult(
+                        await execInActivityFrame(applicationId, buildCheckActivityQuestStatusJs(questId))
+                    );
+                } catch (e) {
+                    log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
+                    return false;
+                }
+                if (status?.completed) {
+                    updateQuestProgress(quest.id, checkpointCount, checkpointCount);
+                    return true;
+                }
+
+                for (const id of groupQuestIds) {
+                    const live = QuestsStore.quests.get(id);
+                    if (live?.userStatus?.completedAt) {
+                        updateQuestProgress(quest.id, checkpointCount, checkpointCount);
+                        return true;
+                    }
+                }
+
+                const liveProgress = await resolveCompletedCheckpointsAsync(
+                    questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
+                );
+                if (liveProgress >= checkpointCount) {
+                    updateQuestProgress(quest.id, checkpointCount, checkpointCount);
+                    return true;
+                }
+
+                await sleep(2000);
+            }
+
+            log.warn(`[${questName}] ${t("logActivityVerifyPending")}`);
+            log.error(`[${questName}] ${t("logActivityVerifyFailed")}`);
+            return false;
+        }
+    };
+}
+
+
+/*
+ * Quests Manager — ported from console script for Vencord
+ */
+
+// resolveStores() provided by console-runtime.js
+
+let mounted = false;
+let panelHidden = false;
+
+function isQuestsManagerOpen() {
+    return mounted && !panelHidden && !!document.getElementById("dqm-gui");
+}
+
+function toggleQuestsManager() {
+    if (isQuestsManagerOpen()) {
+        hidePanel();
+        return;
+    }
+    if (mounted && panelHidden) {
+        showPanel();
+        return;
+    }
+    mountQuestsManager();
+}
+
+function unmountQuestsManager() {
+    if (typeof globalThis.__DQM_UNMOUNT === "function") {
+        try { globalThis.__DQM_UNMOUNT(); } catch (_) {}
+    }
+    mounted = false;
+    panelHidden = false;
+}
+
+function hidePanel() {
+    const g = document.getElementById("dqm-gui");
+    const mini = document.getElementById("dqm-mini-icon");
+    if (g) g.style.display = "none";
+    if (mini) mini.style.display = "none";
+    panelHidden = true;
+}
+
+function showPanel() {
+    const g = document.getElementById("dqm-gui");
+    const mini = document.getElementById("dqm-mini-icon");
+    if (g) {
+        g.style.display = "flex";
+        if (mini) mini.style.display = "none";
+        panelHidden = false;
+        return;
+    }
+    mountQuestsManager();
+}
+
+function mountQuestsManager() {
+    if (mounted && document.getElementById("dqm-gui")) {
+        showPanel();
+        return;
+    }
+
+    if (typeof globalThis.__DQM_UNMOUNT === "function") {
+        try { globalThis.__DQM_UNMOUNT(); } catch (_) {}
+    }
+
+    const stores = resolveStores();
+
+    let ApplicationStreamingStore = stores.ApplicationStreamingStore;
+    let RunningGameStore = stores.RunningGameStore;
+    let QuestsStore = stores.QuestsStore;
+    let ChannelStore = stores.ChannelStore;
+    let GuildChannelStore = stores.GuildChannelStore;
+    let FluxDispatcher = stores.FluxDispatcher;
+    let api = stores.api;
+
+    const missing = [];
+    if (!QuestsStore) missing.push("QuestsStore");
+    if (!api) missing.push("API");
+    if (!FluxDispatcher) missing.push("FluxDispatcher");
+    if (!RunningGameStore) missing.push("RunningGameStore (desktop play)");
+    if (!ApplicationStreamingStore) missing.push("ApplicationStreamingStore (stream)");
+    if (!ChannelStore) missing.push("ChannelStore (stream)");
+    if (!GuildChannelStore) missing.push("GuildChannelStore (stream)");
+
+    const LOG_CAP = 200;
+    const API_RETRIES = 3;
+    const API_RETRY_BASE_MS = 600;
+    const supportedTasks = new Set([
+        "WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP",
+        "PLAY_ACTIVITY", "ACHIEVEMENT_IN_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"
+    ]);
+    const isApp = typeof DiscordNative !== "undefined";
+
+    let currentFilter = "incomplete";
+    let currentCountryFilter = "all";
+    let currentLang = "en";
+    let batchStopRequested = false;
+    let batchRunning = false;
+
+
+    let gui = null;
+    let logBox = null;
+    let listContainer = null;
+    let emptyStateEl = null;
+    let miniIcon = null;
+    let batchStrip = null;
+    let stopAllBtn = null;
+
+
+    const dqmTasks = new Map();
+    const questRuntime = new Map();
+    const cardByQuestId = new Map();
+    const orbsCache = new Map();
+    const activeCleanups = new Set();
+    let gameDetectHold = null;
+    let userOrbsBalance = null;
+    const claimsInFlight = new Set();
+    const acceptsInFlight = new Set();
+    const launchesInFlight = new Set();
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+
+    const showFatalPanel = (lines) => {
+        document.getElementById("dqm-gui")?.remove();
+        document.getElementById("dqm-gui-slynxe")?.remove();
+        const el = document.createElement("div");
+        el.id = "dqm-gui";
+        el.style.cssText = "position:fixed;top:80px;right:24px;z-index:999999;width:420px;padding:20px;border-radius:14px;background:#1e1f22;color:#f2f3f5;font-family:gg sans,Helvetica,Arial,sans-serif;border:1px solid #5865F2;box-shadow:0 12px 40px rgba(0,0,0,.55);";
+        el.innerHTML = `<div style="font-weight:700;font-size:16px;margin-bottom:8px;">Quests Manager</div>`;
+        const p = document.createElement("div");
+        p.style.cssText = "font-size:13px;color:#b5bac1;line-height:1.5;white-space:pre-wrap;";
+        p.textContent = lines.join("\n");
+        el.appendChild(p);
+        const close = document.createElement("button");
+        close.textContent = "Close";
+        close.style.cssText = "margin-top:14px;background:#5865F2;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-weight:600;";
+        close.onclick = () => el.remove();
+        el.appendChild(close);
+        document.body.appendChild(el);
+    };
+
+    if (!QuestsStore || !api) {
+        showFatalPanel([
+            "Critical Discord modules not found.",
+            "Missing: " + missing.filter(m => m === "QuestsStore" || m === "API").join(", "),
+            "Discord may have updated. Reopen Discord and try again."
+        ]);
+        return;
+    }
+
+
+    const i18n = {
+        en: {
+            title: "Quests Manager",
+            btnComplete: "Complete All",
+            btnStopAll: "Stop All",
+            btnRefresh: "Refresh",
+            btnCopy: "Copy logs",
+            btnLang: "عربي",
+            btnMinimize: "Minimize",
+            btnClose: "Close",
+            tabIncomplete: "Incomplete",
+            tabClaimable: "Claimable",
+            tabComplete: "Completed",
+            logReady: "Ready. Rework by X2 Salah.",
+            logReadyServer: "Discord Server: https://discord.gg/btRCeujadA",
+            statusNotEnrolled: "Not enrolled",
+            statusInProgress: "In progress",
+            statusCompleted: "Completed (Claim)",
+            statusClaimable: "Ready to claim",
+            statusClaimed: "Claimed",
+            btnCheckUpdate: "Check update",
+            btnApplyUpdate: "Update now",
+            updateChecking: "Checking for updates…",
+            updateLatest: "Up to date",
+            updateAvailable: "Update available: {tag}",
+            updateApplying: "Installing update…",
+            updateDone: "Update installed. Restart Discord to finish.",
+            updateFailed: "Update failed: ",
+            updateCheckFailed: "Update check failed: ",
+            statusRunning: "Running",
+            statusStopped: "Stopped",
+            statusError: "Error",
+            btnClaim: "Claim reward",
+            btnStart: "Start",
+            btnStop: "Stop",
+            btnOpenDiscord: "Open in Discord",
+            btnActivate: "Activate",
+            btnActivating: "Activating...",
+            logActivateClick: "Activating quest...",
+            logActivateSuccess: "Quest activated.",
+            logActivateFailed: "Activation failed: ",
+            logAlreadyRunning: "Quest already being processed.",
+            logCompleted: "Completed!",
+            logAPIError: "API error: ",
+            logNoQuests: "No incomplete quests to execute.",
+            logBatchStart: "Starting automatic execution for ",
+            logBatchEnd: " quest(s)…",
+            logAllDone: "All quests processed.",
+            logExecStart: "Starting execution (type: ",
+            logExecImpossible: "Impossible: use Discord Desktop app.",
+            logSpoofGame: "Spoofed game: ",
+            logSpoofWait: ". Wait ",
+            logSpoofMinutes: " more minutes.",
+            logSpoofStream: "Spoofed stream for ",
+            logSpoofStreamNote: ". Stream any window in VC for ",
+            logSpoofVCNote: " more minutes. Need at least 1 other person in VC.",
+            logTaskNotSupported: "Task type not supported: ",
+            logError: "Error: ",
+            logVideo: "Video",
+            logGame: "Game",
+            logActivity: "Activity",
+            logStream: "Stream",
+            logCopySuccess: "Logs copied to clipboard!",
+            logCopyError: "Failed to copy logs.",
+            logNoData: "No local data found.",
+            logNoCategory: "No quests in this category.",
+            logRefresh: "Refreshed.",
+            logUnknownError: "Unknown error.",
+            logStackTrace: "Stack: ",
+            progressLabel: "Progress",
+            progressLabelCheckpoints: "checkpoints",
+            logNotEnrolled: "Quest not enrolled. Skipping.",
+            logLaunchClick: "Opening quest page in Discord…",
+            logLaunchFound: "Discord Launch Quest button clicked.",
+            logLaunchNotFound: "Discord Launch Quest button not found on quest page.",
+            logClaimClick: "Attempting to claim reward…",
+            logClaimFound: "Reward claimed successfully.",
+            logClaimNotFound: "Could not claim reward automatically.",
+            logClaimMarked: "Reward confirmed.",
+            logClaimPending: "Claim submitted — waiting for Discord to confirm…",
+            logClaimManual: "Claim failed. Please claim manually in the Quests tab.",
+            logClaimAlready: "Reward already claimed.",
+            logClaimNotReady: "Quest not completed yet.",
+            logStopped: "Stopped.",
+            logStopAll: "Stop All requested — finishing current cleanup…",
+            logStopGameHold: "Play Game paused in Quests Manager. If the real game is still open on your PC, Discord may keep adding progress — close the game to fully pause.",
+            logBatchSummary: "Batch summary — ok: ",
+            logBatchSkipped: ", skipped: ",
+            logBatchFailed: ", failed: ",
+            logNoVoice: "No voice channel found.",
+            labelType: "Type",
+            labelOrbs: "Orbs",
+            labelStatus: "Status",
+            labelEnds: "Ends",
+            labelCountry: "Country",
+            countryGlobal: "Global",
+            countryDetecting: "Detecting…",
+            countryUnknown: "Unknown",
+            countryExcept: "Global −{codes}",
+            countrySourceCatalog: "Source: catalog",
+            countrySourceInferred: "Source: inferred (VPN/IP)",
+            countrySourceOverride: "Source: manual override",
+            countrySourceUnknown: "Source: unknown",
+            countryFilterAll: "All countries",
+            countryFilterGlobal: "Global",
+            countryFilterUnknown: "Unknown",
+            labelCountryFilter: "Filter by country",
+            labelYourLocation: "Location",
+            labelEta: "ETA",
+            statQuests: "Quests",
+            statOrbs: "Orbs",
+            statRunning: "Running",
+            batchPreparing: "Preparing…",
+            batchProgress: "Quest {i} of {n}",
+            batchCurrent: "Current: ",
+            batchOverall: "Overall",
+            typeVideo: "Video",
+            typePlay: "Play Game",
+            typeStream: "Stream",
+            typeLaunch: "Launch Quest",
+            typeOther: "Other",
+            warnPartialModules: "Some optional modules missing (desktop/stream/activity may be limited).",
+            activityLaunchTitle: "Launch Activity Quest",
+            activityLaunchDesc: "This quest requires launching a Discord Activity. Follow these steps:",
+            activityLaunchStep1: "Navigate to the quest page in Discord",
+            activityLaunchStep2: "Click 'Launch Quest' in Discord to open the Activity",
+            activityLaunchStep3: "Complete any authorization prompts in Discord",
+            activityLaunchStep4: "Return here and click 'Start Quest' to begin checkpoints",
+            activityLaunchStep5: "If the activity shows a START button, click it inside the activity window",
+            activityLaunchStart: "Start Quest",
+            activityLaunchCancel: "Cancel",
+            activityLaunchNavigate: "Open Quest in Discord",
+            activityLaunchNavigateError: "Could not navigate to the quest page in Discord.",
+            logCheckpoint: "Checkpoint ",
+            logCheckpointWait: "Waiting for checkpoint ",
+            logWaitingForActivity: "Waiting for activity iframe…",
+            logActivityNotFound: "Activity not found. Click Launch Quest in Discord and authorize the activity.",
+            logActivityInit: "Initializing activity SDK…",
+            logActivityInitFailed: "Activity SDK init failed: ",
+            logActivityVerify: "Verifying quest completion…",
+            logActivityVerifyPending: "Checkpoints submitted — waiting for Discord to confirm completion.",
+            logActivityVerifyFailed: "Discord never confirmed completion. Progress stayed unchanged — not marking as completed.",
+            logActivityCheckpointsDone: "All checkpoints already submitted.",
+            logActivityMissingAppId: "Activity quest is missing an application ID.",
+            logActivityLaunchFirst: "Launching quest in Discord…",
+            logActivityNativeRequired: "Launch Quest requires Discord with --remote-debugging-port=9223. Close Discord, add that flag to the shortcut, then restart.",
+            logActivityFrameNotReady: "Activity frame not ready. Ensure the activity is fully loaded and authorized in Discord.",
+            logActivityWrongApp: "Wrong activity is open. Close other activities and launch this quest's activity first.",
+            logActivityAuthPending: "Activity not authorized yet. Complete Discord authorization prompts, then click Start again.",
+            logActivityInitRetry: "Waiting for activity authorization… (attempt {n}/{max})",
+            logActivitySdkWaiting: "Waiting for activity SDK… (attempt {n}/{max})",
+            logActivityStartTimerIgnored: "questStartTimer was skipped but quest context is valid; continuing with checkpoints. ",
+            logActivityTimerRequired: "questStartTimer never succeeded. Aborting — Discord will not accept checkpoints without an active quest timer.",
+            logActivityLaunching: "Launching quest in Discord…",
+            logActivityDomFound: "Activity iframe visible in Discord — waiting for native frame access…",
+            logActivityWaitHint: "If this times out, click Open in Discord, complete Launch Quest + authorization, then try Start again.",
+            logActivityCheckpointPlan: "{count} checkpoints × {min}–{max}s ≈ {mins} min total",
+            logCheckpointWaitRemaining: "Checkpoint {n}/{total} — {secs}s remaining",
+            logActivityDispatchOk: "Checkpoint event dispatched successfully.",
+            logActivityDispatchFailed: "Checkpoint event dispatch failed: ",
+            logActivityServerProgress: "Discord confirmed checkpoint progress: {n}/{total}",
+            logActivityServerProgressPending: "Checkpoint dispatched but Discord progress unchanged — quest timer may not be active.",
+            logActivityProgressStalled: "Discord progress still unchanged after multiple checkpoints. Aborting to avoid a false completion.",
+            logActivityResumeCheckpoints: "Resuming from checkpoint {done}/{total}",
+            logActivityTimerRetry: "Retrying questStartTimer… (attempt {n}/{max})",
+            settingsCheckpointMin: "Checkpoint min",
+            settingsCheckpointMax: "Checkpoint max",
+            settingsCheckpointUnit: "s",
+            settingsCheckpointHint: "Activity quest wait between checkpoints (30–600s). Applies on next Start.",
+            labelMergedListings: "{n} listings merged"
+        },
+        ar: {
+            title: "مدير المهام",
+            btnComplete: "إكمال الكل",
+            btnStopAll: "إيقاف الكل",
+            btnRefresh: "تحديث",
+            btnCopy: "نسخ السجلات",
+            btnLang: "English",
+            btnMinimize: "تصغير",
+            btnClose: "إغلاق",
+            tabIncomplete: "غير مكتملة",
+            tabClaimable: "قابلة للاستلام",
+            tabComplete: "مكتملة",
+            logReady: "جاهز. إعادة تصميم بواسطة X2 Salah.",
+            logReadyServer: "سيرفر ديسكورد: https://discord.gg/btRCeujadA",
+            statusNotEnrolled: "لم يتم الالتحاق",
+            statusInProgress: "قيد التنفيذ",
+            statusCompleted: "مكتملة (استلام)",
+            statusClaimable: "جاهزة للاستلام",
+            statusClaimed: "تم الاستلام",
+            btnCheckUpdate: "تحقق من التحديث",
+            btnApplyUpdate: "حدّث الآن",
+            updateChecking: "جارٍ التحقق من التحديثات…",
+            updateLatest: "أنت على أحدث إصدار",
+            updateAvailable: "يتوفر تحديث: {tag}",
+            updateApplying: "جارٍ تثبيت التحديث…",
+            updateDone: "تم التثبيت. أعد تشغيل ديسكورد للإكمال.",
+            updateFailed: "فشل التحديث: ",
+            updateCheckFailed: "فشل التحقق من التحديث: ",
+            statusRunning: "قيد التشغيل",
+            statusStopped: "متوقفة",
+            statusError: "خطأ",
+            btnClaim: "استلام المكافأة",
+            btnStart: "بدء",
+            btnStop: "إيقاف",
+            btnOpenDiscord: "فتح في ديسكورد",
+            btnActivate: "تفعيل",
+            btnActivating: "جاري التفعيل...",
+            logActivateClick: "جاري تفعيل المهمة...",
+            logActivateSuccess: "تم تفعيل المهمة.",
+            logActivateFailed: "فشل التفعيل: ",
+            logAlreadyRunning: "المهمة قيد المعالجة بالفعل.",
+            logCompleted: "مكتملة!",
+            logAPIError: "خطأ في API: ",
+            logNoQuests: "لا توجد مهام غير مكتملة.",
+            logBatchStart: "بدء التنفيذ لـ ",
+            logBatchEnd: " مهمة(مهام)…",
+            logAllDone: "تمت معالجة جميع المهام.",
+            logExecStart: "بدء التنفيذ (النوع: ",
+            logExecImpossible: "غير ممكن: استخدم تطبيق ديسكورد المكتبي.",
+            logSpoofGame: "تم محاكاة اللعبة: ",
+            logSpoofWait: ". انتظر ",
+            logSpoofMinutes: " دقائق إضافية.",
+            logSpoofStream: "تم محاكاة البث لـ ",
+            logSpoofStreamNote: ". قم ببث أي نافذة في غرفة صوتية لمدة ",
+            logSpoofVCNote: " دقائق إضافية. تحتاج شخص واحد آخر على الأقل.",
+            logTaskNotSupported: "نوع المهمة غير مدعوم: ",
+            logError: "خطأ: ",
+            logVideo: "فيديو",
+            logGame: "لعبة",
+            logActivity: "نشاط",
+            logStream: "بث",
+            logCopySuccess: "تم نسخ السجلات!",
+            logCopyError: "فشل النسخ.",
+            logNoData: "لا توجد بيانات.",
+            logNoCategory: "لا توجد مهام في هذه الفئة.",
+            logRefresh: "تم التحديث.",
+            logUnknownError: "خطأ غير معروف.",
+            logStackTrace: "تتبع المكدس: ",
+            progressLabel: "التقدم",
+            progressLabelCheckpoints: "نقاط تفتيش",
+            logNotEnrolled: "المهمة غير مسجلة. تخطي.",
+            logLaunchClick: "جاري فتح صفحة المهمة في ديسكورد…",
+            logLaunchFound: "تم النقر على زر تشغيل المهمة في ديسكورد.",
+            logLaunchNotFound: "لم يتم العثور على زر تشغيل المهمة في صفحة المهمة.",
+            logClaimClick: "محاولة استلام المكافأة…",
+            logClaimFound: "تم استلام المكافأة بنجاح.",
+            logClaimNotFound: "تعذر استلام المكافأة تلقائيًا.",
+            logClaimMarked: "تم تأكيد المكافأة.",
+            logClaimPending: "تم إرسال الاستلام — بانتظار تأكيد ديسكورد…",
+            logClaimManual: "فشل الاستلام. يرجى الاستلام يدويًا من تبويب المهام.",
+            logClaimAlready: "تم استلام المكافأة مسبقًا.",
+            logClaimNotReady: "المهمة غير مكتملة بعد.",
+            logStopped: "تم الإيقاف.",
+            logStopAll: "تم طلب إيقاف الكل — جاري التنظيف…",
+            logStopGameHold: "تم إيقاف اللعب في مدير المهام. إذا كانت اللعبة لا تزال مفتوحة على جهازك، قد يستمر ديسكورد في التقدم — أغلق اللعبة للإيقاف الكامل.",
+            logBatchSummary: "ملخص الدفعة — نجح: ",
+            logBatchSkipped: "، تخطي: ",
+            logBatchFailed: "، فشل: ",
+            logNoVoice: "لم يتم العثور على قناة صوتية.",
+            labelType: "النوع",
+            labelOrbs: "الأورب",
+            labelStatus: "الحالة",
+            labelEnds: "ينتهي",
+            labelCountry: "الدولة",
+            countryGlobal: "عام",
+            countryDetecting: "جاري الاكتشاف…",
+            countryUnknown: "غير معروف",
+            countryExcept: "عام −{codes}",
+            countrySourceCatalog: "المصدر: الكتالوج",
+            countrySourceInferred: "المصدر: استنتاج (VPN/IP)",
+            countrySourceOverride: "المصدر: تجاوز يدوي",
+            countrySourceUnknown: "المصدر: غير معروف",
+            countryFilterAll: "كل الدول",
+            countryFilterGlobal: "عام",
+            countryFilterUnknown: "غير معروف",
+            labelCountryFilter: "تصفية حسب الدولة",
+            labelYourLocation: "موقعك",
+            labelEta: "الوقت المتبقي",
+            statQuests: "المهام",
+            statOrbs: "الأورب",
+            statRunning: "قيد التشغيل",
+            batchPreparing: "جاري التحضير…",
+            batchProgress: "مهمة {i} من {n}",
+            batchCurrent: "الحالية: ",
+            batchOverall: "الإجمالي",
+            typeVideo: "فيديو",
+            typePlay: "لعب",
+            typeStream: "بث",
+            typeLaunch: "تشغيل مهمة",
+            typeOther: "أخرى",
+            warnPartialModules: "بعض الوحدات الاختيارية غير موجودة (قد يُقيَّد اللعب/البث/النشاط).",
+            activityLaunchTitle: "تشغيل مهمة النشاط",
+            activityLaunchDesc: "تتطلب هذه المهمة تشغيل نشاط ديسكورد. اتبع الخطوات التالية:",
+            activityLaunchStep1: "انتقل إلى صفحة المهمة في ديسكورد",
+            activityLaunchStep2: "انقر على 'تشغيل المهمة' في ديسكورد لفتح النشاط",
+            activityLaunchStep3: "أكمل أي مطالبات تفويض في ديسكورد",
+            activityLaunchStep4: "عد هنا وانقر على 'بدء المهمة' لبدء نقاط التفتيش",
+            activityLaunchStep5: "إذا ظهر زر START داخل النشاط، انقر عليه في نافذة النشاط",
+            activityLaunchStart: "بدء المهمة",
+            activityLaunchCancel: "إلغاء",
+            activityLaunchNavigate: "فتح المهمة في ديسكورد",
+            activityLaunchNavigateError: "تعذر الانتقال إلى صفحة المهمة في ديسكورد.",
+            logCheckpoint: "نقطة تفتيش ",
+            logCheckpointWait: "انتظار نقطة التفتيش ",
+            logWaitingForActivity: "بانتظار إطار النشاط…",
+            logActivityNotFound: "لم يتم العثور على النشاط. انقر على تشغيل المهمة في ديسكورد وقم بالتفويض.",
+            logActivityInit: "جاري تهيئة SDK للنشاط…",
+            logActivityInitFailed: "فشل تهيئة SDK للنشاط: ",
+            logActivityVerify: "جاري التحقق من إكمال المهمة…",
+            logActivityVerifyPending: "تم إرسال نقاط التفتيش — بانتظار تأكيد ديسكورد.",
+            logActivityVerifyFailed: "لم يؤكد ديسكورد الإكمال. بقي التقدم دون تغيير — لن يتم اعتبار المهمة مكتملة.",
+            logActivityCheckpointsDone: "تم إرسال جميع نقاط التفتيش مسبقًا.",
+            logActivityMissingAppId: "مهمة النشاط تفتقد معرف التطبيق.",
+            logActivityLaunchFirst: "جاري تشغيل المهمة في ديسكورد…",
+            logActivityNativeRequired: "مهمة التشغيل تتطلب تشغيل ديسكورد مع --remote-debugging-port=9223. أغلق ديسكورد، أضف العلم إلى الاختصار، ثم أعد التشغيل.",
+            logActivityFrameNotReady: "إطار النشاط غير جاهز. تأكد من تحميل النشاط بالكامل والتفويض في ديسكورد.",
+            logActivityWrongApp: "نشاط خاطئ مفتوح. أغلق الأنشطة الأخرى وشغّل نشاط هذه المهمة أولاً.",
+            logActivityAuthPending: "النشاط غير مُصرَّح به بعد. أكمل مطالبات التفويض في ديسكورد، ثم انقر على ابدأ مرة أخرى.",
+            logActivityInitRetry: "بانتظار تفويض النشاط… (محاولة {n}/{max})",
+            logActivitySdkWaiting: "بانتظار SDK للنشاط… (محاولة {n}/{max})",
+            logActivityStartTimerIgnored: "تم تخطي questStartTimer لكن سياق المهمة صالح؛ متابعة نقاط التفتيش. ",
+            logActivityTimerRequired: "فشل questStartTimer. تم الإيقاف — لن يقبل ديسكورد نقاط التفتيش بدون مؤقت مهمة نشط.",
+            logActivityLaunching: "جاري تشغيل المهمة في ديسكورد…",
+            logActivityDomFound: "إطار النشاط ظاهر في ديسكورد — بانتظار الوصول الأصلي للإطار…",
+            logActivityWaitHint: "إذا انتهت المهلة، انقر على فتح في ديسكورد، أكمل تشغيل المهمة والتفويض، ثم حاول البدء مرة أخرى.",
+            logActivityCheckpointPlan: "{count} نقاط تفتيش × {min}–{max}ث ≈ {mins} دقيقة إجمالاً",
+            logCheckpointWaitRemaining: "نقطة التفتيش {n}/{total} — متبقي {secs}ث",
+            logActivityDispatchOk: "تم إرسال حدث نقطة التفتيش بنجاح.",
+            logActivityDispatchFailed: "فشل إرسال حدث نقطة التفتيش: ",
+            logActivityServerProgress: "أكد ديسكورد تقدم نقطة التفتيش: {n}/{total}",
+            logActivityServerProgressPending: "تم إرسال نقطة التفتيش لكن تقدم ديسكورد لم يتغير — قد لا يكون مؤقت المهمة نشطاً.",
+            logActivityProgressStalled: "تقدم ديسكورد ما زال دون تغيير بعد عدة نقاط تفتيش. تم الإيقاف لتجنب إكمال خاطئ.",
+            logActivityResumeCheckpoints: "استئناف من نقطة التفتيش {done}/{total}",
+            logActivityTimerRetry: "إعادة محاولة questStartTimer… (محاولة {n}/{max})",
+            settingsCheckpointMin: "الحد الأدنى للنقطة",
+            settingsCheckpointMax: "الحد الأقصى للنقطة",
+            settingsCheckpointUnit: "ث",
+            settingsCheckpointHint: "انتظار مهام النشاط بين نقاط التفتيش (30–600ث). يُطبَّق عند البدء التالي.",
+            labelMergedListings: "تم دمج {n} قوائم"
+        }
+    };
+
+    const t = (key) => i18n[currentLang][key] || i18n.en[key] || key;
+    const timeLocale = () => (currentLang === "ar" ? "ar" : "en-GB");
+
+    const STORAGE_COUNTRY_OVERRIDES_KEY = "questHelper_questCountryOverrides";
+    const STORAGE_INFERRED_COUNTRIES_KEY = "questHelper_inferredCountries";
+    const STORAGE_LAST_IP_COUNTRY_KEY = "questHelper_lastIpCountry";
+    const STORAGE_QUEST_REGIONS_KEY = "questHelper_questRegions";
+    const STORAGE_VPN_BASELINE_KEY = "questHelper_vpnCountryBaseline";
+    const STORAGE_POISONED_AUTO_KEY = "questHelper_questCountries";
+    const IP_COUNTRY_TTL_MS = 5 * 60 * 1000;
+    const REGIONS_TTL_MS = 6 * 60 * 60 * 1000;
+    const REGIONS_URL = "https://api.discordquest.com/api/regions";
+    const COUNTRY_GLOBAL = "";
+    const COUNTRY_ALIASES = { UK: "GB" };
+
+    // Wipe legacy IP auto-stamps that wrongly labeled every quest as the VPN country.
+    try { localStorage.removeItem(STORAGE_POISONED_AUTO_KEY); } catch (_) {}
+
+    const COUNTRY_OPTIONS = [
+        { code: "US", name: "United States" },
+        { code: "GB", name: "United Kingdom" },
+        { code: "CA", name: "Canada" },
+        { code: "AU", name: "Australia" },
+        { code: "DE", name: "Germany" },
+        { code: "FR", name: "France" },
+        { code: "NL", name: "Netherlands" },
+        { code: "BE", name: "Belgium" },
+        { code: "IE", name: "Ireland" },
+        { code: "ES", name: "Spain" },
+        { code: "IT", name: "Italy" },
+        { code: "PT", name: "Portugal" },
+        { code: "PL", name: "Poland" },
+        { code: "SE", name: "Sweden" },
+        { code: "NO", name: "Norway" },
+        { code: "DK", name: "Denmark" },
+        { code: "FI", name: "Finland" },
+        { code: "CH", name: "Switzerland" },
+        { code: "AT", name: "Austria" },
+        { code: "CZ", name: "Czechia" },
+        { code: "RO", name: "Romania" },
+        { code: "HU", name: "Hungary" },
+        { code: "GR", name: "Greece" },
+        { code: "TR", name: "Turkey" },
+        { code: "UA", name: "Ukraine" },
+        { code: "RU", name: "Russia" },
+        { code: "BR", name: "Brazil" },
+        { code: "MX", name: "Mexico" },
+        { code: "AR", name: "Argentina" },
+        { code: "CL", name: "Chile" },
+        { code: "CO", name: "Colombia" },
+        { code: "JP", name: "Japan" },
+        { code: "KR", name: "South Korea" },
+        { code: "CN", name: "China" },
+        { code: "TW", name: "Taiwan" },
+        { code: "HK", name: "Hong Kong" },
+        { code: "SG", name: "Singapore" },
+        { code: "MY", name: "Malaysia" },
+        { code: "TH", name: "Thailand" },
+        { code: "VN", name: "Vietnam" },
+        { code: "PH", name: "Philippines" },
+        { code: "ID", name: "Indonesia" },
+        { code: "IN", name: "India" },
+        { code: "PK", name: "Pakistan" },
+        { code: "BD", name: "Bangladesh" },
+        { code: "AE", name: "United Arab Emirates" },
+        { code: "SA", name: "Saudi Arabia" },
+        { code: "QA", name: "Qatar" },
+        { code: "KW", name: "Kuwait" },
+        { code: "BH", name: "Bahrain" },
+        { code: "OM", name: "Oman" },
+        { code: "EG", name: "Egypt" },
+        { code: "ZA", name: "South Africa" },
+        { code: "NG", name: "Nigeria" },
+        { code: "IL", name: "Israel" },
+        { code: "NZ", name: "New Zealand" },
+    ];
+
+    const COUNTRY_NAME_BY_CODE = Object.fromEntries(COUNTRY_OPTIONS.map(c => [c.code, c.name]));
+
+    const flagEmojiFromCode = (code) => {
+        if (!code || code.length !== 2) return "🌐";
+        const upper = code.toUpperCase();
+        const a = upper.charCodeAt(0);
+        const b = upper.charCodeAt(1);
+        if (a < 65 || a > 90 || b < 65 || b > 90) return "🌐";
+        return String.fromCodePoint(0x1F1E6 + (a - 65), 0x1F1E6 + (b - 65));
+    };
+
+    const normalizeCountryCode = (raw) => {
+        if (raw == null || raw === "") return COUNTRY_GLOBAL;
+        let code = String(raw).trim().toUpperCase();
+        if (COUNTRY_ALIASES[code]) code = COUNTRY_ALIASES[code];
+        if (code.length !== 2) return COUNTRY_GLOBAL;
+        const a = code.charCodeAt(0);
+        const b = code.charCodeAt(1);
+        if (a < 65 || a > 90 || b < 65 || b > 90) return COUNTRY_GLOBAL;
+        return code;
+    };
+
+    const countryDisplayName = (code) => {
+        const normalized = normalizeCountryCode(code);
+        if (!normalized) return t("countryGlobal");
+        return COUNTRY_NAME_BY_CODE[normalized] || normalized;
+    };
+
+    const makeRichCatalogEntry = ({ isGlobal, include, exclude, mode, primary }) => {
+        const inc = (include || []).map(normalizeCountryCode).filter(Boolean);
+        const exc = (exclude || []).map(normalizeCountryCode).filter(Boolean);
+        const prim = normalizeCountryCode(primary) || (mode === "include" && inc[0] ? inc[0] : COUNTRY_GLOBAL);
+        return {
+            isGlobal: !!isGlobal,
+            include: inc,
+            exclude: exc,
+            mode,
+            primary: prim,
+            extra: mode === "include" ? Math.max(0, inc.length - 1) : 0,
+            code: prim
+        };
+    };
+
+    const coerceCatalogEntry = (raw) => {
+        if (!raw || typeof raw !== "object") return null;
+        if (Array.isArray(raw.include) || Array.isArray(raw.exclude) || raw.mode) {
+            const include = (Array.isArray(raw.include) ? raw.include : []).map(normalizeCountryCode).filter(Boolean);
+            const exclude = (Array.isArray(raw.exclude) ? raw.exclude : []).map(normalizeCountryCode).filter(Boolean);
+            let mode = raw.mode;
+            if (mode !== "global" && mode !== "include" && mode !== "exclude" && mode !== "unknown") {
+                if (raw.isGlobal || raw.is_global) mode = "global";
+                else if (include.length) mode = "include";
+                else if (exclude.length) mode = "exclude";
+                else mode = "unknown";
+            }
+            const primary = mode === "include"
+                ? (normalizeCountryCode(raw.primary || raw.code) || include[0] || COUNTRY_GLOBAL)
+                : COUNTRY_GLOBAL;
+            return makeRichCatalogEntry({
+                isGlobal: mode === "global" || !!raw.isGlobal || !!raw.is_global,
+                include,
+                exclude,
+                mode,
+                primary
+            });
+        }
+        // Legacy { code, extra }
+        const code = normalizeCountryCode(raw.code);
+        if (code) {
+            return makeRichCatalogEntry({
+                isGlobal: false,
+                include: [code],
+                exclude: [],
+                mode: "include",
+                primary: code
+            });
+        }
+        return makeRichCatalogEntry({
+            isGlobal: true,
+            include: [],
+            exclude: [],
+            mode: "global",
+            primary: COUNTRY_GLOBAL
+        });
+    };
+
+    const coerceRegionsMap = (map) => {
+        if (!map || typeof map !== "object") return {};
+        const out = {};
+        for (const [id, entry] of Object.entries(map)) {
+            const coerced = coerceCatalogEntry(entry);
+            if (coerced) out[String(id)] = coerced;
+        }
+        return out;
+    };
+
+    let countryOverridesCache = null;
+    let inferredCountriesCache = null;
+    let ipCountryPromise = null;
+    let ipCountryMemory = null;
+    let regionsMemory = null;
+    let regionsPromise = null;
+    let regionsCatalogSettled = false;
+    let currentIpCountry = null;
+    let vpnInferenceCountry = null;
+    let vpnBaselineIds = new Set();
+    const countryResolveInFlight = new Set();
+
+    const loadJsonMap = (key) => {
+        try {
+            const raw = localStorage.getItem(key);
+            const parsed = raw ? JSON.parse(raw) : {};
+            return (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : {};
+        } catch (_) {
+            return {};
+        }
+    };
+
+    const loadCountryOverrides = () => {
+        if (countryOverridesCache) return countryOverridesCache;
+        countryOverridesCache = loadJsonMap(STORAGE_COUNTRY_OVERRIDES_KEY);
+        return countryOverridesCache;
+    };
+
+    const saveCountryOverrides = () => {
+        try {
+            localStorage.setItem(STORAGE_COUNTRY_OVERRIDES_KEY, JSON.stringify(loadCountryOverrides()));
+        } catch (_) {}
+    };
+
+    const getCountryOverride = (questId) => {
+        const map = loadCountryOverrides();
+        const id = String(questId);
+        if (!Object.prototype.hasOwnProperty.call(map, id)) return null;
+        return normalizeCountryCode(map[id]);
+    };
+
+    const setCountryOverride = (questId, code) => {
+        const map = loadCountryOverrides();
+        const id = String(questId);
+        map[id] = normalizeCountryCode(code);
+        saveCountryOverrides();
+        return map[id];
+    };
+
+    const loadInferredCountries = () => {
+        if (inferredCountriesCache) return inferredCountriesCache;
+        inferredCountriesCache = loadJsonMap(STORAGE_INFERRED_COUNTRIES_KEY);
+        return inferredCountriesCache;
+    };
+
+    const saveInferredCountries = () => {
+        try {
+            localStorage.setItem(STORAGE_INFERRED_COUNTRIES_KEY, JSON.stringify(loadInferredCountries()));
+        } catch (_) {}
+    };
+
+    const getInferredCountry = (questId) => {
+        const map = loadInferredCountries();
+        const id = String(questId);
+        if (!Object.prototype.hasOwnProperty.call(map, id)) return null;
+        const code = normalizeCountryCode(map[id]);
+        if (!code) {
+            delete map[id];
+            saveInferredCountries();
+            return null;
+        }
+        return code;
+    };
+
+    const setInferredCountry = (questId, code) => {
+        const normalized = normalizeCountryCode(code);
+        if (!normalized) return null;
+        const map = loadInferredCountries();
+        map[String(questId)] = normalized;
+        saveInferredCountries();
+        return normalized;
+    };
+
+    const clearInferredCountry = (questId) => {
+        const map = loadInferredCountries();
+        const id = String(questId);
+        if (!Object.prototype.hasOwnProperty.call(map, id)) return;
+        delete map[id];
+        saveInferredCountries();
+    };
+
+    const getEmbeddedRegionsSnapshot = () => {
+        try {
+            const snap = (globalThis).__DQM_REGIONS_SNAPSHOT;
+            if (snap && typeof snap === "object" && !Array.isArray(snap)) return coerceRegionsMap(snap);
+        } catch (_) {}
+        return {};
+    };
+
+    const parseRegionsEntry = (entry) => {
+        if (!entry || typeof entry !== "object") {
+            return makeRichCatalogEntry({
+                isGlobal: false, include: [], exclude: [], mode: "unknown", primary: COUNTRY_GLOBAL
+            });
+        }
+        const includeRaw = Array.isArray(entry.regions?.include) ? entry.regions.include : [];
+        const excludeRaw = Array.isArray(entry.regions?.exclude) ? entry.regions.exclude : [];
+        const include = includeRaw.map(normalizeCountryCode).filter(Boolean);
+        const exclude = excludeRaw.map(normalizeCountryCode).filter(Boolean);
+
+        if (entry.is_global) {
+            return makeRichCatalogEntry({
+                isGlobal: true, include: [], exclude: [], mode: "global", primary: COUNTRY_GLOBAL
+            });
+        }
+        if (include.length) {
+            return makeRichCatalogEntry({
+                isGlobal: false, include, exclude, mode: "include", primary: include[0]
+            });
+        }
+        if (exclude.length) {
+            return makeRichCatalogEntry({
+                isGlobal: false, include: [], exclude, mode: "exclude", primary: COUNTRY_GLOBAL
+            });
+        }
+        return makeRichCatalogEntry({
+            isGlobal: false, include: [], exclude: [], mode: "unknown", primary: COUNTRY_GLOBAL
+        });
+    };
+
+    const regionsMapHasEntries = (map) => !!(map && typeof map === "object" && Object.keys(map).length > 0);
+
+    const mergeRegionsMaps = (...maps) => {
+        const out = {};
+        for (const map of maps) {
+            if (!map || typeof map !== "object") continue;
+            for (const [id, entry] of Object.entries(map)) {
+                const coerced = coerceCatalogEntry(entry);
+                if (coerced) out[String(id)] = coerced;
+            }
+        }
+        return out;
+    };
+
+    const collectCatalogCountryCodes = (map) => {
+        const codes = new Set();
+        if (!map) return codes;
+        for (const entry of Object.values(map)) {
+            const coerced = coerceCatalogEntry(entry);
+            if (!coerced) continue;
+            for (const c of coerced.include) codes.add(c);
+            for (const c of coerced.exclude) codes.add(c);
+        }
+        return codes;
+    };
+
+    const readCachedRegions = ({ allowStale = false } = {}) => {
+        if (regionsMemory && regionsMapHasEntries(regionsMemory.map)) {
+            if (allowStale || (Date.now() - regionsMemory.fetchedAt) < REGIONS_TTL_MS) {
+                return regionsMemory.map;
+            }
+        }
+        try {
+            const raw = localStorage.getItem(STORAGE_QUEST_REGIONS_KEY);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed?.fetchedAt || !parsed?.byId || typeof parsed.byId !== "object") return null;
+            const age = Date.now() - Number(parsed.fetchedAt);
+            if (!allowStale && age >= REGIONS_TTL_MS) return null;
+            if (!regionsMapHasEntries(parsed.byId)) return null;
+            const map = coerceRegionsMap(parsed.byId);
+            regionsMemory = { map, fetchedAt: Number(parsed.fetchedAt) };
+            return regionsMemory.map;
+        } catch (_) {
+            return null;
+        }
+    };
+
+    const writeCachedRegions = (byId) => {
+        if (!regionsMapHasEntries(byId)) return;
+        const map = coerceRegionsMap(byId);
+        regionsMemory = { map, fetchedAt: Date.now() };
+        try {
+            localStorage.setItem(STORAGE_QUEST_REGIONS_KEY, JSON.stringify({
+                fetchedAt: regionsMemory.fetchedAt,
+                byId: map
+            }));
+        } catch (_) {}
+    };
+
+    const ensureRegionsCatalog = async ({ force = false } = {}) => {
+        if (!force) {
+            const cached = readCachedRegions();
+            if (cached) {
+                regionsCatalogSettled = true;
+                return cached;
+            }
+        }
+        if (regionsPromise) return regionsPromise;
+
+        regionsPromise = (async () => {
+            const base = mergeRegionsMaps(
+                getEmbeddedRegionsSnapshot(),
+                readCachedRegions({ allowStale: true }) || {}
+            );
+
+            try {
+                const res = await fetch(REGIONS_URL, { cache: "no-store" });
+                if (res.ok) {
+                    const data = await res.json();
+                    const list = Array.isArray(data?.quests) ? data.quests : [];
+                    const live = {};
+                    for (const entry of list) {
+                        if (entry?.id == null) continue;
+                        const parsed = parseRegionsEntry(entry);
+                        const id = String(entry.id);
+                        live[id] = parsed;
+                        if (entry.replacement_id != null) {
+                            live[String(entry.replacement_id)] = parsed;
+                        }
+                    }
+                    if (regionsMapHasEntries(live)) {
+                        const merged = mergeRegionsMaps(base, live);
+                        writeCachedRegions(merged);
+                        return merged;
+                    }
+                }
+            } catch (_) {}
+
+            if (regionsMapHasEntries(base)) {
+                writeCachedRegions(base);
+                return base;
+            }
+            return {};
+        })().finally(() => {
+            regionsCatalogSettled = true;
+            regionsPromise = null;
+        });
+
+        return regionsPromise;
+    };
+
+    const getCatalogCountry = (questId) => {
+        let map = readCachedRegions({ allowStale: true });
+        if (!map) {
+            const snap = getEmbeddedRegionsSnapshot();
+            if (regionsMapHasEntries(snap)) {
+                regionsMemory = { map: snap, fetchedAt: Date.now() };
+                map = snap;
+            }
+        }
+        if (!map) return undefined;
+        const id = String(questId);
+        if (!Object.prototype.hasOwnProperty.call(map, id)) return undefined;
+        return coerceCatalogEntry(map[id]) || undefined;
+    };
+
+    const pickCatalogPrimary = (catalog) => {
+        if (!catalog || catalog.mode !== "include" || !catalog.include?.length) return COUNTRY_GLOBAL;
+        const ip = currentIpCountry || vpnInferenceCountry;
+        if (ip && catalog.include.includes(ip)) return ip;
+        return catalog.include[0];
+    };
+
+    const bustIpCountryCache = () => {
+        ipCountryMemory = null;
+        ipCountryPromise = null;
+        try { localStorage.removeItem(STORAGE_LAST_IP_COUNTRY_KEY); } catch (_) {}
+    };
+
+    const readCachedIpCountry = () => {
+        if (ipCountryMemory && (Date.now() - ipCountryMemory.fetchedAt) < IP_COUNTRY_TTL_MS) {
+            return ipCountryMemory.code;
+        }
+        try {
+            const raw = localStorage.getItem(STORAGE_LAST_IP_COUNTRY_KEY);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed?.code || !parsed?.fetchedAt) return null;
+            if ((Date.now() - Number(parsed.fetchedAt)) >= IP_COUNTRY_TTL_MS) return null;
+            const code = normalizeCountryCode(parsed.code);
+            if (!code) return null;
+            ipCountryMemory = { code, fetchedAt: Number(parsed.fetchedAt) };
+            return code;
+        } catch (_) {
+            return null;
+        }
+    };
+
+    const writeCachedIpCountry = (code) => {
+        const normalized = normalizeCountryCode(code);
+        if (!normalized) return;
+        ipCountryMemory = { code: normalized, fetchedAt: Date.now() };
+        try {
+            localStorage.setItem(STORAGE_LAST_IP_COUNTRY_KEY, JSON.stringify(ipCountryMemory));
+        } catch (_) {}
+    };
+
+    const extractApiCountryCode = (res) => {
+        const body = res?.body ?? res;
+        return normalizeCountryCode(body?.country_code ?? body?.countryCode ?? body?.country);
+    };
+
+    const loadVpnBaseline = () => {
+        try {
+            const raw = localStorage.getItem(STORAGE_VPN_BASELINE_KEY);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed?.country || !Array.isArray(parsed?.questIds)) return null;
+            return {
+                country: normalizeCountryCode(parsed.country),
+                questIds: new Set(parsed.questIds.map(String))
+            };
+        } catch (_) {
+            return null;
+        }
+    };
+
+    const saveVpnBaseline = (country, questIds) => {
+        const code = normalizeCountryCode(country);
+        if (!code) return;
+        vpnInferenceCountry = code;
+        vpnBaselineIds = new Set([...questIds].map(String));
+        try {
+            localStorage.setItem(STORAGE_VPN_BASELINE_KEY, JSON.stringify({
+                country: code,
+                questIds: [...vpnBaselineIds]
+            }));
+        } catch (_) {}
+    };
+
+    const collectCurrentQuestIds = () => {
+        try {
+            return new Set([...QuestsStore.quests.values()].map(q => String(q.id)));
+        } catch (_) {
+            return new Set();
+        }
+    };
+
+    const updateLocationChip = (code) => {
+        const chip = document.getElementById("dqm-stat-location");
+        const label = document.querySelector(".dqm-chip-location-label");
+        if (label) label.textContent = t("labelYourLocation");
+        if (!chip) return;
+        const normalized = normalizeCountryCode(code);
+        if (!normalized) {
+            chip.textContent = "—";
+            return;
+        }
+        chip.textContent = `${flagEmojiFromCode(normalized)} ${normalized}`;
+        chip.title = countryDisplayName(normalized);
+    };
+
+    const onIpCountryResolved = (code, { forceBaseline = false } = {}) => {
+        const normalized = normalizeCountryCode(code);
+        if (!normalized) {
+            updateLocationChip(null);
+            return;
+        }
+        const prev = currentIpCountry || loadVpnBaseline()?.country || null;
+        currentIpCountry = normalized;
+        updateLocationChip(normalized);
+
+        if (!prev) {
+            saveVpnBaseline(normalized, collectCurrentQuestIds());
+            return;
+        }
+        if (prev !== normalized || forceBaseline) {
+            if (prev !== normalized) {
+                // VPN country changed — only brand-new quests after this point infer as the new country.
+                saveVpnBaseline(normalized, collectCurrentQuestIds());
+            }
+        }
+    };
+
+    const fetchIpCountry = async ({ force = false } = {}) => {
+        if (force) bustIpCountryCache();
+        else {
+            const cached = readCachedIpCountry();
+            if (cached) {
+                onIpCountryResolved(cached);
+                return cached;
+            }
+        }
+        if (ipCountryPromise) return ipCountryPromise;
+
+        ipCountryPromise = (async () => {
+            try {
+                try {
+                    const res = await apiGet({ url: "/users/@me/billing/country-code" });
+                    const code = extractApiCountryCode(res);
+                    if (code) {
+                        writeCachedIpCountry(code);
+                        onIpCountryResolved(code);
+                        return code;
+                    }
+                } catch (_) {}
+                try {
+                    const res = await apiGet({ url: "/auth/location-metadata" });
+                    const code = extractApiCountryCode(res);
+                    if (code) {
+                        writeCachedIpCountry(code);
+                        onIpCountryResolved(code);
+                        return code;
+                    }
+                } catch (_) {}
+                updateLocationChip(currentIpCountry);
+                return null;
+            } finally {
+                ipCountryPromise = null;
+            }
+        })();
+
+        return ipCountryPromise;
+    };
+
+    // Restore VPN baseline from storage for inference across reloads.
+    (() => {
+        const baseline = loadVpnBaseline();
+        if (baseline?.country) {
+            vpnInferenceCountry = baseline.country;
+            vpnBaselineIds = baseline.questIds;
+            currentIpCountry = baseline.country;
+        }
+    })();
+
+    const countrySourceLabel = (source) => {
+        if (source === "override") return t("countrySourceOverride");
+        if (source === "catalog") return t("countrySourceCatalog");
+        if (source === "inferred") return t("countrySourceInferred");
+        return t("countrySourceUnknown");
+    };
+
+    const resolveQuestCountrySync = (questId) => {
+        const id = String(questId);
+        const override = getCountryOverride(id);
+        if (override !== null) {
+            return {
+                source: "override",
+                code: override,
+                extra: 0,
+                status: "ready",
+                mode: override ? "include" : "global",
+                include: override ? [override] : [],
+                exclude: []
+            };
+        }
+
+        const catalog = getCatalogCountry(id);
+        if (catalog !== undefined && catalog.mode !== "unknown") {
+            if (catalog.mode === "include" && catalog.include.length) {
+                clearInferredCountry(id);
+            }
+            const primary = pickCatalogPrimary(catalog);
+            return {
+                source: "catalog",
+                code: primary,
+                extra: catalog.mode === "include" ? Math.max(0, catalog.include.length - 1) : 0,
+                status: "ready",
+                mode: catalog.mode,
+                include: catalog.include.slice(),
+                exclude: catalog.exclude.slice()
+            };
+        }
+
+        const inferred = getInferredCountry(id);
+        if (inferred !== null) {
+            return {
+                source: "inferred",
+                code: inferred,
+                extra: 0,
+                status: "ready",
+                mode: "include",
+                include: [inferred],
+                exclude: []
+            };
+        }
+        if (vpnInferenceCountry && !vpnBaselineIds.has(id)) {
+            const stamped = setInferredCountry(id, vpnInferenceCountry);
+            if (stamped) {
+                return {
+                    source: "inferred",
+                    code: stamped,
+                    extra: 0,
+                    status: "ready",
+                    mode: "include",
+                    include: [stamped],
+                    exclude: []
+                };
+            }
+        }
+
+        if (!regionsCatalogSettled && catalog === undefined) {
+            return {
+                source: "unknown",
+                code: COUNTRY_GLOBAL,
+                extra: 0,
+                status: "detecting",
+                mode: "unknown",
+                include: [],
+                exclude: []
+            };
+        }
+
+        return {
+            source: "unknown",
+            code: COUNTRY_GLOBAL,
+            extra: 0,
+            status: "unknown",
+            mode: "unknown",
+            include: [],
+            exclude: []
+        };
+    };
+
+    const resolveQuestCountry = async (questId) => {
+        await ensureRegionsCatalog();
+        return resolveQuestCountrySync(questId);
+    };
+
+    const countryFilterKey = (resolved) => {
+        if (!resolved) return "unknown";
+        if (resolved.status === "detecting") return "unknown";
+        if (resolved.status === "unknown") return "unknown";
+        if (resolved.mode === "exclude" || resolved.mode === "global") return "global";
+        const code = normalizeCountryCode(resolved.code);
+        if (!code) return "global";
+        return code;
+    };
+
+    const getAllCountrySelectOptions = () => {
+        const codes = new Set(COUNTRY_OPTIONS.map(c => c.code));
+        const map = readCachedRegions({ allowStale: true }) || getEmbeddedRegionsSnapshot();
+        for (const c of collectCatalogCountryCodes(map)) codes.add(c);
+        const named = COUNTRY_OPTIONS.slice();
+        const namedSet = new Set(named.map(c => c.code));
+        for (const code of [...codes].sort()) {
+            if (!namedSet.has(code)) named.push({ code, name: code });
+        }
+        return named;
+    };
+
+    const fillCountrySelect = (select) => {
+        if (!select) return;
+        const prev = select.value;
+        select.innerHTML = "";
+        const globalOpt = document.createElement("option");
+        globalOpt.value = COUNTRY_GLOBAL;
+        globalOpt.textContent = `🌐 ${t("countryGlobal")}`;
+        select.appendChild(globalOpt);
+        for (const { code, name } of getAllCountrySelectOptions()) {
+            const opt = document.createElement("option");
+            opt.value = code;
+            opt.textContent = `${flagEmojiFromCode(code)} ${name}`;
+            select.appendChild(opt);
+        }
+        select.dataset.filled = "1";
+        if (prev != null) select.value = prev;
+    };
+
+    const refreshCountrySelectLabels = (select) => {
+        if (!select) return;
+        const globalOpt = select.querySelector(`option[value="${COUNTRY_GLOBAL}"]`);
+        if (globalOpt) globalOpt.textContent = `🌐 ${t("countryGlobal")}`;
+    };
+
+    const formatExcludeLabel = (exclude) => {
+        const codes = (exclude || []).map(normalizeCountryCode).filter(Boolean);
+        if (!codes.length) return t("countryGlobal");
+        return t("countryExcept").replace("{codes}", codes.join(" −"));
+    };
+
+    const codesTitleList = (codes) => (codes || [])
+        .map(normalizeCountryCode)
+        .filter(Boolean)
+        .map(c => `${flagEmojiFromCode(c)} ${countryDisplayName(c)}`)
+        .join(", ");
+
+    const applyCountryToCard = (card, resolved) => {
+        const flagEl = card.querySelector(".dqm-country-flag");
+        const labelEl = card.querySelector(".dqm-country-label");
+        const extraEl = card.querySelector(".dqm-country-extra");
+        const select = card.querySelector(".dqm-country-select");
+        const status = resolved?.status || "ready";
+        const mode = resolved?.mode || (normalizeCountryCode(resolved?.code) ? "include" : "global");
+        const code = normalizeCountryCode(resolved?.code);
+        const include = Array.isArray(resolved?.include) ? resolved.include : (code ? [code] : []);
+        const exclude = Array.isArray(resolved?.exclude) ? resolved.exclude : [];
+        const extra = Number(resolved?.extra) || Math.max(0, include.length - 1);
+        const detecting = status === "detecting";
+        const unknown = status === "unknown";
+        const sourceTip = countrySourceLabel(resolved?.source);
+
+        let labelText = t("countryUnknown");
+        let flagText = "🌐";
+        let tip = sourceTip;
+
+        if (detecting) {
+            labelText = t("countryDetecting");
+            flagText = "…";
+            tip = t("countryDetecting");
+        } else if (unknown) {
+            labelText = t("countryUnknown");
+            flagText = "🌐";
+            tip = sourceTip;
+        } else if (mode === "exclude") {
+            labelText = formatExcludeLabel(exclude);
+            flagText = "🌐";
+            tip = `${sourceTip}\n${labelText}`;
+        } else if (mode === "global" || !code) {
+            labelText = t("countryGlobal");
+            flagText = "🌐";
+            tip = sourceTip;
+        } else {
+            labelText = countryDisplayName(code);
+            flagText = flagEmojiFromCode(code);
+            tip = include.length > 1
+                ? `${sourceTip}\n${codesTitleList(include)}`
+                : `${sourceTip}\n${countryDisplayName(code)}`;
+        }
+
+        if (flagEl) {
+            flagEl.textContent = flagText;
+            flagEl.title = tip;
+        }
+        if (labelEl) {
+            labelEl.textContent = labelText;
+            labelEl.title = tip;
+        }
+        if (extraEl) {
+            if (!detecting && !unknown && mode === "include" && extra > 0) {
+                extraEl.textContent = `+${extra}`;
+                extraEl.title = codesTitleList(include);
+            } else {
+                extraEl.textContent = "";
+                extraEl.title = "";
+            }
+        }
+        if (select) {
+            fillCountrySelect(select);
+            refreshCountrySelectLabels(select);
+            select.disabled = detecting;
+            select.title = tip;
+            if (!detecting && mode === "include" && code) select.value = code;
+            else if (!detecting) select.value = COUNTRY_GLOBAL;
+        }
+    };
+
+    const refreshCountryFilterOptions = () => {
+        const select = document.getElementById("dqm-country-filter");
+        if (!select) return;
+        const prev = currentCountryFilter || select.value || "all";
+        select.innerHTML = "";
+
+        const addOpt = (value, text) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = text;
+            select.appendChild(opt);
+        };
+
+        addOpt("all", t("countryFilterAll"));
+        addOpt("global", `🌐 ${t("countryFilterGlobal")}`);
+        addOpt("unknown", t("countryFilterUnknown"));
+
+        const codes = new Set(COUNTRY_OPTIONS.map(c => c.code));
+        const map = readCachedRegions({ allowStale: true }) || getEmbeddedRegionsSnapshot();
+        for (const c of collectCatalogCountryCodes(map)) codes.add(c);
+        for (const code of [...codes].sort()) {
+            addOpt(code, `${flagEmojiFromCode(code)} ${countryDisplayName(code)}`);
+        }
+
+        select.value = [...select.options].some(o => o.value === prev) ? prev : "all";
+        currentCountryFilter = select.value;
+        select.setAttribute("aria-label", t("labelCountryFilter"));
+        select.title = t("labelCountryFilter");
+    };
+
+
+    const getTaskConfig = (quest) => getSharedTaskConfig(quest);
+
+    const resolveTaskType = (quest, taskName, taskConfig = null) => {
+        const cfg = taskConfig ?? getTaskConfig(quest);
+        const task = taskName ? cfg?.tasks?.[taskName] : null;
+        return String(task?.type || taskName || "").toUpperCase();
+    };
+
+    const resolveTaskName = (quest) => {
+        const taskConfig = getTaskConfig(quest);
+        if (!taskConfig?.tasks) return null;
+        const keys = Object.keys(taskConfig.tasks);
+
+        for (const key of keys) {
+            if (supportedTasks.has(key)) return key;
+        }
+        for (const key of keys) {
+            const type = resolveTaskType(quest, key, taskConfig);
+            if (supportedTasks.has(type)) return key;
+            if (
+                type === "ACHIEVEMENT_IN_ACTIVITY"
+                || type === "PLAY_ACTIVITY"
+                || type.includes("ACHIEVEMENT")
+                || (type.includes("ACTIVITY") && !type.includes("WATCH"))
+            ) {
+                return key;
+            }
+        }
+        for (const key of keys) {
+            const task = taskConfig.tasks[key];
+            if (task?.applications?.length || task?.application_id || task?.applicationId) {
+                return key;
+            }
+        }
+        return keys[0] || null;
+    };
+
+    const getQuestTypeDetails = (quest) => {
+        const taskName = resolveTaskName(quest);
+        const taskConfig = getTaskConfig(quest);
+        const resolvedType = resolveTaskType(quest, taskName, taskConfig);
+        let type = "Other";
+        let label = t("typeOther");
+
+        if (taskName) {
+            if (resolvedType === "WATCH_VIDEO" || resolvedType === "WATCH_VIDEO_ON_MOBILE" || resolvedType.includes("VIDEO")) {
+                type = "Video"; label = "📺 " + t("typeVideo");
+            } else if (resolvedType === "PLAY_ON_DESKTOP" || (resolvedType.includes("PLAY") && resolvedType.includes("DESKTOP"))) {
+                type = "Play Game"; label = "🎮 " + t("typePlay");
+            } else if (resolvedType === "STREAM_ON_DESKTOP" || resolvedType.includes("STREAM")) {
+                type = "Stream"; label = "📡 " + t("typeStream");
+            } else if (
+                isLaunchQuestTask(taskName, taskConfig)
+                || resolvedType === "PLAY_ACTIVITY"
+                || resolvedType === "ACHIEVEMENT_IN_ACTIVITY"
+                || resolvedType.includes("ACHIEVEMENT")
+                || resolvedType.includes("ACTIVITY")
+            ) {
+                type = "Launch Quest"; label = "🚀 " + t("typeLaunch");
+            }
+        }
+
+        if (type === "Other") {
+            const app = quest.config?.application;
+            const hasApp = !!(app?.id || app?.name || resolveQuestApplicationId(quest));
+            const cta = String(
+                quest.config?.messages?.ctaButton
+                ?? quest.config?.messages?.cta_button
+                ?? ""
+            ).toLowerCase();
+            const qName = String(
+                quest.config?.messages?.questName
+                ?? quest.config?.messages?.quest_name
+                ?? ""
+            ).toLowerCase();
+            const isLaunchCta = cta.includes("launch") || qName.includes("launch") || cta.includes("activity");
+            if (hasApp || isLaunchCta) {
+                type = "Launch Quest"; label = "🚀 " + t("typeLaunch");
+            }
+        }
+        return { type, label, taskName };
+    };
+
+    const getAllStoreQuests = () => {
+        const raw = QuestsStore?.quests;
+        if (!raw) return [];
+        const values = typeof raw.values === "function" ? [...raw.values()] : Object.values(raw);
+        return values.map(q => normalizeQuestUserStatus(q)).filter(Boolean);
+    };
+
+    const isLaunchQuestType = (quest) => {
+        const details = getQuestTypeDetails(quest);
+        if (details.type === "Launch Quest") return true;
+        const taskName = resolveTaskName(quest);
+        return isLaunchQuestTask(taskName, getTaskConfig(quest));
+    };
+
+    const getQuestDedupeKey = (quest) => {
+        const appId = quest.config?.application?.id || resolveQuestApplicationId(quest) || "";
+        const taskName = resolveTaskName(quest) || "";
+        const taskType = resolveTaskType(quest, taskName);
+        if (isLaunchQuestType(quest)) {
+            const id = quest.id || "";
+            if (!appId) return `launch|noid|${id}|${taskName}|${taskType}`;
+            return `launch|${appId}|${taskType || taskName}`;
+        }
+        const name = (quest.config?.messages?.questName || quest.config?.messages?.quest_name || "").trim().toLowerCase();
+        return `${appId}|${name}|${taskName}`;
+    };
+
+    const getQuestDuplicateGroup = (quest, allQuests = null) => {
+        if (!isLaunchQuestType(quest)) return [quest];
+        const quests = allQuests ?? getAllStoreQuests();
+        const key = getQuestDedupeKey(quest);
+        return quests.filter(q => isLaunchQuestType(q) && getQuestDedupeKey(q) === key);
+    };
+
+    const getSingleQuestProgress = (quest) => {
+        const taskName = resolveTaskName(quest);
+        const taskConfig = getTaskConfig(quest);
+        let total = 1;
+        let progress = 0;
+        if (taskName && taskConfig?.tasks?.[taskName]) {
+            total = taskConfig.tasks[taskName].target || 1;
+            if (isAchievementActivityTask(taskName, taskConfig)) {
+                progress = readActivityCheckpointProgress(quest, taskName);
+            } else {
+                progress = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+            }
+        }
+        if (quest.userStatus?.completedAt || quest.userStatus?.claimedAt) progress = total;
+        return { taskName, progress, total };
+    };
+
+    const getQuestProgressRatio = (quest) => {
+        const { progress, total } = getSingleQuestProgress(quest);
+        return total > 0 ? progress / total : 0;
+    };
+
+    const pickCanonicalQuest = (duplicates) => {
+        if (!duplicates?.length) return null;
+        if (duplicates.length === 1) return duplicates[0];
+        return duplicates.slice().sort((a, b) => {
+            const aRunning = dqmTasks.has(a.id) ? 1 : 0;
+            const bRunning = dqmTasks.has(b.id) ? 1 : 0;
+            if (bRunning !== aRunning) return bRunning - aRunning;
+
+            const aEnrolled = a.userStatus?.enrolledAt ? 1 : 0;
+            const bEnrolled = b.userStatus?.enrolledAt ? 1 : 0;
+            if (bEnrolled !== aEnrolled) return bEnrolled - aEnrolled;
+
+            const aProg = getQuestProgressRatio(a);
+            const bProg = getQuestProgressRatio(b);
+            if (bProg !== aProg) return bProg - aProg;
+
+            const aExp = new Date(a.config.expiresAt).getTime();
+            const bExp = new Date(b.config.expiresAt).getTime();
+            if (aExp !== bExp) return aExp - bExp;
+
+            return String(a.id).localeCompare(String(b.id));
+        })[0];
+    };
+
+    const getCanonicalQuest = (quest, allQuests = null) => {
+        return pickCanonicalQuest(getQuestDuplicateGroup(quest, allQuests)) ?? quest;
+    };
+
+    const dedupeQuests = (quests) => {
+        const otherQuests = [];
+        const launchGroups = new Map();
+        for (const quest of quests) {
+            if (!isLaunchQuestType(quest)) {
+                otherQuests.push(quest);
+                continue;
+            }
+            const key = getQuestDedupeKey(quest);
+            if (!launchGroups.has(key)) launchGroups.set(key, []);
+            launchGroups.get(key).push(quest);
+        }
+        const result = [...otherQuests];
+        for (const group of launchGroups.values()) {
+            const canonical = pickCanonicalQuest(group);
+            if (canonical) result.push(canonical);
+        }
+        return result;
+    };
+
+    const getDuplicateGroupQuestIds = (quest) => {
+        return getQuestDuplicateGroup(quest).map(q => q.id);
+    };
+
+    const isDuplicateGroupRunning = (quest) => {
+        return getQuestDuplicateGroup(quest).some(q => dqmTasks.has(q.id));
+    };
+
+    const getGroupRuntime = (quest) => {
+        const group = getQuestDuplicateGroup(quest);
+        for (const q of group) {
+            if (dqmTasks.has(q.id)) {
+                return questRuntime.get(q.id) ?? ensureRuntime(getCanonicalQuest(quest));
+            }
+        }
+        return ensureRuntime(getCanonicalQuest(quest));
+    };
+
+    const getQuestProgress = (quest) => {
+        const group = getQuestDuplicateGroup(quest);
+        let best = { taskName: null, progress: 0, total: 1 };
+        for (const q of group) {
+            const p = getSingleQuestProgress(q);
+            if (p.progress > best.progress) best = p;
+        }
+        return best;
+    };
+
+    const isCheckpointQuest = (quest) => {
+        const taskName = resolveTaskName(quest);
+        return isAchievementActivityTask(taskName, getTaskConfig(quest));
+    };
+
+    const formatProgressText = (quest, progress, total) => {
+        if (isCheckpointQuest(quest)) {
+            return `${t("progressLabel")}: ${Math.floor(progress)} / ${total} ${t("progressLabelCheckpoints")}`;
+        }
+        return `${t("progressLabel")}: ${Math.floor(progress)} / ${total}s`;
+    };
+
+    const getProgressEtaMinutes = (quest, progress, total, etaSecsOverride) => {
+        if (etaSecsOverride != null) {
+            return Math.max(1, Math.ceil(etaSecsOverride / 60));
+        }
+        if (isCheckpointQuest(quest)) {
+            const remCheckpoints = Math.max(0, total - progress);
+            return Math.ceil((remCheckpoints * getActivityCheckpointAvgSecs()) / 60);
+        }
+        const rem = Math.max(0, total - progress);
+        return Math.ceil(rem / 60);
+    };
+
+    const getDisplayProgress = (quest, rt) => {
+        const effectiveRt = rt ?? getGroupRuntime(quest);
+        const { progress: serverProgress, total } = getQuestProgress(quest);
+        if (effectiveRt?.running || isDuplicateGroupRunning(quest)) {
+            return {
+                progress: Math.max(effectiveRt.progress ?? 0, serverProgress),
+                total: effectiveRt.target || total
+            };
+        }
+        return { progress: serverProgress, total };
+    };
+
+    const isExpired = (quest) => isQuestExpired(quest);
+
+    const getQuestBucket = (quest) => {
+        const flags = getQuestCompletionFlags(quest);
+        if (flags.isClaimed) return "complete";
+        if (flags.isClaimable) return "claimable";
+        return "incomplete";
+    };
+
+    const matchesFilter = (quest) => {
+        if (isExpired(quest)) return false;
+        const bucket = getQuestBucket(quest);
+        if (currentFilter === "incomplete" && bucket !== "incomplete") return false;
+        if (currentFilter === "claimable" && bucket !== "claimable") return false;
+        if (currentFilter === "complete" && bucket !== "complete") return false;
+        if (currentCountryFilter && currentCountryFilter !== "all") {
+            const key = countryFilterKey(resolveQuestCountrySync(quest.id));
+            if (key !== currentCountryFilter) return false;
+        }
+        return true;
+    };
+
+    const isRunnableQuest = (quest) => {
+        const flags = getQuestCompletionFlags(quest);
+        if (!flags.isEnrolled) return false;
+        if (flags.isCompleted || flags.isClaimed) return false;
+        if (isExpired(quest)) return false;
+        return !!resolveTaskName(quest) || isLaunchQuestType(quest);
+    };
+
+    const isBatchRunnableQuest = (quest) => {
+        if (!isRunnableQuest(quest)) return false;
+        const taskName = resolveTaskName(quest);
+        const taskConfig = getTaskConfig(quest);
+        if (isAchievementActivityTask(taskName, taskConfig)) return false;
+        return true;
+    };
+
+    const extractOrbs = (text) => {
+        if (!text || typeof text !== "string") return null;
+        let m = text.match(/(\d+)\s*Orbs?/i);
+        if (m) return parseInt(m[1], 10);
+        m = text.match(/\b(200|700|1000)\b/);
+        if (m) return parseInt(m[1], 10);
+        return null;
+    };
+
+    const computeQuestOrbs = (quest) => {
+        const rewardsConfig = quest.config?.rewardsConfig?.rewards;
+        if (Array.isArray(rewardsConfig)) {
+            for (const r of rewardsConfig) {
+                if (r?.type === 4) {
+                    const qty = r.orb_quantity ?? r.messages?.orb_quantity;
+                    const num = parseInt(qty, 10);
+                    if (!isNaN(num) && num > 0) return num;
+                }
+            }
+        }
+        if (quest.config.messages) {
+            const msg = quest.config.messages;
+            const val = extractOrbs(msg.rewardName) || extractOrbs(msg.questName) ||
+                extractOrbs(msg.description) || extractOrbs(msg.ctaButton);
+            if (val) return val;
+        }
+        if (quest.config.rewards) {
+            const rewards = Array.isArray(quest.config.rewards) ? quest.config.rewards : [quest.config.rewards];
+            for (const r of rewards) {
+                const num = parseInt(r.amount, 10);
+                if (!isNaN(num) && num > 0) return num;
+                if (r.messages) {
+                    const val = extractOrbs(r.messages.name);
+                    if (val) return val;
+                }
+            }
+        }
+        const str = JSON.stringify(quest.config);
+        const m = str.match(/(\d+)\s*Orbs?/i) || str.match(/\b(200|700|1000)\b/);
+        if (m) {
+            const num = parseInt(m[1] || m[0], 10);
+            if (!isNaN(num) && num > 0) return num;
+        }
+        return null;
+    };
+
+    const getQuestOrbs = (quest, { bustCache = false } = {}) => {
+        if (bustCache) orbsCache.delete(quest.id);
+        if (orbsCache.has(quest.id)) return orbsCache.get(quest.id);
+        const value = computeQuestOrbs(quest);
+        orbsCache.set(quest.id, value);
+        return value;
+    };
+
+    const ensureRuntime = (quest) => {
+        let rt = questRuntime.get(quest.id);
+        if (!rt) {
+            rt = {
+                id: quest.id,
+                name: quest.config.messages?.questName || "Unknown",
+                type: "Other",
+                status: "idle",
+                progress: 0,
+                target: 1,
+                running: false,
+                stopped: false,
+                completed: false,
+                claimed: false,
+                error: null
+            };
+            questRuntime.set(quest.id, rt);
+        }
+        const details = getQuestTypeDetails(quest);
+        const { progress: serverProgress, total } = getQuestProgress(quest);
+        rt.name = quest.config.messages?.questName || rt.name;
+        rt.type = details.type;
+        rt.target = total;
+        if (rt.running) {
+            rt.progress = Math.max(rt.progress ?? 0, serverProgress);
+        } else {
+            rt.progress = serverProgress;
+        }
+        const flags = getQuestCompletionFlags(quest);
+        rt.completed = flags.isCompleted;
+        rt.claimed = flags.isClaimed;
+        rt.running = dqmTasks.has(quest.id);
+        if (rt.running) rt.status = "running";
+        else if (rt.error) rt.status = "error";
+        else if (rt.stopped && !rt.completed) rt.status = "stopped";
+        else if (rt.claimed) rt.status = "claimed";
+        else if (rt.completed) rt.status = "claimable";
+        else if (!flags.isEnrolled) rt.status = "not-enrolled";
+        else rt.status = "enrolled";
+        return rt;
+    };
+
+
+    const errMsg = (e) => {
+        if (!e) return "Unknown";
+        if (typeof e === "string") return e;
+        if (e.body?.message) return String(e.body.message);
+        if (e.message) return String(e.message).slice(0, 200);
+        return "Request failed";
+    };
+
+    const apiRequest = async (method, opts, retries = API_RETRIES) => {
+        let lastErr;
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                if (method === "get") return await api.get(opts);
+                return await api.post(opts);
+            } catch (e) {
+                lastErr = e;
+                const status = e?.status || e?.body?.code;
+                const retryable = !status || status >= 500 || status === 429 || status === 0;
+                if (!retryable || attempt === retries) break;
+                await sleep(API_RETRY_BASE_MS * Math.pow(2, attempt));
+            }
+        }
+        throw lastErr;
+    };
+
+    const apiGet = (opts) => apiRequest("get", opts);
+    const apiPost = (opts) => apiRequest("post", opts);
+
+
+    const addLog = (level, text) => {
+        const msg = typeof text === "string" ? text : String(text);
+        if (!logBox) {
+            console.log(`[DQM][${level}]`, msg);
+            return;
+        }
+        const line = document.createElement("div");
+        line.className = "dqm-log-line dqm-log--" + level.toLowerCase();
+        const time = document.createElement("span");
+        time.className = "dqm-log-time";
+        time.textContent = `[${new Date().toLocaleTimeString(timeLocale(), { hour: "2-digit", minute: "2-digit", second: "2-digit" })}]`;
+        const lvl = document.createElement("span");
+        lvl.className = "dqm-log-level";
+        lvl.textContent = level.padEnd(8, " ");
+        const body = document.createElement("span");
+        body.className = "dqm-log-msg";
+        body.textContent = msg;
+        line.appendChild(time);
+        line.appendChild(document.createTextNode(" "));
+        line.appendChild(lvl);
+        line.appendChild(document.createTextNode(" "));
+        line.appendChild(body);
+        logBox.appendChild(line);
+        while (logBox.children.length > LOG_CAP) logBox.removeChild(logBox.firstChild);
+        logBox.scrollTop = logBox.scrollHeight;
+    };
+
+    const log = {
+        info: (m) => addLog("INFO", m),
+        success: (m) => addLog("SUCCESS", m),
+        warn: (m) => addLog("WARNING", m),
+        error: (m) => addLog("ERROR", m),
+        debug: (m) => addLog("DEBUG", m),
+        running: (m) => addLog("RUNNING", m)
+    };
+
+
+    const progressBarColorVar = (percent, claimed) => {
+        if (claimed) return "var(--dqm-success)";
+        if (percent < 30) return "var(--dqm-warning)";
+        if (percent < 70) return "var(--dqm-orbs)";
+        return "var(--dqm-success)";
+    };
+
+    const updateQuestProgress = (questId, progress, total, options = {}) => {
+        const { etaSecs } = options;
+        const quest = QuestsStore.quests.get(questId);
+        const displayQuest = quest ? getCanonicalQuest(quest) : null;
+        const cardId = displayQuest?.id ?? questId;
+        const card = cardByQuestId.get(cardId);
+        const rt = questRuntime.get(questId) ?? (displayQuest ? questRuntime.get(displayQuest.id) : null);
+        if (rt) {
+            rt.progress = progress;
+            rt.target = total;
+        }
+        if (!card) return;
+        const percent = Math.min(100, Math.round((progress / Math.max(total, 1)) * 100));
+        const bar = card.querySelector(".quest-progress-bar");
+        const progressText = card.querySelector(".quest-progress-text");
+        const percentEl = card.querySelector(".quest-progress-percent");
+        const etaEl = card.querySelector(".dqm-eta");
+        if (bar) {
+            bar.style.width = percent + "%";
+            bar.style.background = progressBarColorVar(percent, false);
+        }
+        if (progressText && displayQuest) {
+            progressText.textContent = formatProgressText(displayQuest, progress, total);
+        } else if (progressText) {
+            progressText.textContent = `${t("progressLabel")}: ${Math.floor(progress)} / ${total}s`;
+        }
+        if (percentEl) percentEl.textContent = `${percent}%`;
+        if (etaEl) {
+            const mins = displayQuest
+                ? getProgressEtaMinutes(displayQuest, progress, total, etaSecs)
+                : Math.ceil(Math.max(0, (etaSecs ?? total - progress)) / 60);
+            etaEl.textContent = mins > 0 ? `${t("labelEta")}: ~${mins}m` : "";
+        }
+        updateRunningStats();
+        updateMiniRunning();
+    };
+
+    const setCardStatusClass = (card, status) => {
+        card.classList.remove(
+            "dqm-card--idle", "dqm-card--not-enrolled", "dqm-card--enrolled",
+            "dqm-card--running", "dqm-card--completed", "dqm-card--claimable", "dqm-card--claimed",
+            "dqm-card--error", "dqm-card--stopped"
+        );
+        card.classList.add("dqm-card--" + status);
+    };
+
+    const statusColorFor = (status) => {
+        const map = {
+            "not-enrolled": "var(--dqm-warning)",
+            enrolled: "var(--dqm-accent)",
+            running: "var(--dqm-success)",
+            completed: "var(--dqm-info)",
+            claimable: "var(--dqm-info)",
+            claimed: "var(--dqm-success)",
+            error: "var(--dqm-danger)",
+            stopped: "var(--dqm-text-muted)",
+            idle: "var(--dqm-text-muted)"
+        };
+        return map[status] || "var(--dqm-text-muted)";
+    };
+
+    const statusLabelFor = (status) => {
+        const map = {
+            "not-enrolled": t("statusNotEnrolled"),
+            enrolled: t("statusInProgress"),
+            running: t("statusRunning"),
+            completed: t("statusCompleted"),
+            claimable: t("statusClaimable"),
+            claimed: t("statusClaimed"),
+            error: t("statusError"),
+            stopped: t("statusStopped"),
+            idle: t("statusInProgress")
+        };
+        return map[status] || status;
+    };
+
+    const patchCardStatus = (questId) => {
+        const quest = QuestsStore.quests.get(questId);
+        if (!quest) return;
+        const canonical = getCanonicalQuest(quest);
+        const card = cardByQuestId.get(canonical.id);
+        if (!card) return;
+        const rt = getGroupRuntime(canonical);
+        setCardStatusClass(card, rt.status);
+        const statusEl = card.querySelector(".dqm-status");
+        if (statusEl) {
+            statusEl.textContent = statusLabelFor(rt.status);
+            statusEl.style.color = statusColorFor(rt.status);
+        }
+        buildCardActions(card, canonical, rt);
+        updateRunningStats();
+        updateMiniRunning();
+    };
+
+
+    const dispatchGamesClear = (fakeGame) => {
+        if (!FluxDispatcher) return;
+        try {
+            FluxDispatcher.dispatch({
+                type: "RUNNING_GAMES_CHANGE",
+                removed: fakeGame?.id != null ? [fakeGame] : [],
+                added: [],
+                games: []
+            });
+        } catch (_) {}
+    };
+
+    const holdGameDetectEmpty = (realGetRunningGames, realGetGameForPID, fakeGame) => {
+        if (!RunningGameStore) return;
+        RunningGameStore.getRunningGames = () => [];
+        RunningGameStore.getGameForPID = () => null;
+        dispatchGamesClear(fakeGame);
+        if (!gameDetectHold) {
+            gameDetectHold = {
+                realGetRunningGames,
+                realGetGameForPID,
+                fakeGame: fakeGame || null,
+                reclearTimer: null
+            };
+        } else {
+            gameDetectHold.fakeGame = fakeGame || gameDetectHold.fakeGame;
+            if (!gameDetectHold.realGetRunningGames) gameDetectHold.realGetRunningGames = realGetRunningGames;
+            if (!gameDetectHold.realGetGameForPID) gameDetectHold.realGetGameForPID = realGetGameForPID;
+        }
+        if (gameDetectHold.reclearTimer) clearTimeout(gameDetectHold.reclearTimer);
+        gameDetectHold.reclearTimer = setTimeout(() => {
+            if (!gameDetectHold || !RunningGameStore) return;
+            RunningGameStore.getRunningGames = () => [];
+            RunningGameStore.getGameForPID = () => null;
+            dispatchGamesClear(gameDetectHold.fakeGame);
+        }, 1000);
+    };
+
+    const releaseGameDetectHold = () => {
+        if (!gameDetectHold) return;
+        if (gameDetectHold.reclearTimer) clearTimeout(gameDetectHold.reclearTimer);
+        const { realGetRunningGames, realGetGameForPID } = gameDetectHold;
+        gameDetectHold = null;
+        if (!RunningGameStore) return;
+        if (typeof realGetRunningGames === "function") {
+            RunningGameStore.getRunningGames = realGetRunningGames;
+        }
+        if (typeof realGetGameForPID === "function") {
+            RunningGameStore.getGameForPID = realGetGameForPID;
+        }
+        let games = [];
+        try {
+            games = typeof realGetRunningGames === "function"
+                ? (realGetRunningGames.call(RunningGameStore) || [])
+                : [];
+        } catch (_) {
+            games = [];
+        }
+        if (FluxDispatcher) {
+            try {
+                FluxDispatcher.dispatch({
+                    type: "RUNNING_GAMES_CHANGE",
+                    removed: [],
+                    added: [],
+                    games
+                });
+            } catch (_) {}
+        }
+    };
+
+    const createTaskState = (questId) => {
+        const state = {
+            active: true,
+            exitMode: null,
+            intervals: [],
+            timeouts: [],
+            restores: [],
+            unsubs: []
+        };
+        state.trackInterval = (id) => { state.intervals.push(id); return id; };
+        state.trackTimeout = (id) => { state.timeouts.push(id); return id; };
+        state.addRestore = (fn) => state.restores.push(fn);
+        state.addUnsub = (fn) => state.unsubs.push(fn);
+        state.cleanup = () => {
+            state.active = false;
+            state.intervals.forEach(clearInterval);
+            state.timeouts.forEach(clearTimeout);
+            state.intervals.length = 0;
+            state.timeouts.length = 0;
+            state.unsubs.forEach(fn => { try { fn(); } catch (_) {} });
+            state.unsubs.length = 0;
+            state.restores.forEach(fn => { try { fn(); } catch (_) {} });
+            state.restores.length = 0;
+            activeCleanups.delete(state.cleanup);
+        };
+        activeCleanups.add(state.cleanup);
+        dqmTasks.set(questId, state);
+        return state;
+    };
+
+    const finishTask = (questId, { stopped = false, error = null, success = false } = {}) => {
+        const state = dqmTasks.get(questId);
+        if (state) {
+            if (stopped) state.exitMode = "stop";
+            else if (success) state.exitMode = "success";
+            else state.exitMode = "error";
+            state.cleanup();
+            dqmTasks.delete(questId);
+        }
+        const quest = QuestsStore.quests.get(questId);
+        if (quest) {
+            const rt = ensureRuntime(quest);
+            rt.running = false;
+            if (error) { rt.error = error; rt.status = "error"; }
+            else if (stopped) { rt.stopped = true; rt.status = "stopped"; }
+            else if (success) { rt.stopped = false; rt.error = null; }
+        }
+        patchCardStatus(questId);
+    };
+
+    const stopQuest = (questId) => {
+        const quest = QuestsStore.quests.get(questId);
+        const runningId = quest
+            ? getQuestDuplicateGroup(quest).find(q => dqmTasks.has(q.id))?.id ?? questId
+            : questId;
+        const state = dqmTasks.get(runningId);
+        if (!state) return;
+        state.active = false;
+        finishTask(runningId, { stopped: true });
+        log.warn(`[${questRuntime.get(runningId)?.name || runningId}] ${t("logStopped")}`);
+        log.warn(t("logStopGameHold"));
+    };
+
+    const stopAllQuests = () => {
+        batchStopRequested = true;
+        log.warn(t("logStopAll"));
+        for (const id of [...dqmTasks.keys()]) stopQuest(id);
+        updateBatchStrip(null);
+        updateStopAllVisibility();
+        scheduleRender();
+    };
+
+
+    const Executors = {
+        async video(quest, taskState, taskName, secondsNeeded, secondsDone) {
+            const questName = quest.config.messages.questName;
+                const maxFuture = 10, speed = 7, interval = 1;
+                const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
+                let completed = false;
+            let done = secondsDone;
+
+                while (taskState.active) {
+                    const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
+                const diff = maxAllowed - done;
+                const timestamp = Math.min(secondsNeeded, done + speed + (Math.random() * 0.5));
+                if (diff >= speed && timestamp > done) {
+                    try {
+                        const res = await apiPost({
+                                url: `/quests/${quest.id}/video-progress`,
+                                body: { timestamp }
+                            });
+                        completed = !!res.body?.completed_at;
+                        done = Math.min(secondsNeeded, timestamp);
+                        log.running(`[${questName}] ${t("logVideo")}: ${Math.floor(done)}/${secondsNeeded}s`);
+                        updateQuestProgress(quest.id, done, secondsNeeded);
+                        } catch (e) {
+                        log.error(`${t("logAPIError")}${errMsg(e)}`);
+                        throw e;
+                        }
+                    }
+                    if (timestamp >= secondsNeeded) break;
+                    await sleep(interval * 1000);
+                }
+
+                if (taskState.active && !completed) {
+                    try {
+                    await apiPost({
+                            url: `/quests/${quest.id}/video-progress`,
+                            body: { timestamp: secondsNeeded }
+                        });
+                    } catch (e) {
+                    log.error(`${t("logAPIError")}${errMsg(e)}`);
+                }
+            }
+            return taskState.active;
+        },
+
+        async desktopGame(quest, taskState, taskName, secondsNeeded, secondsDone) {
+            const questName = quest.config.messages.questName;
+            if (!isApp || !RunningGameStore || !FluxDispatcher) {
+                log.error(`[${questName}] ${t("logExecImpossible")}`);
+                return false;
+                }
+
+                let applicationId = quest.config.application?.id;
+                let applicationName = quest.config.application?.name;
+                let appData = null;
+                let exeName = null;
+
+                if (applicationId) {
+                    try {
+                    const res = await apiGet({ url: `/applications/public?application_ids=${applicationId}` });
+                    appData = res.body?.[0];
+                        if (appData) {
+                        exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">", "") ??
+                            appData.name.replace(/[\/\\:*?"<>|]/g, "");
+                        }
+                    } catch (e) {
+                    log.warn(`${t("logAPIError")}${errMsg(e)}`);
+                    }
+                }
+
+                if (!appData || !exeName) {
+                    let fullText = "";
+                    if (quest.config.messages) {
+                        for (const key in quest.config.messages) {
+                        if (typeof quest.config.messages[key] === "string") fullText += " " + quest.config.messages[key];
+                        }
+                    }
+                    fullText = fullText.toLowerCase();
+                const guessedName = applicationName || questName || "";
+                    if (fullText.includes("roblox") || guessedName.toLowerCase().includes("roblox")) {
+                    appData = { name: "Roblox" }; exeName = "RobloxPlayerBeta.exe";
+                    } else if (fullText.includes("eve online") || (fullText.includes("eve") && fullText.includes("online")) || guessedName.toLowerCase().includes("eve")) {
+                    appData = { name: "EVE Online" }; exeName = "eve.exe";
+                    } else if (fullText.includes("shift at midnight") || guessedName.toLowerCase().includes("shift at midnight")) {
+                    appData = { name: "Shift At Midnight" }; exeName = "ShiftAtMidnight.exe";
+                    } else {
+                        appData = { name: guessedName };
+                        exeName = guessedName.replace(/[\/\\:*?"<>|]/g, "") + ".exe";
+                    }
+                }
+
+                const pid = Math.floor(Math.random() * 30000) + 1000;
+                const fakeGame = {
+                    cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                    exeName,
+                    exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                    hidden: false,
+                    isLauncher: false,
+                    name: appData.name,
+                pid,
+                    pidPath: [pid],
+                    processName: appData.name,
+                start: Date.now()
+                };
+            fakeGame.id = applicationId || pid;
+
+            const realGetRunningGames = gameDetectHold?.realGetRunningGames || RunningGameStore.getRunningGames;
+            const realGetGameForPID = gameDetectHold?.realGetGameForPID || RunningGameStore.getGameForPID;
+            if (gameDetectHold?.reclearTimer) {
+                clearTimeout(gameDetectHold.reclearTimer);
+                gameDetectHold.reclearTimer = null;
+            }
+            gameDetectHold = null;
+
+            taskState.addRestore(() => {
+                if (taskState.exitMode === "success") {
+                    RunningGameStore.getRunningGames = realGetRunningGames;
+                    RunningGameStore.getGameForPID = realGetGameForPID;
+                    let games = [];
+                    try {
+                        games = typeof realGetRunningGames === "function"
+                            ? (realGetRunningGames.call(RunningGameStore) || [])
+                            : [];
+                    } catch (_) {
+                        games = [];
+                    }
+                    try {
+                        FluxDispatcher.dispatch({
+                            type: "RUNNING_GAMES_CHANGE",
+                            removed: fakeGame.id != null ? [fakeGame] : [],
+                            added: [],
+                            games
+                        });
+                    } catch (_) {}
+                    releaseGameDetectHold();
+                } else {
+                    try {
+                        const terminalPayload = { application_id: applicationId || undefined, pid, terminal: true };
+                        if (!terminalPayload.application_id) delete terminalPayload.application_id;
+                        apiPost({ url: `/quests/${quest.id}/heartbeat`, body: terminalPayload }).catch(() => {});
+                    } catch (_) {}
+                    holdGameDetectEmpty(realGetRunningGames, realGetGameForPID, fakeGame);
+                }
+            });
+
+            const spoofGame = () => {
+                if (!taskState.active) return;
+                RunningGameStore.getRunningGames = () => [fakeGame];
+                RunningGameStore.getGameForPID = (p) => (p === pid ? fakeGame : null);
+                FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [], added: [fakeGame], games: [fakeGame] });
+            };
+            spoofGame();
+            taskState.trackInterval(setInterval(spoofGame, 5000));
+
+            let completed = false;
+            let done = secondsDone;
+            const waitTime = Math.ceil((secondsNeeded - done) / 60);
+            log.info(`[${questName}] ${t("logSpoofGame")}${appData.name}${t("logSpoofWait")}${waitTime}${t("logSpoofMinutes")}`);
+            updateQuestProgress(quest.id, done, secondsNeeded);
+
+            while (taskState.active && !completed) {
+                try {
+                    const heartbeatPayload = { application_id: applicationId || undefined, pid, terminal: false };
+                    if (!heartbeatPayload.application_id) delete heartbeatPayload.application_id;
+
+                    const res = await apiPost({ url: `/quests/${quest.id}/heartbeat`, body: heartbeatPayload });
+                    if (!taskState.active) break;
+
+                    const progress = res.body?.progress?.[taskName]?.value ?? 0;
+                    if (res.body?.completed_at) {
+                        completed = true;
+                        done = secondsNeeded;
+                        log.running(`[${questName}] ${t("logGame")}: ${Math.floor(done)}/${secondsNeeded}s`);
+                        updateQuestProgress(quest.id, done, secondsNeeded);
+                        break;
+                    }
+                    if (progress > done) {
+                        done = progress;
+                        log.running(`[${questName}] ${t("logGame")}: ${Math.floor(done)}/${secondsNeeded}s`);
+                        updateQuestProgress(quest.id, done, secondsNeeded);
+                    }
+                    if (done >= secondsNeeded) {
+                        if (!taskState.active) break;
+                        await apiPost({ url: `/quests/${quest.id}/heartbeat`, body: { ...heartbeatPayload, terminal: true } });
+                        if (!taskState.active) break;
+                        completed = true;
+                        break;
+                    }
+                    await sleep(20 * 1000);
+                } catch (e) {
+                    log.error(`${t("logAPIError")}${errMsg(e)}`);
+                    throw e;
+                }
+            }
+            return taskState.active && completed;
+        },
+
+        async stream(quest, taskState, taskName, secondsNeeded, secondsDone) {
+            const questName = quest.config.messages.questName;
+            if (!isApp || !ApplicationStreamingStore || !FluxDispatcher) {
+                log.error(`[${questName}] ${t("logExecImpossible")}`);
+                return false;
+            }
+
+            const applicationId = quest.config.application?.id;
+            const applicationName = quest.config.application?.name || questName;
+                const pid = Math.floor(Math.random() * 30000) + 1000;
+                const realFunc = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
+                ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({
+                id: applicationId, pid, sourceName: null
+            });
+            taskState.addRestore(() => {
+                ApplicationStreamingStore.getStreamerActiveStreamMetadata = realFunc;
+            });
+
+            return await new Promise((resolve) => {
+                let settled = false;
+                const settle = (value) => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(value);
+                };
+
+                const onHeartbeat = (data) => {
+                    try {
+                        if (!taskState.active) return;
+                        const progress = quest.config.configVersion === 1
+                            ? data.userStatus.streamProgressSeconds
+                            : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
+                        log.running(`[${questName}] ${t("logStream")}: ${Math.floor(progress)}/${secondsNeeded}s`);
+                        updateQuestProgress(quest.id, progress, secondsNeeded);
+                        if (progress >= secondsNeeded) {
+                            taskState.active = false;
+                            settle(true);
+                        }
+                    } catch (e) {
+                        log.error(`${t("logError")}${errMsg(e)}`);
+                        taskState.active = false;
+                        settle(false);
+                    }
+                };
+                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
+                taskState.addUnsub(() => {
+                    try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat); } catch (_) {}
+                });
+
+                const waitTime = Math.ceil((secondsNeeded - secondsDone) / 60);
+                log.info(`[${questName}] ${t("logSpoofStream")}${applicationName}${t("logSpoofStreamNote")}${waitTime}${t("logSpoofVCNote")}`);
+                updateQuestProgress(quest.id, secondsDone, secondsNeeded);
+
+                const poll = setInterval(() => {
+                    if (!taskState.active) settle(false);
+                }, 1000);
+                taskState.trackInterval(poll);
+            });
+        },
+
+    };
+
+    const activityExecutors = createActivityExecutors({
+        apiPost,
+        apiGet,
+        sleep,
+        log,
+        t,
+        updateQuestProgress,
+        QuestsStore,
+        FluxDispatcher
+    });
+
+    Object.assign(Executors, {
+        playActivity: activityExecutors.playActivity,
+        achievementActivity: activityExecutors.achievementActivity
+    });
+
+    const refreshQuestsFromApi = async () => {
+        try {
+            const res = await apiGet({ url: "/quests/@me" });
+            const body = res?.body;
+            const quests = Array.isArray(body)
+                ? body
+                : Array.isArray(body?.quests)
+                    ? body.quests
+                    : [];
+            for (const q of quests) {
+                const live = QuestsStore.quests.get(q.id);
+                if (!live) continue;
+                const normalized = normalizeQuestUserStatus(q);
+                if (!normalized?.userStatus) continue;
+                live.userStatus = {
+                    ...live.userStatus,
+                    ...normalized.userStatus,
+                    progress: normalized.userStatus.progress ?? live.userStatus?.progress
+                };
+            }
+        } catch (_) {}
+    };
+
+    const runAchievementActivityQuest = async (quest, taskState, taskName, taskConfig) => {
+        const canonical = getCanonicalQuest(quest);
+        const duplicateIds = getDuplicateGroupQuestIds(canonical);
+        const questName = canonical.config.messages?.questName || canonical.id;
+        const checkpointCount = taskConfig.tasks[taskName]?.target || 3;
+        const completedCheckpoints = await resolveCompletedCheckpointsAsync(
+            canonical.id, taskName, checkpointCount, QuestsStore, apiGet, duplicateIds
+        );
+        const applicationId = resolveQuestApplicationId(canonical, taskName, taskConfig);
+
+        if (!applicationId) {
+            log.error(`[${questName}] ${t("logActivityMissingAppId")}`);
+            taskState.active = false;
+            return false;
+        }
+
+        updateQuestProgress(canonical.id, completedCheckpoints, checkpointCount);
+        if (completedCheckpoints > 0) {
+            log.info(`[${questName}] ${t("logActivityResumeCheckpoints")
+                .replace("{done}", String(completedCheckpoints))
+                .replace("{total}", String(checkpointCount))}`);
+        }
+
+        try {
+            await promptActivityLaunch(canonical, t, (q) => launchQuestInDiscord(q, log, t));
+        } catch (_) {
+            taskState.active = false;
+            return false;
+        }
+
+        if (!(await hasMatchingActivityFrame(applicationId))) {
+            log.info(`[${questName}] ${t("logActivityLaunching")}`);
+            await launchQuestInDiscord(canonical, log, t);
+        }
+
+        return activityExecutors.achievementActivity(
+            canonical,
+            taskState,
+            taskName,
+            checkpointCount,
+            completedCheckpoints,
+            duplicateIds
+        );
+    };
+
+    const executeQuest = async (quest, onComplete) => {
+        const canonical = getCanonicalQuest(quest);
+        const questId = canonical.id;
+        const live = QuestsStore.quests.get(questId) || canonical;
+        const questName = live.config.messages?.questName || "Quest";
+        const taskConfig = getTaskConfig(live);
+        const taskName = resolveTaskName(live);
+
+        if (!taskName) {
+            log.warn(`[${questName}] ${t("logTaskNotSupported")}${Object.keys(taskConfig?.tasks || {}).join(", ")}`);
+            if (onComplete) onComplete({ ok: false, skipped: true });
+            return;
+        }
+        if (!live.userStatus?.enrolledAt) {
+            log.warn(`[${questName}] ${t("logNotEnrolled")}`);
+            if (onComplete) onComplete({ ok: false, skipped: true });
+            return;
+        }
+        if (isExpired(live)) {
+            log.warn(`[${questName}] expired`);
+            if (onComplete) onComplete({ ok: false, skipped: true });
+            return;
+        }
+        if (dqmTasks.has(questId) || isDuplicateGroupRunning(canonical)) {
+            log.warn(`[${questName}] ${t("logAlreadyRunning")}`);
+            if (onComplete) onComplete({ ok: false, skipped: true });
+            return;
+        }
+        if (batchStopRequested) {
+            if (onComplete) onComplete({ ok: false, skipped: true });
+            return;
+        }
+
+        const secondsNeeded = taskConfig.tasks[taskName]?.target || 0;
+        let secondsDone = live.userStatus?.progress?.[taskName]?.value ?? 0;
+        const taskState = createTaskState(questId);
+        const rt = ensureRuntime(live);
+        rt.running = true;
+        rt.stopped = false;
+        rt.error = null;
+        rt.status = "running";
+        patchCardStatus(questId);
+        updateStopAllVisibility();
+
+        log.info(`[${questName}] ${t("logExecStart")}${taskName})`);
+
+        let ok = false;
+        try {
+            if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
+                ok = await Executors.video(live, taskState, taskName, secondsNeeded, secondsDone);
+            } else if (taskName === "PLAY_ON_DESKTOP") {
+                ok = await Executors.desktopGame(live, taskState, taskName, secondsNeeded, secondsDone);
+            } else if (taskName === "STREAM_ON_DESKTOP") {
+                ok = await Executors.stream(live, taskState, taskName, secondsNeeded, secondsDone);
+            } else if (taskName === "PLAY_ACTIVITY") {
+                ok = await Executors.playActivity(live, taskState, taskName, secondsNeeded, secondsDone);
+            } else if (isAchievementActivityTask(taskName, taskConfig)) {
+                ok = await runAchievementActivityQuest(live, taskState, taskName, taskConfig);
+            } else {
+                log.warn(`[${questName}] ${t("logTaskNotSupported")}${taskName}`);
+            }
+
+            if (ok) {
+                log.success(`[${questName}] ${t("logCompleted")}`);
+                finishTask(questId, { success: true });
+            } else if (!dqmTasks.has(questId) || !taskState.active) {
+                if (dqmTasks.has(questId)) finishTask(questId, { stopped: true });
+                else patchCardStatus(questId);
+            } else {
+                finishTask(questId, { error: "incomplete" });
+            }
+        } catch (e) {
+            log.error(`${t("logUnknownError")}${errMsg(e)}`);
+            finishTask(questId, { error: errMsg(e) });
+            ok = false;
+        }
+
+        scheduleRender();
+        updateStopAllVisibility();
+        if (onComplete) onComplete({ ok });
+    };
+
+
+    const patchQuestEnrollment = (questId, enrolledAt) => {
+        const quest = QuestsStore.quests.get(questId);
+        if (!quest) return;
+        quest.userStatus = {
+            ...(quest.userStatus || {}),
+            enrolledAt,
+            completedAt: quest.userStatus?.completedAt ?? null,
+            claimedAt: quest.userStatus?.claimedAt ?? null,
+            progress: quest.userStatus?.progress || {}
+        };
+        patchCardStatus(questId);
+    };
+
+    const acceptQuest = async (quest) => {
+        const canonical = getCanonicalQuest(quest);
+        const questId = canonical.id;
+        const name = canonical.config.messages?.questName || questId;
+        const live = QuestsStore.quests.get(questId) || canonical;
+
+        if (acceptsInFlight.has(questId)) return;
+        if (getQuestDuplicateGroup(canonical).some(q => q.userStatus?.enrolledAt)) return;
+        if (isExpired(live)) return;
+
+        acceptsInFlight.add(questId);
+        scheduleRender();
+        log.info(`[${name}] ${t("logActivateClick")}`);
+
+        try {
+            try {
+                await apiPost({
+                    url: `/quests/${questId}/enroll`,
+                    body: {
+                        location: 11,
+                        is_targeted: false,
+                        metadata_raw: null
+                    }
+                });
+            } catch (_) {
+                await apiPost({
+                    url: `/quests/${questId}/enroll`,
+                    body: { location: 11 }
+                });
+            }
+
+            patchQuestEnrollment(questId, new Date().toISOString());
+            log.success(`[${name}] ${t("logActivateSuccess")}`);
+            scheduleRender();
+        } catch (e) {
+            log.error(`[${name}] ${t("logActivateFailed")}${errMsg(e)}`);
+        } finally {
+            acceptsInFlight.delete(questId);
+            scheduleRender();
+        }
+    };
+
+    const claimQuest = async (quest) => {
+        const questId = quest.id;
+        const name = quest.config.messages?.questName || questId;
+        const live = QuestsStore.quests.get(questId) || quest;
+
+        if (live.userStatus?.claimedAt) {
+            log.warn(`[${name}] ${t("logClaimAlready")}`);
+            return;
+        }
+        if (!live.userStatus?.completedAt) {
+            log.warn(`[${name}] ${t("logClaimNotReady")}`);
+            return;
+        }
+        if (claimsInFlight.has(questId)) {
+            log.warn(`[${name}] ${t("logAlreadyRunning")}`);
+            return;
+        }
+
+        claimsInFlight.add(questId);
+        log.info(`[${name}] ${t("logClaimClick")}`);
+
+        try {
+            await apiPost({
+                url: `/quests/${questId}/claim-reward`,
+                body: {
+                    platform: 0,
+                    location: 11,
+                    is_targeted: false,
+                    metadata_raw: null
+                }
+            });
+
+            const deadline = Date.now() + 5000;
+            let confirmed = false;
+            while (Date.now() < deadline) {
+                const updated = QuestsStore.quests.get(questId);
+                if (updated?.userStatus?.claimedAt) {
+                    confirmed = true;
+                    break;
+                }
+                await sleep(250);
+            }
+
+            if (confirmed) {
+                log.success(`[${name}] ${t("logClaimMarked")}`);
+            } else {
+                log.warn(`[${name}] ${t("logClaimPending")}`);
+            }
+            await fetchUserOrbsBalance();
+            scheduleRender({ bustOrbs: true });
+        } catch (e) {
+            log.error(`[${name}] ${t("logAPIError")}${errMsg(e)}`);
+            log.warn(`[${name}] ${t("logClaimManual")}`);
+        } finally {
+            claimsInFlight.delete(questId);
+        }
+    };
+
+    const launchQuestUi = (quest) => {
+        const questId = quest.id;
+        const name = quest.config.messages?.questName || questId;
+        if (launchesInFlight.has(questId)) return;
+
+        launchesInFlight.add(questId);
+        log.info(`[${name}] ${t("logLaunchClick")}`);
+        launchQuestInDiscord(quest, log, t).finally(() => {
+            launchesInFlight.delete(questId);
+        });
+    };
+
+
+    const updateBatchStrip = (info) => {
+        if (!batchStrip) return;
+        if (!info) {
+            batchStrip.hidden = true;
+            batchStrip.textContent = "";
+            return;
+        }
+        batchStrip.hidden = false;
+        if (info.preparing) {
+            batchStrip.textContent = t("batchPreparing");
+            return;
+        }
+        const line1 = t("batchProgress").replace("{i}", info.i).replace("{n}", info.n);
+        const line2 = t("batchCurrent") + (info.name || "");
+        const pct = info.overall != null ? ` — ${t("batchOverall")}: ${info.overall}%` : "";
+        batchStrip.textContent = `${line1} · ${line2}${pct}`;
+    };
+
+    const updateStopAllVisibility = () => {
+        if (!stopAllBtn) return;
+        const show = batchRunning || dqmTasks.size > 0;
+        stopAllBtn.hidden = !show;
+        stopAllBtn.disabled = !show;
+    };
+
+    const runAllQuests = async () => {
+        if (batchRunning) return;
+        batchStopRequested = false;
+        batchRunning = true;
+        updateStopAllVisibility();
+        updateBatchStrip({ preparing: true });
+
+        const quests = dedupeQuests([...QuestsStore.quests.values()]).filter(isBatchRunnableQuest);
+        if (quests.length === 0) {
+            log.warn(t("logNoQuests"));
+            batchRunning = false;
+            updateBatchStrip(null);
+            updateStopAllVisibility();
+            return;
+        }
+
+        log.info(t("logBatchStart") + quests.length + t("logBatchEnd"));
+        let ok = 0, skipped = 0, failed = 0;
+
+        for (let i = 0; i < quests.length; i++) {
+            if (batchStopRequested) break;
+            const quest = quests[i];
+            const name = quest.config.messages?.questName || quest.id;
+            const overall = Math.round((i / quests.length) * 100);
+            updateBatchStrip({ i: i + 1, n: quests.length, name, overall });
+
+            const result = await new Promise(resolve => executeQuest(quest, resolve));
+            if (!result || result.skipped) skipped++;
+            else if (result.ok) ok++;
+            else failed++;
+        }
+
+        updateBatchStrip({
+            i: quests.length,
+            n: quests.length,
+            name: "—",
+            overall: batchStopRequested ? Math.round((ok / quests.length) * 100) : 100
+        });
+        log.success(t("logBatchSummary") + ok + t("logBatchSkipped") + skipped + t("logBatchFailed") + failed);
+        log.info(t("logAllDone"));
+        batchRunning = false;
+        batchStopRequested = false;
+        setTimeout(() => updateBatchStrip(null), 2500);
+        updateStopAllVisibility();
+        scheduleRender();
+    };
+
+
+    let renderQueued = false;
+    let renderOpts = {};
+    const scheduleRender = (opts = {}) => {
+        Object.assign(renderOpts, opts);
+        if (renderQueued) return;
+        renderQueued = true;
+        requestAnimationFrame(() => {
+            renderQueued = false;
+            const o = renderOpts;
+            renderOpts = {};
+            renderQuests(o);
+        });
+    };
+
+    const sumQuestOrbsForFilter = (filter) => {
+        let total = 0;
+        for (const q of dedupeQuests(getAllStoreQuests().filter(quest => !isExpired(quest)))) {
+            if (getQuestBucket(q) !== filter) continue;
+            const v = getQuestOrbs(q);
+            if (v != null) total += v;
+        }
+        return total;
+    };
+
+    const countQuestsForFilter = (filter) => {
+        let count = 0;
+        for (const q of dedupeQuests(getAllStoreQuests().filter(quest => !isExpired(quest)))) {
+            if (getQuestBucket(q) === filter) count++;
+        }
+        return count;
+    };
+
+    const countTotalQuests = () => {
+        return dedupeQuests(getAllStoreQuests().filter(q => !isExpired(q))).length;
+    };
+
+    const updateTabStats = () => {
+        const pairs = [
+            ["incomplete", "dqm-tab-quests-incomplete", "dqm-tab-orbs-incomplete"],
+            ["claimable", "dqm-tab-quests-claimable", "dqm-tab-orbs-claimable"],
+            ["complete", "dqm-tab-quests-complete", "dqm-tab-orbs-complete"]
+        ];
+        for (const [filter, qId, oId] of pairs) {
+            const qEl = document.getElementById(qId);
+            const oEl = document.getElementById(oId);
+            if (qEl) qEl.textContent = String(countQuestsForFilter(filter));
+            if (oEl) oEl.textContent = String(sumQuestOrbsForFilter(filter));
+        }
+    };
+
+    const fetchUserOrbsBalance = async () => {
+        try {
+            const res = await apiGet({ url: "/users/@me/virtual-currency/balance" });
+            const body = res?.body;
+            if (typeof body === "string" && /^\s*</.test(body)) {
+                log.debug("Orbs balance: invalid API response");
+                return;
+            }
+            const bal = body?.balance ?? body?.virtual_currency_balance ?? 0;
+            userOrbsBalance = typeof bal === "number" ? bal : (parseInt(bal, 10) || 0);
+        } catch (e) {
+            const msg = errMsg(e);
+            log.debug(msg.includes("[object Object]")
+                ? "Orbs balance: Discord API module mismatch"
+                : `Orbs balance: ${msg}`);
+        }
+        updateRunningStats();
+    };
+
+    const updateRunningStats = () => {
+        const qEl = document.getElementById("dqm-stat-quests");
+        const oEl = document.getElementById("dqm-stat-orbs");
+        const rEl = document.getElementById("dqm-stat-running");
+        if (!listContainer) return;
+        if (qEl) qEl.textContent = String(countTotalQuests());
+        if (oEl) oEl.textContent = userOrbsBalance != null ? String(userOrbsBalance) : "—";
+        if (rEl) rEl.textContent = String(dqmTasks.size);
+        updateTabStats();
+    };
+
+    const updateMiniRunning = () => {
+        if (!miniIcon) return;
+        miniIcon.classList.toggle("dqm-mini--running", dqmTasks.size > 0);
+    };
+
+    const updateEmptyState = (visible, key) => {
+        if (!listContainer) return;
+        if (!emptyStateEl) {
+            emptyStateEl = document.createElement("div");
+            emptyStateEl.className = "dqm-empty";
+        }
+        if (visible) {
+            emptyStateEl.textContent = t(key);
+            if (!emptyStateEl.parentNode) listContainer.appendChild(emptyStateEl);
+        } else if (emptyStateEl.parentNode) emptyStateEl.remove();
+    };
+
+    const buildCardActions = (card, quest, rt) => {
+        const actions = card.querySelector(".actions");
+        if (!actions) return;
+        actions.textContent = "";
+        const canonical = getCanonicalQuest(quest);
+        const group = getQuestDuplicateGroup(canonical);
+        const enrolled = group.some(q => q.userStatus?.enrolledAt);
+        const completed = group.some(q => q.userStatus?.completedAt);
+        const claimed = group.some(q => q.userStatus?.claimedAt);
+        const running = isDuplicateGroupRunning(canonical);
+        const details = getQuestTypeDetails(canonical);
+
+        const addBtn = (cls, label, onClick, aria, disabled = false) => {
+            const b = document.createElement("button");
+            b.className = "dqm-action-btn " + cls;
+            b.textContent = label;
+            b.setAttribute("aria-label", aria || label);
+            b.disabled = disabled;
+            if (onClick) b.onclick = onClick;
+            actions.appendChild(b);
+        };
+
+        if (!enrolled && !completed && !claimed && !isExpired(canonical)) {
+            if (acceptsInFlight.has(canonical.id)) {
+                addBtn("dqm-action-activate", t("btnActivating"), null, null, true);
+            } else {
+                addBtn("dqm-action-activate", t("btnActivate"), () => acceptQuest(canonical));
+            }
+        }
+
+        if (enrolled && !completed && !claimed) {
+            if (running) {
+                addBtn("dqm-action-stop", t("btnStop"), () => stopQuest(canonical.id));
+            } else if (isRunnableQuest(canonical)) {
+                addBtn("dqm-action-start", t("btnStart"), () => executeQuest(canonical));
+            }
+            if (details.type === "Launch Quest" && isAchievementActivityTask(details.taskName, getTaskConfig(canonical))) {
+                addBtn("dqm-action-launch", t("btnOpenDiscord"), () => launchQuestUi(canonical));
+            }
+        }
+        if (completed && !claimed) {
+            const claimTarget = group.find(q => q.userStatus?.completedAt && !q.userStatus?.claimedAt) ?? canonical;
+            addBtn("dqm-action-claim", t("btnClaim"), () => claimQuest(claimTarget));
+        }
+    };
+
+    const createQuestCard = (quest) => {
+        const card = document.createElement("div");
+        card.className = "dqm-card";
+        card.id = `quest-card-${quest.id}`;
+        card.dataset.questId = quest.id;
+
+        const nameEl = document.createElement("div");
+        nameEl.className = "dqm-card-name";
+
+        const meta = document.createElement("div");
+        meta.className = "dqm-card-meta";
+
+        const makeItem = (labelClass, valueClass) => {
+            const row = document.createElement("div");
+            row.className = "dqm-meta-item";
+            const b = document.createElement("b");
+            b.className = labelClass;
+            const v = document.createElement("span");
+            v.className = valueClass;
+            row.appendChild(b);
+            row.appendChild(v);
+            return row;
+        };
+
+        meta.appendChild(makeItem("dqm-lbl-type", "dqm-type-badge"));
+        meta.appendChild(makeItem("dqm-lbl-orbs", "dqm-orbs-val"));
+        meta.appendChild(makeItem("dqm-lbl-status", "dqm-status"));
+        meta.appendChild(makeItem("dqm-lbl-ends", "dqm-ends-val"));
+
+        const countryRow = document.createElement("div");
+        countryRow.className = "dqm-meta-item dqm-meta-country";
+        const countryLbl = document.createElement("b");
+        countryLbl.className = "dqm-lbl-country";
+        const countryVal = document.createElement("span");
+        countryVal.className = "dqm-country-val";
+        const countryFlag = document.createElement("span");
+        countryFlag.className = "dqm-country-flag";
+        countryFlag.setAttribute("aria-hidden", "true");
+        const countryLabel = document.createElement("span");
+        countryLabel.className = "dqm-country-label";
+        const countryExtra = document.createElement("span");
+        countryExtra.className = "dqm-country-extra";
+        const countrySelect = document.createElement("select");
+        countrySelect.className = "dqm-country-select";
+        countrySelect.setAttribute("aria-label", "Country");
+        countrySelect.title = "Override country";
+        countryVal.appendChild(countryFlag);
+        countryVal.appendChild(countryLabel);
+        countryVal.appendChild(countryExtra);
+        countryVal.appendChild(countrySelect);
+        countryRow.appendChild(countryLbl);
+        countryRow.appendChild(countryVal);
+        meta.appendChild(countryRow);
+
+        countrySelect.addEventListener("change", () => {
+            const questId = card.dataset.questId;
+            if (!questId) return;
+            const next = setCountryOverride(questId, countrySelect.value);
+            applyCountryToCard(card, { source: "override", code: next, extra: 0, status: "ready" });
+        });
+        countrySelect.addEventListener("click", (e) => e.stopPropagation());
+        countrySelect.addEventListener("mousedown", (e) => e.stopPropagation());
+
+        const progressWrap = document.createElement("div");
+        progressWrap.className = "dqm-progress-wrap";
+        const labels = document.createElement("div");
+        labels.className = "dqm-progress-labels";
+        const progressText = document.createElement("span");
+        progressText.className = "quest-progress-text";
+        const percentEl = document.createElement("span");
+        percentEl.className = "quest-progress-percent";
+        labels.appendChild(progressText);
+        labels.appendChild(percentEl);
+        const track = document.createElement("div");
+        track.className = "dqm-progress-track";
+        const bar = document.createElement("div");
+        bar.className = "quest-progress-bar";
+        track.appendChild(bar);
+        const eta = document.createElement("div");
+        eta.className = "dqm-eta";
+        progressWrap.appendChild(labels);
+        progressWrap.appendChild(track);
+        progressWrap.appendChild(eta);
+
+        const actions = document.createElement("div");
+        actions.className = "actions";
+
+        card.appendChild(nameEl);
+        card.appendChild(meta);
+        card.appendChild(progressWrap);
+        card.appendChild(actions);
+        updateQuestCard(card, quest);
+        return card;
+    };
+
+    const updateQuestCard = (card, quest) => {
+        const canonical = getCanonicalQuest(quest);
+        const rt = getGroupRuntime(canonical);
+        const details = getQuestTypeDetails(canonical);
+        const { progress, total } = getDisplayProgress(canonical, rt);
+        const percent = Math.min(100, Math.round((progress / Math.max(total, 1)) * 100));
+            const orbsValue = getQuestOrbs(canonical);
+        const expiresAt = new Date(canonical.config.expiresAt).toLocaleDateString(timeLocale());
+        const dupCount = isLaunchQuestType(canonical) ? getQuestDuplicateGroup(canonical).length : 1;
+
+        setCardStatusClass(card, rt.status);
+
+        const nameEl = card.querySelector(".dqm-card-name");
+        if (nameEl) {
+            nameEl.textContent = dupCount > 1
+                ? `${rt.name} · ${t("labelMergedListings").replace("{n}", String(dupCount))}`
+                : rt.name;
+        }
+
+        const setLbl = (sel, text) => {
+            const el = card.querySelector(sel);
+            if (el) el.textContent = text + ":";
+        };
+        setLbl(".dqm-lbl-type", t("labelType"));
+        setLbl(".dqm-lbl-orbs", t("labelOrbs"));
+        setLbl(".dqm-lbl-status", t("labelStatus"));
+        setLbl(".dqm-lbl-ends", t("labelEnds"));
+        setLbl(".dqm-lbl-country", t("labelCountry"));
+
+        const typeBadge = card.querySelector(".dqm-type-badge");
+        if (typeBadge) typeBadge.textContent = details.label;
+        const orbsVal = card.querySelector(".dqm-orbs-val");
+        if (orbsVal) orbsVal.textContent = orbsValue != null ? String(orbsValue) : "—";
+        const statusEl = card.querySelector(".dqm-status");
+        if (statusEl) {
+            statusEl.textContent = statusLabelFor(rt.status);
+            statusEl.style.color = statusColorFor(rt.status);
+        }
+        const endsVal = card.querySelector(".dqm-ends-val");
+        if (endsVal) endsVal.textContent = expiresAt;
+
+        const countrySelect = card.querySelector(".dqm-country-select");
+        if (countrySelect) countrySelect.setAttribute("aria-label", t("labelCountry"));
+
+        const syncCountryUi = (resolved) => {
+            applyCountryToCard(card, resolved);
+        };
+
+        const syncResolved = resolveQuestCountrySync(canonical.id);
+        if (syncResolved.status === "ready") {
+            countryResolveInFlight.delete(canonical.id);
+            syncCountryUi(syncResolved);
+        } else if (countryResolveInFlight.has(canonical.id)) {
+            syncCountryUi(syncResolved);
+        } else {
+            syncCountryUi(syncResolved);
+            countryResolveInFlight.add(canonical.id);
+            resolveQuestCountry(canonical.id).then((resolved) => {
+                countryResolveInFlight.delete(canonical.id);
+                if (cardByQuestId.get(canonical.id) !== card) return;
+                syncCountryUi(resolved);
+                refreshCountryFilterOptions();
+            });
+        }
+
+        const progressText = card.querySelector(".quest-progress-text");
+        if (progressText) progressText.textContent = formatProgressText(canonical, progress, total);
+        const percentEl = card.querySelector(".quest-progress-percent");
+        if (percentEl) percentEl.textContent = `${percent}%`;
+        const bar = card.querySelector(".quest-progress-bar");
+        if (bar) {
+            bar.style.width = percent + "%";
+            bar.style.background = progressBarColorVar(percent, rt.claimed);
+        }
+        const etaEl = card.querySelector(".dqm-eta");
+        if (etaEl) {
+            const mins = getProgressEtaMinutes(canonical, progress, total);
+            etaEl.textContent = (rt.running || progress < total)
+                ? `${t("labelEta")}: ~${mins}m`
+                : "";
+        }
+
+        buildCardActions(card, canonical, rt);
+    };
+
+    const renderQuests = ({ bustOrbs = false } = {}) => {
+        if (!listContainer) return;
+        if (bustOrbs) orbsCache.clear();
+
+        const allQuests = dedupeQuests([...QuestsStore.quests.values()]);
+        const visible = allQuests.filter(matchesFilter);
+        const visibleIds = new Set(visible.map(q => q.id));
+
+        for (const [id, card] of cardByQuestId) {
+            if (!visibleIds.has(id)) {
+                card.remove();
+                cardByQuestId.delete(id);
+            }
+        }
+
+        if (allQuests.length === 0) {
+            for (const [, card] of cardByQuestId) card.remove();
+            cardByQuestId.clear();
+            updateEmptyState(true, "logNoData");
+            updateRunningStats();
+            return;
+        }
+
+        const frag = document.createDocumentFragment();
+        let appendedNew = false;
+        for (const quest of visible) {
+            let card = cardByQuestId.get(quest.id);
+            if (!card) {
+                card = createQuestCard(quest);
+                cardByQuestId.set(quest.id, card);
+                frag.appendChild(card);
+                appendedNew = true;
+            } else {
+                updateQuestCard(card, quest);
+            }
+        }
+        if (appendedNew) listContainer.appendChild(frag);
+        updateEmptyState(visible.length === 0, "logNoCategory");
+        updateRunningStats();
+        updateMiniRunning();
+        updateStopAllVisibility();
+    };
+
+    const applyDir = () => {
+        if (!gui) return;
+        gui.dir = currentLang === "ar" ? "rtl" : "ltr";
+        gui.lang = currentLang === "ar" ? "ar" : "en";
+    };
+
+    const updateUITexts = () => {
+        applyDir();
+        const map = {
+            "dqm-title": t("title"),
+            "dqm-run-all": t("btnComplete"),
+            "dqm-stop-all": t("btnStopAll"),
+            "dqm-refresh": t("btnRefresh"),
+            "dqm-copy-logs": t("btnCopy"),
+            "dqm-lang-toggle": t("btnLang")
+        };
+        for (const [id, text] of Object.entries(map)) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = text;
+        }
+        const min = document.getElementById("dqm-minimize");
+        const close = document.getElementById("dqm-close");
+        if (min) { min.setAttribute("aria-label", t("btnMinimize")); min.title = t("btnMinimize"); }
+        if (close) { close.setAttribute("aria-label", t("btnClose")); close.title = t("btnClose"); }
+
+        const tabLabels = {
+            incomplete: t("tabIncomplete"),
+            claimable: t("tabClaimable"),
+            complete: t("tabComplete")
+        };
+        gui.querySelectorAll(".tab-btn").forEach(btn => {
+            const filter = btn.getAttribute("data-filter");
+            const label = btn.querySelector(".tab-label");
+            if (label && tabLabels[filter]) label.textContent = tabLabels[filter];
+        });
+
+        const countryFilterLbl = gui.querySelector(".dqm-country-filter-label");
+        if (countryFilterLbl) countryFilterLbl.textContent = t("labelCountryFilter");
+
+        const sub = document.getElementById("dqm-subtitle");
+        if (sub) sub.textContent = `${t("statQuests")} · ${t("statOrbs")} · ${PLUGIN_VERSION_LABEL}`;
+
+        const versionEl = document.getElementById("dqm-version");
+        if (versionEl) versionEl.textContent = getPluginVersionLabel();
+
+        const checkBtn = document.getElementById("dqm-check-update");
+        if (checkBtn) checkBtn.textContent = t("btnCheckUpdate");
+        const applyBtn = document.getElementById("dqm-apply-update");
+        if (applyBtn) applyBtn.textContent = t("btnApplyUpdate");
+
+        document.querySelector(".dqm-chip-quests-label") && (document.querySelector(".dqm-chip-quests-label").textContent = t("statQuests"));
+        document.querySelector(".dqm-chip-orbs-label") && (document.querySelector(".dqm-chip-orbs-label").textContent = t("statOrbs"));
+        document.querySelector(".dqm-chip-run-label") && (document.querySelector(".dqm-chip-run-label").textContent = t("statRunning"));
+        updateLocationChip(currentIpCountry);
+        refreshCountryFilterOptions();
+
+        gui.querySelectorAll(".dqm-tab-quests-label").forEach(el => { el.textContent = t("statQuests"); });
+        gui.querySelectorAll(".dqm-tab-orbs-label").forEach(el => { el.textContent = t("statOrbs"); });
+
+        scheduleRender();
+    };
+
+    const clampGuiToViewport = () => {
+        if (!gui) return;
+        const rect = gui.getBoundingClientRect();
+        const maxL = Math.max(8, window.innerWidth - rect.width - 8);
+        const maxT = Math.max(8, window.innerHeight - Math.min(rect.height, window.innerHeight - 8) - 8);
+        let left = rect.left;
+        let top = rect.top;
+        left = Math.min(Math.max(8, left), maxL);
+        top = Math.min(Math.max(8, top), maxT);
+        gui.style.left = left + "px";
+        gui.style.top = top + "px";
+        gui.style.right = "auto";
+    };
+
+
+    const onViewportResize = () => clampGuiToViewport();
+
+    const cleanupAll = () => {
+        batchStopRequested = true;
+        window.removeEventListener("resize", onViewportResize);
+        for (const fn of [...activeCleanups]) {
+            try { fn(); } catch (_) {}
+        }
+        activeCleanups.clear();
+        dqmTasks.forEach((task) => {
+            try { task.active = false; task.cleanup?.(); } catch (_) {}
+        });
+        dqmTasks.clear();
+        releaseGameDetectHold();
+        cardByQuestId.clear();
+        orbsCache.clear();
+        questRuntime.clear();
+        claimsInFlight.clear();
+        acceptsInFlight.clear();
+        launchesInFlight.clear();
+        userOrbsBalance = null;
+        gui?.remove();
+        miniIcon?.remove();
+        document.getElementById("dqm-gui")?.remove();
+        document.getElementById("dqm-gui-slynxe")?.remove();
+        document.getElementById("dqm-mini-icon")?.remove();
+        gui = null;
+        logBox = null;
+        listContainer = null;
+        miniIcon = null;
+    };
+
+
+    document.getElementById("dqm-gui")?.remove();
+    document.getElementById("dqm-gui-slynxe")?.remove();
+    document.getElementById("dqm-mini-icon")?.remove();
+    gui = document.createElement("div");
+    gui.id = "dqm-gui";
+    gui.setAttribute("role", "dialog");
+    gui.setAttribute("aria-label", "Quests Manager");
+    applyDir();
+
+    gui.innerHTML = `
+        <div id="dqm-header" class="dqm-header">
+            <div class="dqm-header-top">
+                <div class="dqm-brand">
+                    <div class="dqm-brand-mark" aria-hidden="true">🎮</div>
+                    <div class="dqm-brand-text">
+                        <span id="dqm-title"></span>
+                        <span id="dqm-subtitle" class="dqm-subtitle"></span>
+                </div>
+                    </div>
+                <div class="dqm-win-btns">
+                    <button id="dqm-minimize" class="dqm-btn-icon" type="button">─</button>
+                    <button id="dqm-close" class="dqm-btn-icon dqm-close" type="button">✕</button>
+                    </div>
+                </div>
+            <div class="dqm-stats">
+                <span class="dqm-chip"><span class="dqm-chip-quests-label"></span> <strong id="dqm-stat-quests">0</strong></span>
+                <span class="dqm-chip dqm-chip--orbs"><span class="dqm-chip-orbs-label"></span> <strong id="dqm-stat-orbs">0</strong></span>
+                <span class="dqm-chip dqm-chip--run"><span class="dqm-chip-run-label"></span> <strong id="dqm-stat-running">0</strong></span>
+                <span class="dqm-chip dqm-chip--location"><span class="dqm-chip-location-label"></span> <strong id="dqm-stat-location">—</strong></span>
+                <span class="dqm-chip dqm-chip--version" title="Plugin version"><strong id="dqm-version">${PLUGIN_VERSION_LABEL}</strong></span>
+            </div>
+            <div class="dqm-toolbar">
+                <button id="dqm-run-all" class="dqm-btn dqm-btn-green" type="button"></button>
+                <button id="dqm-stop-all" class="dqm-btn dqm-btn-danger" type="button" hidden></button>
+                <button id="dqm-refresh" class="dqm-btn dqm-btn-gray" type="button"></button>
+                <button id="dqm-copy-logs" class="dqm-btn dqm-btn-gray" type="button"></button>
+                <button id="dqm-lang-toggle" class="dqm-btn dqm-btn-blurple" type="button"></button>
+            </div>
+            <div class="dqm-update-bar">
+                <span id="dqm-update-status" class="dqm-update-status"></span>
+                <button id="dqm-check-update" class="dqm-btn dqm-btn-gray dqm-btn-sm" type="button"></button>
+                <button id="dqm-apply-update" class="dqm-btn dqm-btn-blurple dqm-btn-sm" type="button" hidden></button>
+            </div>
+        </div>
+        <div id="dqm-batch" class="dqm-batch" hidden></div>
+        <div class="dqm-tabs">
+            <div class="tab-col">
+                <div class="dqm-tab-stats">
+                    <span class="dqm-chip dqm-chip--sm">
+                        <span class="dqm-tab-quests-label"></span> <strong id="dqm-tab-quests-incomplete">0</strong>
+                    </span>
+                    <span class="dqm-chip dqm-chip--sm dqm-chip--orbs">
+                        <span class="dqm-tab-orbs-label"></span> <strong id="dqm-tab-orbs-incomplete">0</strong>
+                    </span>
+                </div>
+                <button class="tab-btn active" data-filter="incomplete" type="button">
+                    <span class="tab-label"></span>
+                </button>
+            </div>
+            <div class="tab-col">
+                <div class="dqm-tab-stats">
+                    <span class="dqm-chip dqm-chip--sm">
+                        <span class="dqm-tab-quests-label"></span> <strong id="dqm-tab-quests-claimable">0</strong>
+                    </span>
+                    <span class="dqm-chip dqm-chip--sm dqm-chip--orbs">
+                        <span class="dqm-tab-orbs-label"></span> <strong id="dqm-tab-orbs-claimable">0</strong>
+                    </span>
+                </div>
+                <button class="tab-btn" data-filter="claimable" type="button">
+                    <span class="tab-label"></span>
+                </button>
+            </div>
+            <div class="tab-col">
+                <div class="dqm-tab-stats">
+                    <span class="dqm-chip dqm-chip--sm">
+                        <span class="dqm-tab-quests-label"></span> <strong id="dqm-tab-quests-complete">0</strong>
+                    </span>
+                    <span class="dqm-chip dqm-chip--sm dqm-chip--orbs">
+                        <span class="dqm-tab-orbs-label"></span> <strong id="dqm-tab-orbs-complete">0</strong>
+                    </span>
+                </div>
+                <button class="tab-btn" data-filter="complete" type="button">
+                    <span class="tab-label"></span>
+                </button>
+            </div>
+            <div class="dqm-country-filter-wrap">
+                <label class="dqm-country-filter-label" for="dqm-country-filter"></label>
+                <select id="dqm-country-filter" class="dqm-country-filter" aria-label="Filter by country"></select>
+            </div>
+        </div>
+        <div id="dqm-list"></div>
+        <div id="dqm-logs" aria-live="polite"></div>
+    `;
+    document.body.appendChild(gui);
+    logBox = gui.querySelector("#dqm-logs");
+    listContainer = gui.querySelector("#dqm-list");
+    batchStrip = gui.querySelector("#dqm-batch");
+    stopAllBtn = gui.querySelector("#dqm-stop-all");
+
+    updateUITexts();
+    log.info(t("logReady"));
+    log.info(t("logReadyServer"));
+    if (missing.length > 2) log.warn(t("warnPartialModules") + " " + missing.join(", "));
+
+    miniIcon = document.createElement("div");
+    miniIcon.id = "dqm-mini-icon";
+    miniIcon.textContent = "🎮";
+    miniIcon.setAttribute("role", "button");
+    miniIcon.setAttribute("aria-label", t("title"));
+    document.body.appendChild(miniIcon);
+
+
+    gui.querySelector("#dqm-close").onclick = () => hidePanel();
+    gui.querySelector("#dqm-minimize").onclick = () => {
+        gui.style.display = "none";
+        miniIcon.style.display = 'flex';
+        const r = gui.getBoundingClientRect();
+        miniIcon.style.right = '525px';
+        miniIcon.style.top = '5px';
+        miniIcon.style.left = 'auto';
+    };
+    gui.querySelector("#dqm-refresh").onclick = async () => {
+        await Promise.all([
+            refreshQuestsFromApi(),
+            ensureRegionsCatalog({ force: true }),
+            fetchIpCountry({ force: true })
+        ]);
+        refreshCountryFilterOptions();
+        scheduleRender({ bustOrbs: true });
+        await fetchUserOrbsBalance();
+        log.info(t("logRefresh"));
+    };
+    gui.querySelector("#dqm-run-all").onclick = () => runAllQuests();
+    stopAllBtn.onclick = () => stopAllQuests();
+    gui.querySelector("#dqm-copy-logs").onclick = async () => {
+        try {
+            await navigator.clipboard.writeText(logBox.innerText || "");
+            log.success(t("logCopySuccess"));
+        } catch (e) {
+            log.error(t("logCopyError"));
+        }
+    };
+    gui.querySelector("#dqm-lang-toggle").onclick = () => {
+        currentLang = currentLang === "en" ? "ar" : "en";
+        updateUITexts();
+    };
+
+    let pendingUpdateZipUrl = null;
+    const setUpdateStatus = (text, kind = "") => {
+        const el = document.getElementById("dqm-update-status");
+        if (!el) return;
+        el.textContent = text || "";
+        el.classList.remove("dqm-update--ok", "dqm-update--warn", "dqm-update--err");
+        if (kind) el.classList.add(`dqm-update--${kind}`);
+    };
+    const setApplyVisible = (visible) => {
+        const btn = document.getElementById("dqm-apply-update");
+        if (btn) btn.hidden = !visible;
+    };
+
+    const runUpdateCheck = async ({ silent = false } = {}) => {
+        if (!silent) setUpdateStatus(t("updateChecking"));
+        setApplyVisible(false);
+        pendingUpdateZipUrl = null;
+        const result = await checkForPluginUpdate();
+        if (!result.ok) {
+            setUpdateStatus(t("updateCheckFailed") + (result.error || ""), "err");
+            return result;
+        }
+        if (result.hasUpdate && result.release?.srcZipUrl) {
+            pendingUpdateZipUrl = result.release.srcZipUrl;
+            setUpdateStatus(
+                t("updateAvailable").replace("{tag}", result.latest || ""),
+                "warn"
+            );
+            setApplyVisible(true);
+        } else if (result.hasUpdate && !result.release?.srcZipUrl) {
+            setUpdateStatus(
+                t("updateAvailable").replace("{tag}", result.latest || "") + ` — ${getReleasesPageUrl()}`,
+                "warn"
+            );
+        } else {
+            setUpdateStatus(t("updateLatest") + ` (${PLUGIN_VERSION_LABEL})`, "ok");
+        }
+        return result;
+    };
+
+    gui.querySelector("#dqm-check-update").onclick = () => { runUpdateCheck(); };
+    gui.querySelector("#dqm-apply-update").onclick = async () => {
+        if (!pendingUpdateZipUrl) {
+            await runUpdateCheck();
+            if (!pendingUpdateZipUrl) return;
+        }
+        setUpdateStatus(t("updateApplying"), "warn");
+        setApplyVisible(false);
+        const applied = await applyPluginUpdate(pendingUpdateZipUrl);
+        if (applied.ok) {
+            setUpdateStatus(t("updateDone"), "ok");
+            log.success(applied.message || t("updateDone"));
+        } else {
+            setUpdateStatus(t("updateFailed") + applied.message, "err");
+            log.error(t("updateFailed") + applied.message);
+            setApplyVisible(true);
+        }
+    };
+
+    gui.querySelectorAll(".tab-btn").forEach(btn => {
+        btn.onclick = (e) => {
+            gui.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+            e.currentTarget.classList.add("active");
+            currentFilter = e.currentTarget.getAttribute("data-filter");
+            scheduleRender();
+        };
+    });
+    const countryFilterEl = gui.querySelector("#dqm-country-filter");
+    if (countryFilterEl) {
+        countryFilterEl.onchange = () => {
+            currentCountryFilter = countryFilterEl.value || "all";
+            scheduleRender();
+        };
+    }
+
+
+    const header = gui.querySelector("#dqm-header");
+    let dragging = false, sx, sy, sl, st;
+    header.addEventListener("mousedown", (e) => {
+        if (e.target.closest("button")) return;
+        dragging = true;
+        header.style.cursor = "grabbing";
+        sx = e.clientX; sy = e.clientY;
+        const rect = gui.getBoundingClientRect();
+        sl = rect.left; st = rect.top;
+        gui.style.right = "auto";
+        gui.style.left = sl + "px";
+        document.addEventListener("mousemove", onDrag);
+        document.addEventListener("mouseup", onDragEnd);
+        e.preventDefault();
+    });
+    const onDrag = (e) => {
+        if (!dragging) return;
+        gui.style.left = (sl + e.clientX - sx) + "px";
+        gui.style.top = (st + e.clientY - sy) + "px";
+    };
+    const onDragEnd = () => {
+        dragging = false;
+        header.style.cursor = "grab";
+        document.removeEventListener("mousemove", onDrag);
+        document.removeEventListener("mouseup", onDragEnd);
+        clampGuiToViewport();
+    };
+
+
+    let miniDrag = false, mSx, mSy, mSl, mSt, miniMoved = false;
+    miniIcon.addEventListener("mousedown", (e) => {
+        miniDrag = true; miniMoved = false;
+        mSx = e.clientX; mSy = e.clientY;
+        const rect = miniIcon.getBoundingClientRect();
+        mSl = rect.left; mSt = rect.top;
+        miniIcon.style.right = "auto";
+        miniIcon.style.left = mSl + "px";
+        document.addEventListener("mousemove", onMiniMove);
+        document.addEventListener("mouseup", onMiniUp);
+        e.preventDefault();
+    });
+    const onMiniMove = (e) => {
+        if (!miniDrag) return;
+        miniMoved = true;
+        miniIcon.style.left = (mSl + e.clientX - mSx) + "px";
+        miniIcon.style.top = (mSt + e.clientY - mSy) + "px";
+    };
+    const onMiniUp = () => {
+        miniDrag = false;
+        document.removeEventListener("mousemove", onMiniMove);
+        document.removeEventListener("mouseup", onMiniUp);
+        if (!miniMoved) {
+            miniIcon.style.display = "none";
+            gui.style.display = "flex";
+            panelHidden = false;
+            clampGuiToViewport();
+        }
+    };
+
+    window.addEventListener("resize", onViewportResize);
+
+    const onQuestsStoreChange = () => {
+        scheduleRender();
+        fetchUserOrbsBalance();
+    };
+    if (QuestsStore?.addChangeListener) {
+        QuestsStore.addChangeListener(onQuestsStoreChange);
+        activeCleanups.add(() => {
+            try { QuestsStore.removeChangeListener(onQuestsStoreChange); } catch (_) {}
+        });
+    }
+
+    fetchUserOrbsBalance();
+    ensureRegionsCatalog().then(() => {
+        refreshCountryFilterOptions();
+        scheduleRender();
+    }).catch(() => {});
+    fetchIpCountry().catch(() => {});
+    refreshQuestsFromApi().then(() => renderQuests());
+    runUpdateCheck({ silent: true }).catch(() => {});
+    mounted = true;
+    panelHidden = false;
+    globalThis.__DQM_UNMOUNT = () => {
+        cleanupAll();
+        mounted = false;
+        panelHidden = false;
+        globalThis.__DQM_UNMOUNT = null;
+    };
+}
+
+
+
+(async () => {
+    injectDqmStyles("#dqm-gui, #dqm-mini-icon {\n    --dqm-bg: #2b2d31;\n    --dqm-bg-secondary: #1e1f22;\n    --dqm-panel: #313338;\n    --dqm-panel-hover: #383a40;\n    --dqm-surface: #2b2d31;\n    --dqm-border: #1e1f22;\n    --dqm-text: #f2f3f5;\n    --dqm-text-muted: #b5bac1;\n    --dqm-accent: #5865F2;\n    --dqm-accent-hover: #4752c4;\n    --dqm-success: #248046;\n    --dqm-success-bright: #57F287;\n    --dqm-warning: #faa61a;\n    --dqm-orbs: #f0b232;\n    --dqm-danger: #ed4245;\n    --dqm-info: #00b0f4;\n    --dqm-log: #4ade80;\n    --dqm-radius: 14px;\n    --dqm-shadow: 0 16px 48px rgba(0,0,0,.55), 0 0 0 1px rgba(88,101,242,.12);\n}\n#dqm-gui {\n    position: fixed; top: 100px; right: 30px; width: 540px; height: 680px;\n    min-width: 420px; min-height: 480px; z-index: 999999; resize: both;\n    display: flex; flex-direction: column; overflow: hidden;\n    color: var(--dqm-text);\n    font-family: \"gg sans\", \"Segoe UI\", \"Helvetica Neue\", Helvetica, Arial, sans-serif;\n    border-radius: var(--dqm-radius);\n    border: 1px solid var(--dqm-border);\n    box-shadow: var(--dqm-shadow);\n    background:\n        linear-gradient(165deg, rgba(88,101,242,.08) 0%, transparent 42%),\n        linear-gradient(180deg, var(--dqm-bg) 0%, var(--dqm-panel) 48%, #2a2c31 100%);\n}\n#dqm-gui * { box-sizing: border-box; }\n#dqm-gui button:focus-visible,\n#dqm-gui .tab-btn:focus-visible {\n    outline: 2px solid var(--dqm-accent);\n    outline-offset: 2px;\n}\n#dqm-gui .dqm-header {\n    display: flex; flex-direction: column; gap: 10px;\n    padding: 14px 16px 12px; background: rgba(30,31,34,.72);\n    border-bottom: 1px solid var(--dqm-border); cursor: grab; user-select: none;\n    backdrop-filter: blur(8px);\n}\n#dqm-gui .dqm-header-top {\n    display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-brand {\n    display: flex; align-items: center; gap: 10px; min-width: 0;\n}\n#dqm-gui .dqm-brand-mark {\n    width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;\n    background: linear-gradient(145deg, var(--dqm-accent), #7289da);\n    box-shadow: 0 0 18px rgba(88,101,242,.35); font-size: 16px; flex-shrink: 0;\n}\n#dqm-gui .dqm-brand-text { display: flex; flex-direction: column; min-width: 0; }\n#dqm-gui #dqm-title {\n    font-weight: 700; font-size: 16px; letter-spacing: .2px; color: var(--dqm-text);\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n}\n#dqm-gui .dqm-subtitle {\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 500;\n}\n#dqm-gui .dqm-win-btns { display: flex; gap: 2px; }\n#dqm-gui .dqm-btn-icon {\n    background: transparent; border: none; color: var(--dqm-text-muted);\n    cursor: pointer; font-size: 16px; width: 32px; height: 28px; border-radius: 6px;\n    line-height: 1;\n}\n#dqm-gui .dqm-btn-icon:hover { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-icon.dqm-close:hover { background: var(--dqm-danger); color: #fff; }\n#dqm-gui .dqm-stats {\n    display: flex; gap: 8px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-chip {\n    display: inline-flex; align-items: center; gap: 6px;\n    background: var(--dqm-bg-secondary); border: 1px solid rgba(255,255,255,.04);\n    padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-chip strong { color: var(--dqm-text); font-weight: 700; }\n#dqm-gui .dqm-chip--orbs { color: var(--dqm-orbs); }\n#dqm-gui .dqm-chip--run { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-chip--location { color: var(--dqm-info); }\n#dqm-gui .dqm-chip--version {\n    color: var(--dqm-accent);\n    border-color: rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-toolbar {\n    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;\n}\n#dqm-gui .dqm-update-bar {\n    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;\n}\n#dqm-gui .dqm-update-status {\n    flex: 1 1 140px; min-width: 0; font-size: 11px; color: var(--dqm-text-muted);\n    font-weight: 600; line-height: 1.3;\n}\n#dqm-gui .dqm-update--ok { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-update--warn { color: var(--dqm-warning); }\n#dqm-gui .dqm-update--err { color: var(--dqm-danger); }\n#dqm-gui .dqm-btn-sm { padding: 5px 10px; font-size: 11px; border-radius: 7px; }\n#dqm-gui .dqm-card--claimable {\n    border-color: rgba(0,176,244,.35);\n}\n#dqm-gui .dqm-btn {\n    border: none; cursor: pointer; font-size: 12px; padding: 7px 12px;\n    border-radius: 8px; font-weight: 650; color: #fff;\n    transition: background .15s ease, transform .12s ease, box-shadow .15s ease;\n}\n#dqm-gui .dqm-btn:hover { transform: translateY(-1px); }\n#dqm-gui .dqm-btn:active { transform: translateY(0); }\n#dqm-gui .dqm-btn-green {\n    background: linear-gradient(180deg, #2d9d55, var(--dqm-success));\n    box-shadow: 0 4px 14px rgba(36,128,70,.35);\n}\n#dqm-gui .dqm-btn-danger {\n    background: linear-gradient(180deg, #f04747, var(--dqm-danger));\n}\n#dqm-gui .dqm-btn-gray { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-blurple {\n    background: linear-gradient(180deg, #6a76f4, var(--dqm-accent));\n    box-shadow: 0 4px 14px rgba(88,101,242,.28);\n}\n#dqm-gui .dqm-batch {\n    margin: 0 16px; padding: 8px 12px; border-radius: 8px;\n    background: rgba(88,101,242,.12); border: 1px solid rgba(88,101,242,.25);\n    font-size: 12px; color: var(--dqm-text); font-weight: 600;\n}\n#dqm-gui .dqm-tabs {\n    display: flex; gap: 12px; align-items: flex-end; padding: 10px 16px;\n    background: rgba(30,31,34,.45); border-bottom: 1px solid var(--dqm-border);\n}\n#dqm-gui .tab-col {\n    display: flex; flex-direction: column; align-items: center; gap: 6px;\n}\n#dqm-gui .dqm-tab-stats {\n    display: flex; gap: 6px; flex-wrap: wrap; justify-content: center;\n}\n#dqm-gui .dqm-chip--sm {\n    padding: 3px 8px; font-size: 11px;\n}\n#dqm-gui .tab-btn {\n    border: none; padding: 6px 14px; border-radius: 999px; font-size: 12px;\n    font-weight: 650; cursor: pointer; background: var(--dqm-panel-hover);\n    color: var(--dqm-text-muted); transition: background .15s, color .15s;\n}\n#dqm-gui .tab-btn .tab-label { line-height: 1.2; }\n#dqm-gui .tab-btn.active {\n    background: var(--dqm-accent); color: #fff;\n    box-shadow: 0 0 0 1px rgba(88,101,242,.4), 0 4px 12px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-country-filter-wrap {\n    margin-left: auto; display: flex; flex-direction: column; gap: 4px;\n    align-items: flex-end; min-width: 0; max-width: 180px;\n}\n#dqm-gui .dqm-country-filter-label {\n    font-size: 10px; color: var(--dqm-text-muted); font-weight: 600;\n    white-space: nowrap;\n}\n#dqm-gui .dqm-country-filter {\n    appearance: none; -webkit-appearance: none;\n    width: 100%; max-width: 180px;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 8px;\n    padding: 5px 24px 5px 10px; font-size: 11px; font-weight: 600;\n    cursor: pointer; line-height: 1.3;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-filter:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-filter:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-filter option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui[dir=\"rtl\"] .dqm-country-filter-wrap { margin-left: 0; margin-right: auto; align-items: flex-start; }\n#dqm-gui #dqm-list {\n    padding: 12px 14px; overflow-y: auto; flex: 1;\n    display: flex; flex-direction: column; gap: 10px;\n}\n#dqm-gui #dqm-list::-webkit-scrollbar { width: 8px; }\n#dqm-gui #dqm-list::-webkit-scrollbar-thumb {\n    background: #4e5058; border-radius: 8px;\n}\n#dqm-gui .dqm-empty {\n    text-align: center; color: var(--dqm-text-muted); padding: 36px 16px; font-size: 14px;\n}\n#dqm-gui .dqm-card {\n    background: linear-gradient(180deg, rgba(43,45,49,.95), rgba(35,37,41,.98));\n    padding: 12px 14px; border-radius: 12px;\n    border: 1px solid rgba(255,255,255,.04);\n    border-left: 4px solid var(--dqm-accent);\n    display: flex; flex-direction: column; gap: 8px;\n    box-shadow: 0 6px 18px rgba(0,0,0,.22);\n    transition: border-color .2s, box-shadow .2s, background .2s;\n}\n#dqm-gui .dqm-card:hover {\n    background: linear-gradient(180deg, rgba(48,50,55,.98), rgba(38,40,45,.98));\n    box-shadow: 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--not-enrolled { border-left-color: var(--dqm-warning); }\n#dqm-gui .dqm-card--enrolled { border-left-color: var(--dqm-accent); }\n#dqm-gui .dqm-card--running {\n    border-left-color: var(--dqm-success-bright);\n    box-shadow: 0 0 0 1px rgba(87,242,135,.12), 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--running::after {\n    content: \"\"; position: absolute; top: 12px; inset-inline-end: 12px;\n    width: 8px; height: 8px; border-radius: 50%; background: var(--dqm-success-bright);\n    box-shadow: 0 0 0 0 rgba(87,242,135,.55); animation: dqm-pulse 1.6s infinite;\n}\n#dqm-gui .dqm-card { position: relative; }\n#dqm-gui .dqm-card--completed { border-left-color: var(--dqm-info); }\n#dqm-gui .dqm-card--claimed { border-left-color: var(--dqm-success); }\n#dqm-gui .dqm-card--error { border-left-color: var(--dqm-danger); }\n#dqm-gui .dqm-card--stopped { border-left-color: var(--dqm-text-muted); }\n#dqm-gui .dqm-card-name {\n    font-weight: 700; font-size: 14px; color: var(--dqm-text);\n    padding-inline-end: 16px; line-height: 1.3;\n}\n#dqm-gui .dqm-card-meta {\n    display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 12px;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-meta-item { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }\n#dqm-gui .dqm-meta-item b { font-weight: 650; color: var(--dqm-text-muted); }\n#dqm-gui .dqm-type-badge {\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;\n}\n#dqm-gui .dqm-orbs-val { color: var(--dqm-orbs); font-weight: 700; }\n#dqm-gui .dqm-status { font-weight: 700; }\n#dqm-gui .dqm-meta-country { grid-column: 1 / -1; }\n#dqm-gui .dqm-country-val {\n    display: inline-flex; align-items: center; gap: 6px; min-width: 0;\n}\n#dqm-gui .dqm-country-flag {\n    font-size: 14px; line-height: 1; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-label {\n    color: var(--dqm-text); font-weight: 650; font-size: 11px;\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;\n}\n#dqm-gui .dqm-country-extra {\n    color: var(--dqm-text-muted); font-weight: 700; font-size: 10px; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-select {\n    appearance: none; -webkit-appearance: none;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 6px;\n    padding: 2px 22px 2px 8px; font-size: 11px; font-weight: 600;\n    max-width: 100%; cursor: pointer; line-height: 1.4;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-select:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-select:disabled { opacity: 0.65; cursor: wait; }\n#dqm-gui .dqm-country-select:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-select option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui .dqm-progress-wrap { display: flex; flex-direction: column; gap: 4px; }\n#dqm-gui .dqm-progress-labels {\n    display: flex; justify-content: space-between; gap: 8px;\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 600;\n}\n#dqm-gui .dqm-progress-track {\n    width: 100%; height: 8px; background: var(--dqm-bg-secondary);\n    border-radius: 999px; overflow: hidden; direction: ltr;\n    box-shadow: inset 0 1px 3px rgba(0,0,0,.35);\n}\n#dqm-gui .quest-progress-bar {\n    height: 100%; width: 0; border-radius: 999px;\n    background: var(--dqm-accent);\n    transition: width .35s ease, background .25s ease;\n    box-shadow: 0 0 10px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-eta { font-size: 11px; color: var(--dqm-text-muted); }\n#dqm-gui .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }\n#dqm-gui .dqm-action-btn {\n    border: none; padding: 6px 11px; border-radius: 7px; cursor: pointer;\n    font-size: 11px; font-weight: 700; color: #fff; transition: filter .15s, transform .12s;\n}\n#dqm-gui .dqm-action-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }\n#dqm-gui .dqm-action-start { background: var(--dqm-success); }\n#dqm-gui .dqm-action-stop { background: var(--dqm-danger); }\n#dqm-gui .dqm-action-launch { background: var(--dqm-accent); }\n#dqm-gui .dqm-action-activate { background: var(--dqm-warning); color: #1e1f22; }\n#dqm-gui .dqm-action-activate:disabled { opacity: 0.6; cursor: wait; }\n#dqm-gui .dqm-action-claim { background: var(--dqm-orbs); color: #1e1f22; }\n#dqm-gui #dqm-logs {\n    background: var(--dqm-bg-secondary); font-family: Consolas, \"Courier New\", monospace;\n    font-size: 11px; padding: 10px 12px; height: 118px; min-height: 72px;\n    overflow-y: auto; border-top: 1px solid #000; color: var(--dqm-log);\n}\n#dqm-gui .dqm-log-line { margin-bottom: 2px; white-space: pre-wrap; word-break: break-word; }\n#dqm-gui .dqm-log-time { color: #6b7280; }\n#dqm-gui .dqm-log-level { font-weight: 700; }\n#dqm-gui .dqm-log--info .dqm-log-level { color: var(--dqm-info); }\n#dqm-gui .dqm-log--success .dqm-log-level { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-log--warning .dqm-log-level { color: var(--dqm-warning); }\n#dqm-gui .dqm-log--error .dqm-log-level { color: var(--dqm-danger); }\n#dqm-gui .dqm-log--debug .dqm-log-level { color: var(--dqm-text-muted); }\n#dqm-gui .dqm-log--running .dqm-log-level { color: var(--dqm-accent); }\n#dqm-mini-icon {\n    display: none; position: fixed; width: 52px; height: 52px; z-index: 999999;\n    border-radius: 16px; cursor: grab; user-select: none;\n    align-items: center; justify-content: center; font-size: 20px; color: #fff;\n    background: linear-gradient(145deg, var(--dqm-accent), #2d9d55);\n    border: 1px solid rgba(255,255,255,.12);\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 18px rgba(88,101,242,.3);\n    transition: transform .15s ease, box-shadow .15s ease;\n}\n#dqm-mini-icon:hover { transform: scale(1.06); }\n#dqm-mini-icon.dqm-mini--running {\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.5);\n    animation: dqm-pulse-ring 1.8s infinite;\n}\n@keyframes dqm-pulse {\n    0% { box-shadow: 0 0 0 0 rgba(87,242,135,.55); }\n    70% { box-shadow: 0 0 0 8px rgba(87,242,135,0); }\n    100% { box-shadow: 0 0 0 0 rgba(87,242,135,0); }\n}\n@keyframes dqm-pulse-ring {\n    0% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.45); }\n    70% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 12px rgba(87,242,135,0); }\n    100% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,0); }\n}\n@media (prefers-reduced-motion: reduce) {\n    #dqm-gui .dqm-card--running::after,\n    #dqm-mini-icon.dqm-mini--running { animation: none; }\n    #dqm-gui .quest-progress-bar,\n    #dqm-gui .dqm-btn { transition: none; }\n}\n#dqm-gui[dir=\"rtl\"] .dqm-card { border-left: 1px solid rgba(255,255,255,.04); border-right: 4px solid var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--not-enrolled { border-right-color: var(--dqm-warning); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--enrolled { border-right-color: var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--running { border-right-color: var(--dqm-success-bright); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--completed { border-right-color: var(--dqm-info); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--claimed { border-right-color: var(--dqm-success); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--error { border-right-color: var(--dqm-danger); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--stopped { border-right-color: var(--dqm-text-muted); }\n\n.dqm-modal-overlay {\n    position: fixed; inset: 0; z-index: 10000000;\n    background: rgba(0, 0, 0, 0.65);\n    display: flex; align-items: center; justify-content: center;\n    padding: 20px;\n}\n.dqm-modal {\n    width: min(480px, 100%); max-height: 90vh; overflow-y: auto;\n    background: var(--dqm-panel, #313338); color: var(--dqm-text, #f2f3f5);\n    border: 1px solid var(--dqm-border, #1e1f22);\n    border-radius: 12px; padding: 20px;\n    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);\n    font-family: \"gg sans\", \"Segoe UI\", Helvetica, Arial, sans-serif;\n}\n.dqm-modal-title {\n    margin: 0 0 8px; font-size: 18px; font-weight: 700;\n}\n.dqm-modal-desc {\n    margin: 0 0 14px; font-size: 13px; color: var(--dqm-text-muted, #b5bac1); line-height: 1.5;\n}\n.dqm-modal-steps {\n    margin: 0 0 16px; padding-left: 20px; font-size: 13px;\n    color: var(--dqm-text, #f2f3f5); line-height: 1.6;\n}\n.dqm-modal-steps li { margin-bottom: 8px; }\n.dqm-modal-error {\n    margin-bottom: 12px; padding: 10px 12px; border-radius: 8px;\n    background: rgba(237, 66, 69, 0.12); border: 1px solid rgba(237, 66, 69, 0.3);\n    color: #ed4245; font-size: 12px;\n}\n.dqm-modal-footer {\n    display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end;\n}\n.dqm-modal-footer .dqm-btn { font-size: 12px; padding: 8px 14px; border-radius: 8px; border: none; cursor: pointer; font-weight: 650; }\n.dqm-modal-footer .dqm-btn-gray { background: var(--dqm-panel-hover, #383a40); color: var(--dqm-text, #f2f3f5); }\n.dqm-modal-footer .dqm-btn-blurple { background: var(--dqm-accent, #5865F2); color: #fff; }\n\n#dqm-launcher-btn {\r\n    position: fixed;\r\n    bottom: calc(24px + env(safe-area-inset-bottom, 0px));\r\n    right: calc(16px + env(safe-area-inset-right, 0px));\r\n    z-index: 999998;\r\n    min-width: 44px;\r\n    min-height: 44px;\r\n    padding: 10px 16px;\r\n    border: none;\r\n    border-radius: 8px;\r\n    cursor: pointer;\r\n    touch-action: manipulation;\r\n    -webkit-tap-highlight-color: transparent;\r\n    font-family: \"gg sans\", \"Segoe UI\", \"Helvetica Neue\", Helvetica, Arial, sans-serif;\r\n    font-size: 14px;\r\n    font-weight: 600;\r\n    color: #fff;\r\n    background: var(--dqm-accent, #5865F2);\r\n    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.08);\r\n    user-select: none;\r\n}\r\n#dqm-launcher-btn:active {\r\n    background: var(--dqm-accent-hover, #4752c4);\r\n    transform: scale(0.98);\r\n}\r\n@media (hover: hover) {\r\n    #dqm-launcher-btn:hover {\r\n        background: var(--dqm-accent-hover, #4752c4);\r\n    }\r\n}\r\n@media (max-width: 768px) {\r\n    #dqm-gui {\r\n        top: 60px !important;\r\n        left: 8px !important;\r\n        right: 8px !important;\r\n        width: calc(100vw - 16px) !important;\r\n        min-width: unset !important;\r\n        height: calc(100dvh - 100px) !important;\r\n        max-height: calc(100dvh - 60px);\r\n        resize: none;\r\n    }\r\n    #dqm-launcher-btn {\r\n        bottom: calc(72px + env(safe-area-inset-bottom, 0px));\r\n        right: calc(12px + env(safe-area-inset-right, 0px));\r\n        font-size: 13px;\r\n        padding: 12px 14px;\r\n    }\r\n}\r\n");
+
+    await waitForDiscordReady();
+
+    const ready = await ensureQuestsManagerReady();
+    if (!ready) {
+        injectLauncherButton();
+        setupLauncherPersistence();
+        return;
+    }
+
+    injectLauncherButton();
+    setupLauncherPersistence();
+    console.log("[Quests Manager] Loaded. Click the Quests Manager button to open.");
+})();
+
+})();

@@ -1,0 +1,48 @@
+# Dependencies & package managers
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-error.log*
+package-lock.json
+pnpm-lock.yaml
+
+# Build / caches
+dist/
+build/
+.cache/
+*.tsbuildinfo
+_dl/
+_extract/
+_dqm_update/
+
+# Local Vencord clones (installer output)
+Vencord/
+Vencord_*/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.*
+
+# Logs & temp
+*.log
+tmp/
+temp/
+*.tmp
+
+# Archives created locally for release packaging (keep release assets out of tree)
+*.zip
+!**/regions.snapshot.json
