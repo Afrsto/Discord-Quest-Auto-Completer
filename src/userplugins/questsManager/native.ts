@@ -5,7 +5,18 @@
  */
 
 import { execFile } from "child_process";
-import { createWriteStream, existsSync, mkdirSync, promises as fsp, readdirSync, rmSync } from "fs";
+import {
+    createWriteStream,
+    existsSync,
+    mkdirSync,
+    openSync,
+    promises as fsp,
+    readSync,
+    closeSync,
+    readdirSync,
+    rmSync,
+    statSync
+} from "fs";
 import { homedir } from "os";
 import path from "path";
 import { pipeline } from "stream/promises";
@@ -330,6 +341,10 @@ function downloadFile(url: string, dest: string): Promise<void> {
     });
 }
 
+function isPluginIndexDir(dir: string): boolean {
+    return existsSync(path.join(dir, "index.tsx")) || existsSync(path.join(dir, "index.ts"));
+}
+
 async function findPluginRootInExtract(extractDir: string): Promise<string | null> {
     const candidates = [
         path.join(extractDir, "src", "userplugins", "questsManager"),
@@ -337,30 +352,80 @@ async function findPluginRootInExtract(extractDir: string): Promise<string | nul
         path.join(extractDir, "questsManager")
     ];
     for (const c of candidates) {
-        if (existsSync(path.join(c, "index.tsx")) || existsSync(path.join(c, "index.ts"))) {
-            return c;
-        }
+        if (isPluginIndexDir(c)) return c;
     }
-    // One nested folder (zip root)
-    try {
-        const entries = await fsp.readdir(extractDir, { withFileTypes: true });
+
+    // Walk for questsManager/index.(tsx|ts) — handles unexpected zip nesting.
+    const queue = [extractDir];
+    let scanned = 0;
+    while (queue.length && scanned < 400) {
+        const dir = queue.shift()!;
+        scanned++;
+        let entries;
+        try {
+            entries = await fsp.readdir(dir, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        const base = path.basename(dir);
+        if (base === "questsManager" && isPluginIndexDir(dir)) {
+            return dir;
+        }
         for (const ent of entries) {
             if (!ent.isDirectory()) continue;
-            const nested = path.join(extractDir, ent.name);
-            for (const c of [
-                path.join(nested, "src", "userplugins", "questsManager"),
-                path.join(nested, "userplugins", "questsManager"),
-                path.join(nested, "questsManager")
-            ]) {
-                if (existsSync(path.join(c, "index.tsx")) || existsSync(path.join(c, "index.ts"))) {
-                    return c;
-                }
-            }
+            if (ent.name === "node_modules" || ent.name === ".git") continue;
+            queue.push(path.join(dir, ent.name));
         }
-    } catch {
-        /* ignore */
     }
     return null;
+}
+
+function assertZipFile(zipPath: string): void {
+    let st;
+    try {
+        st = statSync(zipPath);
+    } catch {
+        throw new Error("Downloaded src.zip is missing.");
+    }
+    if (!st.isFile() || st.size < 64) {
+        throw new Error("Downloaded src.zip is empty or too small.");
+    }
+    const magic = Buffer.alloc(2);
+    const fd = openSync(zipPath, "r");
+    try {
+        readSync(fd, magic, 0, 2, 0);
+    } finally {
+        closeSync(fd);
+    }
+    if (magic[0] !== 0x50 || magic[1] !== 0x4b) {
+        throw new Error("Downloaded update is not a valid zip (expected PK header).");
+    }
+}
+
+/** Unzip without cmd.exe — runCommand quoting turns PowerShell -Command into a no-op echo. */
+async function extractZipArchive(zipPath: string, extractDir: string): Promise<void> {
+    const opts = { windowsHide: true, maxBuffer: 10 * 1024 * 1024 } as const;
+
+    if (process.platform === "win32") {
+        try {
+            await execFileAsync("tar.exe", ["-xf", zipPath, "-C", extractDir], opts);
+            return;
+        } catch (tarErr: any) {
+            console.warn(`[${PLUGIN_NAME}] tar.exe extract failed, trying Expand-Archive:`, tarErr?.message || tarErr);
+        }
+
+        const psCommand =
+            `Expand-Archive -Path '${zipPath.replace(/'/g, "''")}' ` +
+            `-DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`;
+        await execFileAsync(
+            "powershell.exe",
+            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCommand],
+            opts
+        );
+        return;
+    }
+
+    await execFileAsync("unzip", ["-o", zipPath, "-d", extractDir], opts);
 }
 
 async function copyDirRecursive(src: string, dest: string): Promise<void> {
@@ -433,22 +498,8 @@ export async function applyPluginUpdateFromUrl(
         mkdirSync(extractDir, { recursive: true });
 
         await downloadFile(String(zipUrl), zipPath);
-
-        if (process.platform === "win32") {
-            await runCommand(
-                "powershell.exe",
-                [
-                    "-NoProfile",
-                    "-ExecutionPolicy", "Bypass",
-                    "-Command",
-                    `Expand-Archive -Path '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`
-                ],
-                root,
-                10 * 1024 * 1024
-            );
-        } else {
-            await runCommand("unzip", ["-o", zipPath, "-d", extractDir], root, 10 * 1024 * 1024);
-        }
+        assertZipFile(zipPath);
+        await extractZipArchive(zipPath, extractDir);
 
         const sourcePlugin = await findPluginRootInExtract(extractDir);
         if (!sourcePlugin) {
