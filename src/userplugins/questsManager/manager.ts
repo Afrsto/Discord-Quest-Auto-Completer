@@ -1655,6 +1655,15 @@ export function mountQuestsManager() {
         return getQuestDuplicateGroup(quest).map(q => q.id);
     };
 
+    // Same pool as getQuestProgress / buildCardActions — never resume from out-of-region siblings.
+    const getRegionPeerQuestIds = (quest) => {
+        const display = getCanonicalQuest(quest);
+        const group = getQuestDuplicateGroup(quest);
+        const regionPeers = group.filter(questMatchesUserRegion);
+        const pool = regionPeers.length ? regionPeers : [display];
+        return pool.map(q => q.id);
+    };
+
     const isDuplicateGroupRunning = (quest) => {
         return getQuestDuplicateGroup(quest).some(q => dqmTasks.has(q.id));
     };
@@ -2484,7 +2493,7 @@ export function mountQuestsManager() {
 
     const runAchievementActivityQuest = async (quest, taskState, taskName, taskConfig) => {
         const canonical = getCanonicalQuest(quest);
-        const duplicateIds = getDuplicateGroupQuestIds(canonical);
+        const duplicateIds = getRegionPeerQuestIds(canonical);
         const questName = canonical.config.messages?.questName || canonical.id;
         const checkpointCount = taskConfig.tasks[taskName]?.target || 3;
         const completedCheckpoints = await resolveCompletedCheckpointsAsync(
