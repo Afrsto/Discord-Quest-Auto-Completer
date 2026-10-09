@@ -357,7 +357,7 @@ export function mountQuestsManager() {
             logActivityVerify: "Verifying quest completion…",
             logActivityVerifyPending: "Checkpoints submitted — waiting for Discord to confirm completion.",
             logActivityVerifyFailed: "Discord never confirmed completion. Progress stayed unchanged — not marking as completed.",
-            logActivityCheckpointsDone: "All checkpoints already submitted.",
+            logActivityCheckpointsDone: "Activity quest already has all checkpoints submitted. Refresh quests or claim the reward in Discord — not marking as completed.",
             logActivityMissingAppId: "Activity quest is missing an application ID.",
             logActivityLaunchFirst: "Launching quest in Discord…",
             logActivityNativeRequired: "Activity quests require a Vencord rebuild with native.ts. Run pnpm build and restart Discord.",
@@ -530,7 +530,7 @@ export function mountQuestsManager() {
             logActivityVerify: "جاري التحقق من إكمال المهمة…",
             logActivityVerifyPending: "تم إرسال نقاط التفتيش — بانتظار تأكيد ديسكورد.",
             logActivityVerifyFailed: "لم يؤكد ديسكورد الإكمال. بقي التقدم دون تغيير — لن يتم اعتبار المهمة مكتملة.",
-            logActivityCheckpointsDone: "تم إرسال جميع نقاط التفتيش مسبقًا.",
+            logActivityCheckpointsDone: "تم إرسال جميع نقاط التفتيش مسبقًا. حدّث المهام أو استلم المكافأة في ديسكورد — لن يتم اعتبارها مكتملة.",
             logActivityMissingAppId: "مهمة النشاط تفتقد معرف التطبيق.",
             logActivityLaunchFirst: "جاري تشغيل المهمة في ديسكورد…",
             logActivityNativeRequired: "مهام النشاط تتطلب إعادة بناء Vencord مع native.ts. شغّل pnpm build وأعد تشغيل ديسكورد.",
@@ -1655,15 +1655,6 @@ export function mountQuestsManager() {
         return getQuestDuplicateGroup(quest).map(q => q.id);
     };
 
-    // Same pool as getQuestProgress / buildCardActions — never resume from out-of-region siblings.
-    const getRegionPeerQuestIds = (quest) => {
-        const display = getCanonicalQuest(quest);
-        const group = getQuestDuplicateGroup(quest);
-        const regionPeers = group.filter(questMatchesUserRegion);
-        const pool = regionPeers.length ? regionPeers : [display];
-        return pool.map(q => q.id);
-    };
-
     const isDuplicateGroupRunning = (quest) => {
         return getQuestDuplicateGroup(quest).some(q => dqmTasks.has(q.id));
     };
@@ -2493,16 +2484,25 @@ export function mountQuestsManager() {
 
     const runAchievementActivityQuest = async (quest, taskState, taskName, taskConfig) => {
         const canonical = getCanonicalQuest(quest);
-        const duplicateIds = getRegionPeerQuestIds(canonical);
+        const duplicateIds = getDuplicateGroupQuestIds(canonical);
         const questName = canonical.config.messages?.questName || canonical.id;
         const checkpointCount = taskConfig.tasks[taskName]?.target || 3;
+        // Match getQuestProgress / DQH: resume from THIS listing only.
+        // Maxing progress across regional merge siblings caused Resume 1/1 →
+        // "All checkpoints already submitted" → false Completed! while Discord stayed 0/1.
         const completedCheckpoints = await resolveCompletedCheckpointsAsync(
-            canonical.id, taskName, checkpointCount, QuestsStore, apiGet, duplicateIds
+            canonical.id, taskName, checkpointCount, QuestsStore, apiGet
         );
         const applicationId = resolveQuestApplicationId(canonical, taskName, taskConfig);
 
         if (!applicationId) {
             log.error(`[${questName}] ${t("logActivityMissingAppId")}`);
+            taskState.active = false;
+            return false;
+        }
+
+        if (completedCheckpoints >= checkpointCount) {
+            log.warn(`[${questName}] ${t("logActivityCheckpointsDone")}`);
             taskState.active = false;
             return false;
         }
@@ -2526,6 +2526,7 @@ export function mountQuestsManager() {
             await launchQuestInDiscord(canonical, log, t);
         }
 
+        // duplicateIds: iframe binding allow-list only (not progress inflation).
         return activityExecutors.achievementActivity(
             canonical,
             taskState,

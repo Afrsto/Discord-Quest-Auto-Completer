@@ -139,7 +139,7 @@ export function getQuestCompletionFlags(quest) {
     };
 }
 
-export async function fetchQuestProgressFromApi(questId, apiGet) {
+export async function fetchQuestProgressFromApi(questId, apiGet, taskName = null) {
     if (!apiGet) return 0;
     try {
         const res = await apiGet({ url: "/quests/@me" });
@@ -152,17 +152,17 @@ export async function fetchQuestProgressFromApi(questId, apiGet) {
         const found = quests.find(q => q.id === questId);
         if (!found) return 0;
         const normalized = normalizeQuestUserStatus(found);
-        return readActivityCheckpointProgress(normalized, null);
+        return readActivityCheckpointProgress(normalized, taskName);
     } catch (_) {
         return 0;
     }
 }
 
-export async function fetchBestProgressForGroup(questIds, apiGet) {
+export async function fetchBestProgressForGroup(questIds, apiGet, taskName = null) {
     if (!apiGet || !questIds?.length) return 0;
     let best = 0;
     for (const id of questIds) {
-        best = Math.max(best, await fetchQuestProgressFromApi(id, apiGet));
+        best = Math.max(best, await fetchQuestProgressFromApi(id, apiGet, taskName));
     }
     return best;
 }
@@ -178,10 +178,13 @@ export function resolveGroupCompletedCheckpoints(questIds, taskName, checkpointC
 export async function resolveCompletedCheckpointsAsync(
     questId, taskName, checkpointCount, QuestsStore, apiGet, extraQuestIds = []
 ) {
-    const ids = [...new Set([questId, ...(extraQuestIds ?? [])])];
+    // Progress must stay scoped to the active quest (+ explicit peers only).
+    // Never pass an entire regional merge group here — a completed sibling
+    // would inflate 0/1 → 1/1 and falsely skip real checkpoint work.
+    const ids = [...new Set([questId, ...(extraQuestIds ?? [])].filter(Boolean).map(String))];
     let best = resolveGroupCompletedCheckpoints(ids, taskName, checkpointCount, QuestsStore);
     if (apiGet) {
-        const apiCount = await fetchBestProgressForGroup(ids, apiGet);
+        const apiCount = await fetchBestProgressForGroup(ids, apiGet, taskName);
         best = Math.max(best, Math.min(checkpointCount, apiCount));
     }
     return best;
@@ -1083,14 +1086,20 @@ export function createActivityExecutors(deps) {
         async achievementActivity(quest, taskState, taskName, checkpointCount, initialCompletedCheckpoints, duplicateQuestIds = []) {
             const questName = quest.config.messages?.questName || quest.id;
             const applicationId = resolveQuestApplicationId(quest, taskName);
-            let questId = quest.id;
-            let completedCheckpoints = initialCompletedCheckpoints;
-            const groupQuestIds = [...new Set([questId, ...(duplicateQuestIds ?? [])].map(String))];
+            let questId = String(quest.id);
+            let completedCheckpoints = Math.min(
+                checkpointCount,
+                Math.max(0, Math.floor(Number(initialCompletedCheckpoints) || 0))
+            );
+            // Full regional merge group is ONLY for iframe quest-id binding (allowed set).
+            // Progress / verify must use the active quest id alone — same as DQH.
+            const allowedQuestIds = [...new Set([questId, ...(duplicateQuestIds ?? [])].map(String))];
 
             const remaining = Math.max(0, checkpointCount - completedCheckpoints);
             if (remaining === 0) {
+                // Match DQH: already-submitted is NOT success — never log Completed!
                 log.warn(`[${questName}] ${t("logActivityCheckpointsDone")}`);
-                return true;
+                return false;
             }
 
             if (!applicationId) {
@@ -1116,13 +1125,25 @@ export function createActivityExecutors(deps) {
             }
 
             const initResult = await initActivityWithRetry(
-                applicationId, questId, taskState, sleep, log, t, questName, groupQuestIds
+                applicationId, questId, taskState, sleep, log, t, questName, allowedQuestIds
             );
             if (!initResult) return false;
 
             const effectiveFromInit = initResult.effectiveQuestId || initResult.boundQuestId;
-            if (effectiveFromInit && groupQuestIds.includes(String(effectiveFromInit))) {
-                questId = String(effectiveFromInit);
+            if (effectiveFromInit && allowedQuestIds.includes(String(effectiveFromInit))) {
+                const boundId = String(effectiveFromInit);
+                const boundProgress = resolveCompletedCheckpoints(
+                    boundId, taskName, checkpointCount, QuestsStore
+                );
+                const boundFlags = getQuestCompletionFlags(QuestsStore.quests.get(boundId));
+                // Adopt iframe-bound id only when that listing still needs work.
+                // Never switch onto a completed sibling and then fake-complete the card.
+                if (
+                    boundId === questId
+                    || (!boundFlags.isCompleted && !boundFlags.isClaimed && boundProgress < checkpointCount)
+                ) {
+                    questId = boundId;
+                }
             }
 
             if (initResult.startTimerIgnored) {
@@ -1131,8 +1152,9 @@ export function createActivityExecutors(deps) {
                 await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
             }
 
+            // Active quest only — do not max() with regional siblings.
             const freshCompleted = await resolveCompletedCheckpointsAsync(
-                questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
+                questId, taskName, checkpointCount, QuestsStore, apiGet
             );
             if (freshCompleted > completedCheckpoints) {
                 completedCheckpoints = freshCompleted;
@@ -1145,141 +1167,141 @@ export function createActivityExecutors(deps) {
             const remainingAfterInit = Math.max(0, checkpointCount - completedCheckpoints);
             if (remainingAfterInit === 0) {
                 log.warn(`[${questName}] ${t("logActivityCheckpointsDone")}`);
-            } else {
-                const { minSecs, maxSecs } = getActivityCheckpointSettings();
-                const allTimes = generateCheckpointTimes(checkpointCount, minSecs, maxSecs);
-                const checkpointTimes = allTimes.slice(completedCheckpoints);
-                const totalPlanSecs = checkpointTimes.reduce((sum, secs) => sum + secs, 0);
-                log.info(`[${questName}] ${t("logActivityCheckpointPlan")
-                    .replace("{count}", String(checkpointTimes.length))
-                    .replace("{min}", String(minSecs))
-                    .replace("{max}", String(maxSecs))
-                    .replace("{mins}", String(Math.ceil(totalPlanSecs / 60)))}`);
+                return false;
+            }
 
-                updateQuestProgress(quest.id, completedCheckpoints, checkpointCount, {
-                    etaSecs: totalPlanSecs
+            const { minSecs, maxSecs } = getActivityCheckpointSettings();
+            const allTimes = generateCheckpointTimes(checkpointCount, minSecs, maxSecs);
+            const checkpointTimes = allTimes.slice(completedCheckpoints);
+            const totalPlanSecs = checkpointTimes.reduce((sum, secs) => sum + secs, 0);
+            log.info(`[${questName}] ${t("logActivityCheckpointPlan")
+                .replace("{count}", String(checkpointTimes.length))
+                .replace("{min}", String(minSecs))
+                .replace("{max}", String(maxSecs))
+                .replace("{mins}", String(Math.ceil(totalPlanSecs / 60)))}`);
+
+            updateQuestProgress(quest.id, completedCheckpoints, checkpointCount, {
+                etaSecs: totalPlanSecs
+            });
+
+            let serverProgress = await resolveCompletedCheckpointsAsync(
+                questId, taskName, checkpointCount, QuestsStore, apiGet
+            );
+            const progressAtStart = serverProgress;
+            let stalledDispatches = 0;
+
+            const onHeartbeat = (data) => {
+                if (!taskState.active) return;
+                const eventQuestId = data?.questId ?? data?.quest?.id ?? data?.quest_id;
+                if (eventQuestId && String(eventQuestId) !== String(questId)) return;
+                const us = data?.userStatus ?? data?.user_status;
+                if (!us?.progress) return;
+                const keyed = taskName && us.progress?.[taskName]?.value != null
+                    ? us.progress[taskName].value
+                    : Object.values(us.progress)[0]?.value;
+                if (keyed == null) return;
+                const progress = Math.min(checkpointCount, Math.max(0, Math.floor(keyed)));
+                serverProgress = Math.max(serverProgress, progress);
+                updateQuestProgress(quest.id, serverProgress, checkpointCount);
+            };
+            if (FluxDispatcher?.subscribe) {
+                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
+                taskState.addUnsub(() => {
+                    try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat); } catch (_) {}
                 });
+            }
 
-                let serverProgress = await resolveCompletedCheckpointsAsync(
-                    questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
-                );
-                const progressAtStart = serverProgress;
-                let stalledDispatches = 0;
+            for (let i = 0; i < checkpointTimes.length; i++) {
+                if (!taskState.active) return false;
 
-                const onHeartbeat = (data) => {
-                    if (!taskState.active) return;
-                    const eventQuestId = data?.questId ?? data?.quest?.id ?? data?.quest_id;
-                    if (eventQuestId && !groupQuestIds.some(id => String(id) === String(eventQuestId))) return;
-                    const us = data?.userStatus ?? data?.user_status;
-                    if (!us?.progress) return;
-                    const vals = Object.values(us.progress);
-                    const val = vals[0]?.value;
-                    if (val == null) return;
-                    const progress = Math.min(checkpointCount, Math.max(0, Math.floor(val)));
-                    serverProgress = Math.max(serverProgress, progress);
-                    updateQuestProgress(quest.id, serverProgress, checkpointCount);
-                };
-                if (FluxDispatcher?.subscribe) {
-                    FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
-                    taskState.addUnsub(() => {
-                        try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat); } catch (_) {}
-                    });
-                }
+                const checkpointNum = completedCheckpoints + i + 1;
+                const isLast = checkpointNum >= checkpointCount;
+                const waitSecs = checkpointTimes[i];
 
-                for (let i = 0; i < checkpointTimes.length; i++) {
+                log.info(`[${questName}] ${t("logCheckpointWait")}${checkpointNum}/${checkpointCount} (${waitSecs}s)`);
+
+                const waitStart = Date.now();
+                let lastFeedbackAt = waitStart;
+                while (Date.now() - waitStart < waitSecs * 1000) {
                     if (!taskState.active) return false;
 
-                    const checkpointNum = completedCheckpoints + i + 1;
-                    const isLast = checkpointNum >= checkpointCount;
-                    const waitSecs = checkpointTimes[i];
+                    const elapsedSecs = Math.floor((Date.now() - waitStart) / 1000);
+                    const remainingSecs = Math.max(0, waitSecs - elapsedSecs);
+                    const etaSecs = estimateRemainingCheckpointSecs(checkpointTimes, i, elapsedSecs);
 
-                    log.info(`[${questName}] ${t("logCheckpointWait")}${checkpointNum}/${checkpointCount} (${waitSecs}s)`);
-
-                    const waitStart = Date.now();
-                    let lastFeedbackAt = waitStart;
-                    while (Date.now() - waitStart < waitSecs * 1000) {
-                        if (!taskState.active) return false;
-
-                        const elapsedSecs = Math.floor((Date.now() - waitStart) / 1000);
-                        const remainingSecs = Math.max(0, waitSecs - elapsedSecs);
-                        const etaSecs = estimateRemainingCheckpointSecs(checkpointTimes, i, elapsedSecs);
-
-                        if (Date.now() - lastFeedbackAt >= CHECKPOINT_WAIT_FEEDBACK_MS) {
-                            lastFeedbackAt = Date.now();
-                            log.info(`[${questName}] ${t("logCheckpointWaitRemaining")
-                                .replace("{n}", String(checkpointNum))
-                                .replace("{total}", String(checkpointCount))
-                                .replace("{secs}", String(remainingSecs))}`);
-                            updateQuestProgress(
-                                quest.id,
-                                Math.max(completedCheckpoints, serverProgress),
-                                checkpointCount,
-                                { etaSecs }
-                            );
-                        }
-
-                        await sleep(1000);
-                    }
-
-                    if (!taskState.active) return false;
-
-                    log.running(`[${questName}] ${t("logCheckpoint")}${checkpointNum}/${checkpointCount}`);
-
-                    let dispatchResult;
-                    try {
-                        if (isLast) {
-                            const completedPayload = JSON.stringify({ quest_id: questId, completed: true });
-                            const completedJs = buildDispatchMessageEventJs("quest-completed", completedPayload);
-                            dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, completedJs));
-                        } else {
-                            const progressJs = buildDispatchMessageEventJs("quest-progress", String(checkpointNum));
-                            dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, progressJs));
-                        }
-                    } catch (e) {
-                        log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
-                        return false;
-                    }
-
-                    if (dispatchResult?.success) {
-                        log.info(`[${questName}] ${t("logActivityDispatchOk")}`);
-                    } else {
-                        log.warn(`[${questName}] ${t("logActivityDispatchFailed")}${dispatchResult?.error || "unknown"}`);
-                    }
-
-                    const progressBeforePoll = serverProgress;
-                    let polledProgress = progressBeforePoll;
-                    for (const id of groupQuestIds) {
-                        polledProgress = Math.max(
-                            polledProgress,
-                            await pollServerCheckpointProgress(
-                                id, taskName, checkpointCount, polledProgress, QuestsStore, sleep
-                            )
+                    if (Date.now() - lastFeedbackAt >= CHECKPOINT_WAIT_FEEDBACK_MS) {
+                        lastFeedbackAt = Date.now();
+                        log.info(`[${questName}] ${t("logCheckpointWaitRemaining")
+                            .replace("{n}", String(checkpointNum))
+                            .replace("{total}", String(checkpointCount))
+                            .replace("{secs}", String(remainingSecs))}`);
+                        updateQuestProgress(
+                            quest.id,
+                            Math.max(completedCheckpoints, serverProgress),
+                            checkpointCount,
+                            { etaSecs }
                         );
                     }
-                    const apiPolled = await fetchBestProgressForGroup(groupQuestIds, apiGet);
-                    const confirmedProgress = Math.max(polledProgress, apiPolled);
-                    if (dispatchResult?.success) {
-                        const displayProgress = Math.max(serverProgress, confirmedProgress);
-                        serverProgress = displayProgress;
-                        updateQuestProgress(quest.id, displayProgress, checkpointCount);
-                        if (confirmedProgress > progressBeforePoll) {
-                            stalledDispatches = 0;
-                            log.info(`[${questName}] ${t("logActivityServerProgress")
-                                .replace("{n}", String(confirmedProgress))
-                                .replace("{total}", String(checkpointCount))}`);
-                        } else {
-                            stalledDispatches += 1;
-                            log.warn(`[${questName}] ${t("logActivityServerProgressPending")}`);
-                            if (stalledDispatches >= 2 && confirmedProgress <= progressAtStart) {
-                                log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
-                                return false;
-                            }
+
+                    await sleep(1000);
+                }
+
+                if (!taskState.active) return false;
+
+                log.running(`[${questName}] ${t("logCheckpoint")}${checkpointNum}/${checkpointCount}`);
+
+                let dispatchResult;
+                try {
+                    if (isLast) {
+                        const completedPayload = JSON.stringify({ quest_id: questId, completed: true });
+                        const completedJs = buildDispatchMessageEventJs("quest-completed", completedPayload);
+                        dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, completedJs));
+                    } else {
+                        const progressJs = buildDispatchMessageEventJs("quest-progress", String(checkpointNum));
+                        dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, progressJs));
+                    }
+                } catch (e) {
+                    log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
+                    return false;
+                }
+
+                if (dispatchResult?.success) {
+                    log.info(`[${questName}] ${t("logActivityDispatchOk")}`);
+                } else {
+                    log.warn(`[${questName}] ${t("logActivityDispatchFailed")}${dispatchResult?.error || "unknown"}`);
+                }
+
+                const progressBeforePoll = serverProgress;
+                const polledProgress = await pollServerCheckpointProgress(
+                    questId, taskName, checkpointCount, progressBeforePoll, QuestsStore, sleep
+                );
+                const apiPolled = await fetchQuestProgressFromApi(questId, apiGet, taskName);
+                const confirmedProgress = Math.max(
+                    polledProgress,
+                    Math.min(checkpointCount, Math.max(0, Math.floor(apiPolled || 0)))
+                );
+                if (dispatchResult?.success) {
+                    const displayProgress = Math.max(serverProgress, confirmedProgress);
+                    serverProgress = displayProgress;
+                    updateQuestProgress(quest.id, displayProgress, checkpointCount);
+                    if (confirmedProgress > progressBeforePoll) {
+                        stalledDispatches = 0;
+                        log.info(`[${questName}] ${t("logActivityServerProgress")
+                            .replace("{n}", String(confirmedProgress))
+                            .replace("{total}", String(checkpointCount))}`);
+                    } else {
+                        stalledDispatches += 1;
+                        log.warn(`[${questName}] ${t("logActivityServerProgressPending")}`);
+                        if (stalledDispatches >= 2 && confirmedProgress <= progressAtStart) {
+                            log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
+                            return false;
                         }
                     }
                 }
             }
 
-            // Never treat local MessageEvents alone as completion — require Discord confirmation.
+            // Never treat local MessageEvents alone as completion — require Discord confirmation
+            // on THIS quest id only (never a regional sibling's completedAt).
             log.info(`[${questName}] ${t("logActivityVerify")}`);
             for (let attempt = 0; attempt < 6; attempt++) {
                 if (!taskState.active) return false;
@@ -1298,25 +1320,17 @@ export function createActivityExecutors(deps) {
                     return true;
                 }
 
-                for (const id of groupQuestIds) {
-                    const live = QuestsStore.quests.get(id);
-                    if (live?.userStatus?.completedAt) {
-                        updateQuestProgress(quest.id, checkpointCount, checkpointCount);
-                        return true;
-                    }
+                const live = QuestsStore.quests.get(questId);
+                if (live?.userStatus?.completedAt) {
+                    updateQuestProgress(quest.id, checkpointCount, checkpointCount);
+                    return true;
                 }
 
                 const liveProgress = await resolveCompletedCheckpointsAsync(
-                    questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
+                    questId, taskName, checkpointCount, QuestsStore, apiGet
                 );
                 if (liveProgress >= checkpointCount) {
-                    // Progress hit target on Discord's side; still require completedAt when possible.
-                    const anyCompleted = groupQuestIds.some(id => QuestsStore.quests.get(id)?.userStatus?.completedAt);
-                    if (anyCompleted || status?.completed) {
-                        updateQuestProgress(quest.id, checkpointCount, checkpointCount);
-                        return true;
-                    }
-                    // If Discord reports full progress but not completed_at yet, keep polling.
+                    // Full progress without completedAt yet — keep polling (DQH API verify loop).
                     updateQuestProgress(quest.id, liveProgress, checkpointCount);
                 }
 
