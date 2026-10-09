@@ -207,6 +207,7 @@
 }
 #dqm-gui .dqm-card--not-enrolled { border-left-color: var(--dqm-warning); }
 #dqm-gui .dqm-card--enrolled { border-left-color: var(--dqm-accent); }
+#dqm-gui .dqm-card--ready-to-launch { border-left-color: var(--dqm-warning); }
 #dqm-gui .dqm-card--running {
     border-left-color: var(--dqm-success-bright);
     box-shadow: 0 0 0 1px rgba(87,242,135,.12), 0 8px 22px rgba(0,0,0,.28);
@@ -345,6 +346,7 @@
 #dqm-gui[dir="rtl"] .dqm-card { border-left: 1px solid rgba(255,255,255,.04); border-right: 4px solid var(--dqm-accent); }
 #dqm-gui[dir="rtl"] .dqm-card--not-enrolled { border-right-color: var(--dqm-warning); }
 #dqm-gui[dir="rtl"] .dqm-card--enrolled { border-right-color: var(--dqm-accent); }
+#dqm-gui[dir="rtl"] .dqm-card--ready-to-launch { border-right-color: var(--dqm-warning); }
 #dqm-gui[dir="rtl"] .dqm-card--running { border-right-color: var(--dqm-success-bright); }
 #dqm-gui[dir="rtl"] .dqm-card--completed { border-right-color: var(--dqm-info); }
 #dqm-gui[dir="rtl"] .dqm-card--claimed { border-right-color: var(--dqm-success); }

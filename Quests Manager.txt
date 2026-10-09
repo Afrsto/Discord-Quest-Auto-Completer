@@ -328,8 +328,9 @@ globalThis.__DQM_REGIONS_SNAPSHOT = {"1545205635577290893":{"isGlobal":false,"in
  * Launch Quest / Activity quest completion — ported from Discord Quest Helper
  */
 
-const DEFAULT_CHECKPOINT_MIN_SECS = 60;
-const DEFAULT_CHECKPOINT_MAX_SECS = 120;
+// Match Discord Quest Helper defaults (new installs; localStorage overrides still win).
+const DEFAULT_CHECKPOINT_MIN_SECS = 180;
+const DEFAULT_CHECKPOINT_MAX_SECS = 300;
 const CHECKPOINT_MIN_LIMIT = 30;
 const CHECKPOINT_MAX_LIMIT = 600;
 const STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY = "questHelper_activityCheckpointMin";
@@ -729,6 +730,7 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
 
         let startTimerResult = null;
         let startTimerError = null;
+        let startTimerIgnored = false;
         try {
             startTimerResult = await withTimeout(
                 sdk.commands.questStartTimer({ quest_id: effectiveQuestId }),
@@ -737,10 +739,12 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             );
         } catch (e) {
             startTimerError = describeError(e);
+            // DQH: benign 4002 "Quest not found" with valid iframe quest context → continue.
             if (isKnownBenignQuestStartTimerError(e) && hasRetryableQuestContext) {
+                startTimerIgnored = true;
+            } else {
                 return JSON.stringify({
                     success: false,
-                    errorCode: "QUEST_PENDING",
                     error: "questStartTimer failed: " + startTimerError,
                     effectiveQuestId,
                     boundQuestId,
@@ -748,22 +752,15 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
                     waitedMs
                 });
             }
-            return JSON.stringify({
-                success: false,
-                error: "questStartTimer failed: " + startTimerError,
-                effectiveQuestId,
-                boundQuestId,
-                commands,
-                waitedMs
-            });
         }
 
         if (startTimerResult && typeof startTimerResult === "object" && startTimerResult.success === false) {
             startTimerError = describeError(startTimerResult);
             if (isKnownBenignQuestStartTimerError(startTimerResult) && hasRetryableQuestContext) {
+                startTimerIgnored = true;
+            } else {
                 return JSON.stringify({
                     success: false,
-                    errorCode: "QUEST_PENDING",
                     error: "questStartTimer returned failure: " + startTimerError,
                     effectiveQuestId,
                     boundQuestId,
@@ -771,14 +768,6 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
                     waitedMs
                 });
             }
-            return JSON.stringify({
-                success: false,
-                error: "questStartTimer returned failure: " + startTimerError,
-                effectiveQuestId,
-                boundQuestId,
-                commands,
-                waitedMs
-            });
         }
 
         return JSON.stringify({
@@ -786,8 +775,8 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             waitedMs,
             effectiveQuestId,
             boundQuestId,
-            startTimerError: null,
-            startTimerIgnored: false
+            startTimerError: startTimerIgnored ? startTimerError : null,
+            startTimerIgnored
         });
     } catch (e) {
         return JSON.stringify({ success: false, error: describeError(e) });
@@ -1449,12 +1438,9 @@ function createActivityExecutors(deps) {
             }
 
             if (initResult.startTimerIgnored) {
+                // Match DQH: benign questStartTimer rejection with valid quest context → continue.
                 log.warn(`[${questName}] ${t("logActivityStartTimerIgnored")}${initResult.startTimerError || ""}`);
-                const timerOk = await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
-                if (!timerOk) {
-                    log.error(`[${questName}] ${t("logActivityTimerRequired")}`);
-                    return false;
-                }
+                await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
             }
 
             const freshCompleted = await resolveCompletedCheckpointsAsync(
@@ -1471,146 +1457,141 @@ function createActivityExecutors(deps) {
             const remainingAfterInit = Math.max(0, checkpointCount - completedCheckpoints);
             if (remainingAfterInit === 0) {
                 log.warn(`[${questName}] ${t("logActivityCheckpointsDone")}`);
-                return true;
-            }
+            } else {
+                const { minSecs, maxSecs } = getActivityCheckpointSettings();
+                const allTimes = generateCheckpointTimes(checkpointCount, minSecs, maxSecs);
+                const checkpointTimes = allTimes.slice(completedCheckpoints);
+                const totalPlanSecs = checkpointTimes.reduce((sum, secs) => sum + secs, 0);
+                log.info(`[${questName}] ${t("logActivityCheckpointPlan")
+                    .replace("{count}", String(checkpointTimes.length))
+                    .replace("{min}", String(minSecs))
+                    .replace("{max}", String(maxSecs))
+                    .replace("{mins}", String(Math.ceil(totalPlanSecs / 60)))}`);
 
-            const { minSecs, maxSecs } = getActivityCheckpointSettings();
-            const allTimes = generateCheckpointTimes(checkpointCount, minSecs, maxSecs);
-            const checkpointTimes = allTimes.slice(completedCheckpoints);
-            const totalPlanSecs = checkpointTimes.reduce((sum, secs) => sum + secs, 0);
-            log.info(`[${questName}] ${t("logActivityCheckpointPlan")
-                .replace("{count}", String(checkpointTimes.length))
-                .replace("{min}", String(minSecs))
-                .replace("{max}", String(maxSecs))
-                .replace("{mins}", String(Math.ceil(totalPlanSecs / 60)))}`);
-
-            updateQuestProgress(quest.id, completedCheckpoints, checkpointCount, {
-                etaSecs: totalPlanSecs
-            });
-
-            let serverProgress = await resolveCompletedCheckpointsAsync(
-                questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
-            );
-            const progressAtStart = serverProgress;
-            let stalledDispatches = 0;
-
-            const onHeartbeat = (data) => {
-                if (!taskState.active) return;
-                const eventQuestId = data?.questId ?? data?.quest?.id ?? data?.quest_id;
-                if (eventQuestId && !groupQuestIds.some(id => String(id) === String(eventQuestId))) return;
-                const us = data?.userStatus ?? data?.user_status;
-                if (!us?.progress) return;
-                const vals = Object.values(us.progress);
-                const val = vals[0]?.value;
-                if (val == null) return;
-                const progress = Math.min(checkpointCount, Math.max(0, Math.floor(val)));
-                serverProgress = Math.max(serverProgress, progress);
-                updateQuestProgress(quest.id, serverProgress, checkpointCount);
-            };
-            if (FluxDispatcher?.subscribe) {
-                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
-                taskState.addUnsub(() => {
-                    try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat); } catch (_) {}
+                updateQuestProgress(quest.id, completedCheckpoints, checkpointCount, {
+                    etaSecs: totalPlanSecs
                 });
-            }
 
-            for (let i = 0; i < checkpointTimes.length; i++) {
-                if (!taskState.active) return false;
+                let serverProgress = await resolveCompletedCheckpointsAsync(
+                    questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
+                );
+                const progressAtStart = serverProgress;
+                let stalledDispatches = 0;
 
-                const checkpointNum = completedCheckpoints + i + 1;
-                const isLast = checkpointNum >= checkpointCount;
-                const waitSecs = checkpointTimes[i];
+                const onHeartbeat = (data) => {
+                    if (!taskState.active) return;
+                    const eventQuestId = data?.questId ?? data?.quest?.id ?? data?.quest_id;
+                    if (eventQuestId && !groupQuestIds.some(id => String(id) === String(eventQuestId))) return;
+                    const us = data?.userStatus ?? data?.user_status;
+                    if (!us?.progress) return;
+                    const vals = Object.values(us.progress);
+                    const val = vals[0]?.value;
+                    if (val == null) return;
+                    const progress = Math.min(checkpointCount, Math.max(0, Math.floor(val)));
+                    serverProgress = Math.max(serverProgress, progress);
+                    updateQuestProgress(quest.id, serverProgress, checkpointCount);
+                };
+                if (FluxDispatcher?.subscribe) {
+                    FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
+                    taskState.addUnsub(() => {
+                        try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat); } catch (_) {}
+                    });
+                }
 
-                log.info(`[${questName}] ${t("logCheckpointWait")}${checkpointNum}/${checkpointCount} (${waitSecs}s)`);
-
-                const waitStart = Date.now();
-                let lastFeedbackAt = waitStart;
-                while (Date.now() - waitStart < waitSecs * 1000) {
+                for (let i = 0; i < checkpointTimes.length; i++) {
                     if (!taskState.active) return false;
 
-                    const elapsedSecs = Math.floor((Date.now() - waitStart) / 1000);
-                    const remainingSecs = Math.max(0, waitSecs - elapsedSecs);
-                    const etaSecs = estimateRemainingCheckpointSecs(checkpointTimes, i, elapsedSecs);
+                    const checkpointNum = completedCheckpoints + i + 1;
+                    const isLast = checkpointNum >= checkpointCount;
+                    const waitSecs = checkpointTimes[i];
 
-                    if (Date.now() - lastFeedbackAt >= CHECKPOINT_WAIT_FEEDBACK_MS) {
-                        lastFeedbackAt = Date.now();
-                        log.info(`[${questName}] ${t("logCheckpointWaitRemaining")
-                            .replace("{n}", String(checkpointNum))
-                            .replace("{total}", String(checkpointCount))
-                            .replace("{secs}", String(remainingSecs))}`);
-                        updateQuestProgress(
-                            quest.id,
-                            Math.max(completedCheckpoints, serverProgress),
-                            checkpointCount,
-                            { etaSecs }
+                    log.info(`[${questName}] ${t("logCheckpointWait")}${checkpointNum}/${checkpointCount} (${waitSecs}s)`);
+
+                    const waitStart = Date.now();
+                    let lastFeedbackAt = waitStart;
+                    while (Date.now() - waitStart < waitSecs * 1000) {
+                        if (!taskState.active) return false;
+
+                        const elapsedSecs = Math.floor((Date.now() - waitStart) / 1000);
+                        const remainingSecs = Math.max(0, waitSecs - elapsedSecs);
+                        const etaSecs = estimateRemainingCheckpointSecs(checkpointTimes, i, elapsedSecs);
+
+                        if (Date.now() - lastFeedbackAt >= CHECKPOINT_WAIT_FEEDBACK_MS) {
+                            lastFeedbackAt = Date.now();
+                            log.info(`[${questName}] ${t("logCheckpointWaitRemaining")
+                                .replace("{n}", String(checkpointNum))
+                                .replace("{total}", String(checkpointCount))
+                                .replace("{secs}", String(remainingSecs))}`);
+                            updateQuestProgress(
+                                quest.id,
+                                Math.max(completedCheckpoints, serverProgress),
+                                checkpointCount,
+                                { etaSecs }
+                            );
+                        }
+
+                        await sleep(1000);
+                    }
+
+                    if (!taskState.active) return false;
+
+                    log.running(`[${questName}] ${t("logCheckpoint")}${checkpointNum}/${checkpointCount}`);
+
+                    let dispatchResult;
+                    try {
+                        if (isLast) {
+                            const completedPayload = JSON.stringify({ quest_id: questId, completed: true });
+                            const completedJs = buildDispatchMessageEventJs("quest-completed", completedPayload);
+                            dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, completedJs));
+                        } else {
+                            const progressJs = buildDispatchMessageEventJs("quest-progress", String(checkpointNum));
+                            dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, progressJs));
+                        }
+                    } catch (e) {
+                        log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
+                        return false;
+                    }
+
+                    if (dispatchResult?.success) {
+                        log.info(`[${questName}] ${t("logActivityDispatchOk")}`);
+                    } else {
+                        log.warn(`[${questName}] ${t("logActivityDispatchFailed")}${dispatchResult?.error || "unknown"}`);
+                    }
+
+                    const progressBeforePoll = serverProgress;
+                    let polledProgress = progressBeforePoll;
+                    for (const id of groupQuestIds) {
+                        polledProgress = Math.max(
+                            polledProgress,
+                            await pollServerCheckpointProgress(
+                                id, taskName, checkpointCount, polledProgress, QuestsStore, sleep
+                            )
                         );
                     }
-
-                    await sleep(1000);
-                }
-
-                if (!taskState.active) return false;
-
-                log.running(`[${questName}] ${t("logCheckpoint")}${checkpointNum}/${checkpointCount}`);
-
-                let dispatchResult;
-                try {
-                    if (isLast) {
-                        const completedPayload = JSON.stringify({ quest_id: questId, completed: true });
-                        const completedJs = buildDispatchMessageEventJs("quest-completed", completedPayload);
-                        dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, completedJs));
-                    } else {
-                        const progressJs = buildDispatchMessageEventJs("quest-progress", String(checkpointNum));
-                        dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, progressJs));
-                    }
-                } catch (e) {
-                    log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
-                    return false;
-                }
-
-                if (dispatchResult?.success) {
-                    log.info(`[${questName}] ${t("logActivityDispatchOk")}`);
-                } else {
-                    log.warn(`[${questName}] ${t("logActivityDispatchFailed")}${dispatchResult?.error || "unknown"}`);
-                }
-
-                const progressBeforePoll = serverProgress;
-                let polledProgress = progressBeforePoll;
-                for (const id of groupQuestIds) {
-                    polledProgress = Math.max(
-                        polledProgress,
-                        await pollServerCheckpointProgress(
-                            id, taskName, checkpointCount, polledProgress, QuestsStore, sleep
-                        )
-                    );
-                }
-                const apiPolled = await fetchBestProgressForGroup(groupQuestIds, apiGet);
-                const confirmedProgress = Math.max(polledProgress, apiPolled);
-                if (dispatchResult?.success) {
-                    const displayProgress = Math.max(serverProgress, confirmedProgress);
-                    serverProgress = displayProgress;
-                    updateQuestProgress(quest.id, displayProgress, checkpointCount);
-                    if (confirmedProgress > progressBeforePoll) {
-                        stalledDispatches = 0;
-                        log.info(`[${questName}] ${t("logActivityServerProgress")
-                            .replace("{n}", String(confirmedProgress))
-                            .replace("{total}", String(checkpointCount))}`);
-                    } else {
-                        stalledDispatches += 1;
-                        log.warn(`[${questName}] ${t("logActivityServerProgressPending")}`);
-                        if (stalledDispatches >= 2 && confirmedProgress <= progressAtStart) {
-                            log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
-                            return false;
+                    const apiPolled = await fetchBestProgressForGroup(groupQuestIds, apiGet);
+                    const confirmedProgress = Math.max(polledProgress, apiPolled);
+                    if (dispatchResult?.success) {
+                        const displayProgress = Math.max(serverProgress, confirmedProgress);
+                        serverProgress = displayProgress;
+                        updateQuestProgress(quest.id, displayProgress, checkpointCount);
+                        if (confirmedProgress > progressBeforePoll) {
+                            stalledDispatches = 0;
+                            log.info(`[${questName}] ${t("logActivityServerProgress")
+                                .replace("{n}", String(confirmedProgress))
+                                .replace("{total}", String(checkpointCount))}`);
+                        } else {
+                            stalledDispatches += 1;
+                            log.warn(`[${questName}] ${t("logActivityServerProgressPending")}`);
+                            if (stalledDispatches >= 2 && confirmedProgress <= progressAtStart) {
+                                log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
+                                return false;
+                            }
                         }
                     }
                 }
             }
 
-            if (serverProgress >= checkpointCount) {
-                updateQuestProgress(quest.id, checkpointCount, checkpointCount);
-                return true;
-            }
-
+            // Never treat local MessageEvents alone as completion — require Discord confirmation.
             log.info(`[${questName}] ${t("logActivityVerify")}`);
             for (let attempt = 0; attempt < 6; attempt++) {
                 if (!taskState.active) return false;
@@ -1641,8 +1622,14 @@ function createActivityExecutors(deps) {
                     questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
                 );
                 if (liveProgress >= checkpointCount) {
-                    updateQuestProgress(quest.id, checkpointCount, checkpointCount);
-                    return true;
+                    // Progress hit target on Discord's side; still require completedAt when possible.
+                    const anyCompleted = groupQuestIds.some(id => QuestsStore.quests.get(id)?.userStatus?.completedAt);
+                    if (anyCompleted || status?.completed) {
+                        updateQuestProgress(quest.id, checkpointCount, checkpointCount);
+                        return true;
+                    }
+                    // If Discord reports full progress but not completed_at yet, keep polling.
+                    updateQuestProgress(quest.id, liveProgress, checkpointCount);
                 }
 
                 await sleep(2000);
@@ -1823,6 +1810,7 @@ function mountQuestsManager() {
             logReadyServer: "Discord Server: https://discord.gg/btRCeujadA",
             statusNotEnrolled: "Not enrolled",
             statusInProgress: "In progress",
+            statusReadyToLaunch: "Ready to launch",
             statusCompleted: "Completed (Claim)",
             statusClaimable: "Ready to claim",
             statusClaimed: "Claimed",
@@ -1846,6 +1834,8 @@ function mountQuestsManager() {
             btnActivating: "Activating...",
             logActivateClick: "Activating quest...",
             logActivateSuccess: "Quest activated.",
+            logActivatePending: "Activation submitted — waiting for Discord to confirm…",
+            logActivateNotConfirmed: "Discord did not confirm enrollment. Try again.",
             logActivateFailed: "Activation failed: ",
             logAlreadyRunning: "Quest already being processed.",
             logCompleted: "Completed!",
@@ -1993,6 +1983,7 @@ function mountQuestsManager() {
             logReadyServer: "سيرفر ديسكورد: https://discord.gg/btRCeujadA",
             statusNotEnrolled: "لم يتم الالتحاق",
             statusInProgress: "قيد التنفيذ",
+            statusReadyToLaunch: "جاهزة للإطلاق",
             statusCompleted: "مكتملة (استلام)",
             statusClaimable: "جاهزة للاستلام",
             statusClaimed: "تم الاستلام",
@@ -2016,6 +2007,8 @@ function mountQuestsManager() {
             btnActivating: "جاري التفعيل...",
             logActivateClick: "جاري تفعيل المهمة...",
             logActivateSuccess: "تم تفعيل المهمة.",
+            logActivatePending: "تم إرسال التفعيل — بانتظار تأكيد ديسكورد…",
+            logActivateNotConfirmed: "ديسكورد لم يؤكد الالتحاق. حاول مرة أخرى.",
             logActivateFailed: "فشل التفعيل: ",
             logAlreadyRunning: "المهمة قيد المعالجة بالفعل.",
             logCompleted: "مكتملة!",
@@ -3057,13 +3050,19 @@ function mountQuestsManager() {
                 || resolvedType === "PLAY_ACTIVITY"
                 || resolvedType === "ACHIEVEMENT_IN_ACTIVITY"
                 || resolvedType.includes("ACHIEVEMENT")
-                || resolvedType.includes("ACTIVITY")
+                || (resolvedType.includes("ACTIVITY") && !resolvedType.includes("DESKTOP"))
             ) {
                 type = "Launch Quest"; label = "🚀 " + t("typeLaunch");
             }
         }
 
         if (type === "Other") {
+            const pureDesktopOrVideo = taskName === "PLAY_ON_DESKTOP"
+                || taskName === "STREAM_ON_DESKTOP"
+                || taskName === "WATCH_VIDEO"
+                || taskName === "WATCH_VIDEO_ON_MOBILE"
+                || resolvedType.includes("DESKTOP")
+                || resolvedType.includes("VIDEO");
             const app = quest.config?.application;
             const hasApp = !!(app?.id || app?.name || resolveQuestApplicationId(quest));
             const msg = quest.config?.messages || {};
@@ -3076,7 +3075,7 @@ function mountQuestsManager() {
                 || cta.includes("launch")
                 || qName.includes("launch")
                 || cta.includes("activity");
-            if (hasApp || isLaunchCta) {
+            if (!pureDesktopOrVideo && (hasApp || isLaunchCta)) {
                 type = "Launch Quest"; label = "🚀 " + t("typeLaunch");
             }
         }
@@ -3439,7 +3438,16 @@ function mountQuestsManager() {
         else if (rt.claimed) rt.status = "claimed";
         else if (rt.completed) rt.status = "claimable";
         else if (!flags.isEnrolled) rt.status = "not-enrolled";
-        else rt.status = "enrolled";
+        else if (
+            details.type === "Launch Quest"
+            && (rt.progress ?? 0) <= 0
+            && isLaunchQuestTask(details.taskName, getTaskConfig(quest))
+        ) {
+            // Enrolled but Discord still shows Launch Quest / 0 progress.
+            rt.status = "ready-to-launch";
+        } else {
+            rt.status = "enrolled";
+        }
         return rt;
     };
 
@@ -3557,7 +3565,8 @@ function mountQuestsManager() {
     const setCardStatusClass = (card, status) => {
         card.classList.remove(
             "dqm-card--idle", "dqm-card--not-enrolled", "dqm-card--enrolled",
-            "dqm-card--running", "dqm-card--completed", "dqm-card--claimable", "dqm-card--claimed",
+            "dqm-card--ready-to-launch", "dqm-card--running", "dqm-card--completed",
+            "dqm-card--claimable", "dqm-card--claimed",
             "dqm-card--error", "dqm-card--stopped"
         );
         card.classList.add("dqm-card--" + status);
@@ -3567,6 +3576,7 @@ function mountQuestsManager() {
         const map = {
             "not-enrolled": "var(--dqm-warning)",
             enrolled: "var(--dqm-accent)",
+            "ready-to-launch": "var(--dqm-warning)",
             running: "var(--dqm-success)",
             completed: "var(--dqm-info)",
             claimable: "var(--dqm-info)",
@@ -3582,6 +3592,7 @@ function mountQuestsManager() {
         const map = {
             "not-enrolled": t("statusNotEnrolled"),
             enrolled: t("statusInProgress"),
+            "ready-to-launch": t("statusReadyToLaunch"),
             running: t("statusRunning"),
             completed: t("statusCompleted"),
             claimable: t("statusClaimable"),
@@ -4193,6 +4204,16 @@ function mountQuestsManager() {
         patchCardStatus(questId);
     };
 
+    const clearOptimisticEnrollment = (questId) => {
+        const quest = QuestsStore.quests.get(questId);
+        if (!quest?.userStatus) return;
+        quest.userStatus = {
+            ...quest.userStatus,
+            enrolledAt: null
+        };
+        patchCardStatus(questId);
+    };
+
     const acceptQuest = async (quest) => {
         const canonical = getCanonicalQuest(quest);
         const questId = canonical.id;
@@ -4224,10 +4245,33 @@ function mountQuestsManager() {
                 });
             }
 
+            // Optimistic UI, then confirm via QuestsStore /quests/@me (mirror claim).
             patchQuestEnrollment(questId, new Date().toISOString());
-            log.success(`[${name}] ${t("logActivateSuccess")}`);
+            log.info(`[${name}] ${t("logActivatePending")}`);
+
+            const deadline = Date.now() + 5000;
+            let confirmed = false;
+            while (Date.now() < deadline) {
+                await refreshQuestsFromApi();
+                if (getQuestDuplicateGroup(canonical).some(q => {
+                    const updated = QuestsStore.quests.get(q.id);
+                    return !!updated?.userStatus?.enrolledAt;
+                })) {
+                    confirmed = true;
+                    break;
+                }
+                await sleep(250);
+            }
+
+            if (confirmed) {
+                log.success(`[${name}] ${t("logActivateSuccess")}`);
+            } else {
+                clearOptimisticEnrollment(questId);
+                log.error(`[${name}] ${t("logActivateNotConfirmed")}`);
+            }
             scheduleRender();
         } catch (e) {
+            clearOptimisticEnrollment(questId);
             log.error(`[${name}] ${t("logActivateFailed")}${errMsg(e)}`);
         } finally {
             acceptsInFlight.delete(questId);
@@ -4294,13 +4338,14 @@ function mountQuestsManager() {
     };
 
     const launchQuestUi = (quest) => {
-        const questId = quest.id;
-        const name = quest.config.messages?.questName || questId;
+        const canonical = getCanonicalQuest(quest);
+        const questId = canonical.id;
+        const name = canonical.config.messages?.questName || questId;
         if (launchesInFlight.has(questId)) return;
 
         launchesInFlight.add(questId);
         log.info(`[${name}] ${t("logLaunchClick")}`);
-        launchQuestInDiscord(quest, log, t).finally(() => {
+        launchQuestInDiscord(canonical, log, t).finally(() => {
             launchesInFlight.delete(questId);
         });
     };
@@ -5171,7 +5216,7 @@ function mountQuestsManager() {
 
 
 (async () => {
-    injectDqmStyles("#dqm-gui, #dqm-mini-icon {\n    --dqm-bg: #2b2d31;\n    --dqm-bg-secondary: #1e1f22;\n    --dqm-panel: #313338;\n    --dqm-panel-hover: #383a40;\n    --dqm-surface: #2b2d31;\n    --dqm-border: #1e1f22;\n    --dqm-text: #f2f3f5;\n    --dqm-text-muted: #b5bac1;\n    --dqm-accent: #5865F2;\n    --dqm-accent-hover: #4752c4;\n    --dqm-success: #248046;\n    --dqm-success-bright: #57F287;\n    --dqm-warning: #faa61a;\n    --dqm-orbs: #f0b232;\n    --dqm-danger: #ed4245;\n    --dqm-info: #00b0f4;\n    --dqm-log: #4ade80;\n    --dqm-radius: 14px;\n    --dqm-shadow: 0 16px 48px rgba(0,0,0,.55), 0 0 0 1px rgba(88,101,242,.12);\n}\n#dqm-gui {\n    position: fixed; top: 100px; right: 30px; width: 540px; height: 680px;\n    min-width: 420px; min-height: 480px; z-index: 999999; resize: both;\n    display: flex; flex-direction: column; overflow: hidden;\n    color: var(--dqm-text);\n    font-family: \"gg sans\", \"Segoe UI\", \"Helvetica Neue\", Helvetica, Arial, sans-serif;\n    border-radius: var(--dqm-radius);\n    border: 1px solid var(--dqm-border);\n    box-shadow: var(--dqm-shadow);\n    background:\n        linear-gradient(165deg, rgba(88,101,242,.08) 0%, transparent 42%),\n        linear-gradient(180deg, var(--dqm-bg) 0%, var(--dqm-panel) 48%, #2a2c31 100%);\n}\n#dqm-gui * { box-sizing: border-box; }\n#dqm-gui button:focus-visible,\n#dqm-gui .tab-btn:focus-visible {\n    outline: 2px solid var(--dqm-accent);\n    outline-offset: 2px;\n}\n#dqm-gui .dqm-header {\n    display: flex; flex-direction: column; gap: 10px;\n    padding: 14px 16px 12px; background: rgba(30,31,34,.72);\n    border-bottom: 1px solid var(--dqm-border); cursor: grab; user-select: none;\n    backdrop-filter: blur(8px);\n}\n#dqm-gui .dqm-header-top {\n    display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-brand {\n    display: flex; align-items: center; gap: 10px; min-width: 0;\n}\n#dqm-gui .dqm-brand-mark {\n    width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;\n    background: linear-gradient(145deg, var(--dqm-accent), #7289da);\n    box-shadow: 0 0 18px rgba(88,101,242,.35); font-size: 16px; flex-shrink: 0;\n}\n#dqm-gui .dqm-brand-text { display: flex; flex-direction: column; min-width: 0; }\n#dqm-gui #dqm-title {\n    font-weight: 700; font-size: 16px; letter-spacing: .2px; color: var(--dqm-text);\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n}\n#dqm-gui .dqm-subtitle {\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 500;\n}\n#dqm-gui .dqm-win-btns { display: flex; gap: 2px; }\n#dqm-gui .dqm-btn-icon {\n    background: transparent; border: none; color: var(--dqm-text-muted);\n    cursor: pointer; font-size: 16px; width: 32px; height: 28px; border-radius: 6px;\n    line-height: 1;\n}\n#dqm-gui .dqm-btn-icon:hover { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-icon.dqm-close:hover { background: var(--dqm-danger); color: #fff; }\n#dqm-gui .dqm-stats {\n    display: flex; gap: 8px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-chip {\n    display: inline-flex; align-items: center; gap: 6px;\n    background: var(--dqm-bg-secondary); border: 1px solid rgba(255,255,255,.04);\n    padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-chip strong { color: var(--dqm-text); font-weight: 700; }\n#dqm-gui .dqm-chip--orbs { color: var(--dqm-orbs); }\n#dqm-gui .dqm-chip--run { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-chip--location { color: var(--dqm-info); }\n#dqm-gui .dqm-chip--version {\n    color: var(--dqm-accent);\n    border-color: rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-toolbar {\n    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;\n}\n#dqm-gui .dqm-update-group {\n    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;\n    margin-left: auto; min-width: 0; max-width: 100%;\n}\n#dqm-gui .dqm-update-status {\n    min-width: 0; max-width: 200px; font-size: 11px; color: var(--dqm-text-muted);\n    font-weight: 600; line-height: 1.3;\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n}\n#dqm-gui .dqm-update--ok { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-update--warn { color: var(--dqm-warning); }\n#dqm-gui .dqm-update--err { color: var(--dqm-danger); }\n#dqm-gui .dqm-btn-sm { padding: 5px 10px; font-size: 11px; border-radius: 7px; }\n#dqm-gui .dqm-card--claimable {\n    border-color: rgba(0,176,244,.35);\n}\n#dqm-gui .dqm-btn {\n    border: none; cursor: pointer; font-size: 12px; padding: 7px 12px;\n    border-radius: 8px; font-weight: 650; color: #fff;\n    transition: background .15s ease, transform .12s ease, box-shadow .15s ease;\n}\n#dqm-gui .dqm-btn:hover { transform: translateY(-1px); }\n#dqm-gui .dqm-btn:active { transform: translateY(0); }\n#dqm-gui .dqm-btn-green {\n    background: linear-gradient(180deg, #2d9d55, var(--dqm-success));\n    box-shadow: 0 4px 14px rgba(36,128,70,.35);\n}\n#dqm-gui .dqm-btn-danger {\n    background: linear-gradient(180deg, #f04747, var(--dqm-danger));\n}\n#dqm-gui .dqm-btn-gray { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-blurple {\n    background: linear-gradient(180deg, #6a76f4, var(--dqm-accent));\n    box-shadow: 0 4px 14px rgba(88,101,242,.28);\n}\n#dqm-gui .dqm-batch {\n    margin: 0 16px; padding: 8px 12px; border-radius: 8px;\n    background: rgba(88,101,242,.12); border: 1px solid rgba(88,101,242,.25);\n    font-size: 12px; color: var(--dqm-text); font-weight: 600;\n}\n#dqm-gui .dqm-tabs {\n    display: flex; gap: 12px; align-items: flex-end; padding: 10px 16px;\n    background: rgba(30,31,34,.45); border-bottom: 1px solid var(--dqm-border);\n}\n#dqm-gui .tab-col {\n    display: flex; flex-direction: column; align-items: center; gap: 6px;\n}\n#dqm-gui .dqm-tab-stats {\n    display: flex; gap: 6px; flex-wrap: wrap; justify-content: center;\n}\n#dqm-gui .dqm-chip--sm {\n    padding: 3px 8px; font-size: 11px;\n}\n#dqm-gui .tab-btn {\n    border: none; padding: 6px 14px; border-radius: 999px; font-size: 12px;\n    font-weight: 650; cursor: pointer; background: var(--dqm-panel-hover);\n    color: var(--dqm-text-muted); transition: background .15s, color .15s;\n}\n#dqm-gui .tab-btn .tab-label { line-height: 1.2; }\n#dqm-gui .tab-btn.active {\n    background: var(--dqm-accent); color: #fff;\n    box-shadow: 0 0 0 1px rgba(88,101,242,.4), 0 4px 12px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-country-filter-wrap {\n    margin-left: auto; display: flex; flex-direction: column; gap: 4px;\n    align-items: flex-end; min-width: 0; max-width: 180px;\n}\n#dqm-gui .dqm-country-filter-label {\n    font-size: 10px; color: var(--dqm-text-muted); font-weight: 600;\n    white-space: nowrap;\n}\n#dqm-gui .dqm-country-filter {\n    appearance: none; -webkit-appearance: none;\n    width: 100%; max-width: 180px;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 8px;\n    padding: 5px 24px 5px 10px; font-size: 11px; font-weight: 600;\n    cursor: pointer; line-height: 1.3;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-filter:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-filter:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-filter option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui[dir=\"rtl\"] .dqm-country-filter-wrap { margin-left: 0; margin-right: auto; align-items: flex-start; }\n#dqm-gui #dqm-list {\n    padding: 12px 14px; overflow-y: auto; flex: 1;\n    display: flex; flex-direction: column; gap: 10px;\n}\n#dqm-gui #dqm-list::-webkit-scrollbar { width: 8px; }\n#dqm-gui #dqm-list::-webkit-scrollbar-thumb {\n    background: #4e5058; border-radius: 8px;\n}\n#dqm-gui .dqm-empty {\n    text-align: center; color: var(--dqm-text-muted); padding: 36px 16px; font-size: 14px;\n}\n#dqm-gui .dqm-card {\n    background: linear-gradient(180deg, rgba(43,45,49,.95), rgba(35,37,41,.98));\n    padding: 12px 14px; border-radius: 12px;\n    border: 1px solid rgba(255,255,255,.04);\n    border-left: 4px solid var(--dqm-accent);\n    display: flex; flex-direction: column; gap: 8px;\n    box-shadow: 0 6px 18px rgba(0,0,0,.22);\n    transition: border-color .2s, box-shadow .2s, background .2s;\n}\n#dqm-gui .dqm-card:hover {\n    background: linear-gradient(180deg, rgba(48,50,55,.98), rgba(38,40,45,.98));\n    box-shadow: 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--not-enrolled { border-left-color: var(--dqm-warning); }\n#dqm-gui .dqm-card--enrolled { border-left-color: var(--dqm-accent); }\n#dqm-gui .dqm-card--running {\n    border-left-color: var(--dqm-success-bright);\n    box-shadow: 0 0 0 1px rgba(87,242,135,.12), 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--running::after {\n    content: \"\"; position: absolute; top: 12px; inset-inline-end: 12px;\n    width: 8px; height: 8px; border-radius: 50%; background: var(--dqm-success-bright);\n    box-shadow: 0 0 0 0 rgba(87,242,135,.55); animation: dqm-pulse 1.6s infinite;\n}\n#dqm-gui .dqm-card { position: relative; }\n#dqm-gui .dqm-card--completed { border-left-color: var(--dqm-info); }\n#dqm-gui .dqm-card--claimed { border-left-color: var(--dqm-success); }\n#dqm-gui .dqm-card--error { border-left-color: var(--dqm-danger); }\n#dqm-gui .dqm-card--stopped { border-left-color: var(--dqm-text-muted); }\n#dqm-gui .dqm-card-name {\n    font-weight: 700; font-size: 14px; color: var(--dqm-text);\n    padding-inline-end: 16px; line-height: 1.3;\n}\n#dqm-gui .dqm-card-meta {\n    display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 12px;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-meta-item { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }\n#dqm-gui .dqm-meta-item b { font-weight: 650; color: var(--dqm-text-muted); }\n#dqm-gui .dqm-type-badge {\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;\n}\n#dqm-gui .dqm-orbs-val { color: var(--dqm-orbs); font-weight: 700; }\n#dqm-gui .dqm-status { font-weight: 700; }\n#dqm-gui .dqm-meta-country { grid-column: 1 / -1; }\n#dqm-gui .dqm-country-val {\n    display: inline-flex; align-items: center; gap: 6px; min-width: 0;\n}\n#dqm-gui .dqm-country-flag {\n    font-size: 14px; line-height: 1; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-label {\n    color: var(--dqm-text); font-weight: 650; font-size: 11px;\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;\n}\n#dqm-gui .dqm-country-extra {\n    color: var(--dqm-text-muted); font-weight: 700; font-size: 10px; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-select {\n    appearance: none; -webkit-appearance: none;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 6px;\n    padding: 2px 22px 2px 8px; font-size: 11px; font-weight: 600;\n    max-width: 100%; cursor: pointer; line-height: 1.4;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-select:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-select:disabled { opacity: 0.65; cursor: wait; }\n#dqm-gui .dqm-country-select:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-select option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui .dqm-progress-wrap { display: flex; flex-direction: column; gap: 4px; }\n#dqm-gui .dqm-progress-labels {\n    display: flex; justify-content: space-between; gap: 8px;\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 600;\n}\n#dqm-gui .dqm-progress-track {\n    width: 100%; height: 8px; background: var(--dqm-bg-secondary);\n    border-radius: 999px; overflow: hidden; direction: ltr;\n    box-shadow: inset 0 1px 3px rgba(0,0,0,.35);\n}\n#dqm-gui .quest-progress-bar {\n    height: 100%; width: 0; border-radius: 999px;\n    background: var(--dqm-accent);\n    transition: width .35s ease, background .25s ease;\n    box-shadow: 0 0 10px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-eta { font-size: 11px; color: var(--dqm-text-muted); }\n#dqm-gui .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }\n#dqm-gui .dqm-action-btn {\n    border: none; padding: 6px 11px; border-radius: 7px; cursor: pointer;\n    font-size: 11px; font-weight: 700; color: #fff; transition: filter .15s, transform .12s;\n}\n#dqm-gui .dqm-action-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }\n#dqm-gui .dqm-action-start { background: var(--dqm-success); }\n#dqm-gui .dqm-action-stop { background: var(--dqm-danger); }\n#dqm-gui .dqm-action-launch { background: var(--dqm-accent); }\n#dqm-gui .dqm-action-activate { background: var(--dqm-warning); color: #1e1f22; }\n#dqm-gui .dqm-action-activate:disabled { opacity: 0.6; cursor: wait; }\n#dqm-gui .dqm-action-claim { background: var(--dqm-orbs); color: #1e1f22; }\n#dqm-gui #dqm-logs {\n    background: var(--dqm-bg-secondary); font-family: Consolas, \"Courier New\", monospace;\n    font-size: 11px; padding: 10px 12px; height: 118px; min-height: 72px;\n    overflow-y: auto; border-top: 1px solid #000; color: var(--dqm-log);\n}\n#dqm-gui .dqm-log-line { margin-bottom: 2px; white-space: pre-wrap; word-break: break-word; }\n#dqm-gui .dqm-log-time { color: #6b7280; }\n#dqm-gui .dqm-log-level { font-weight: 700; }\n#dqm-gui .dqm-log--info .dqm-log-level { color: var(--dqm-info); }\n#dqm-gui .dqm-log--success .dqm-log-level { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-log--warning .dqm-log-level { color: var(--dqm-warning); }\n#dqm-gui .dqm-log--error .dqm-log-level { color: var(--dqm-danger); }\n#dqm-gui .dqm-log--debug .dqm-log-level { color: var(--dqm-text-muted); }\n#dqm-gui .dqm-log--running .dqm-log-level { color: var(--dqm-accent); }\n#dqm-mini-icon {\n    display: none; position: fixed; width: 52px; height: 52px; z-index: 999999;\n    border-radius: 16px; cursor: grab; user-select: none;\n    align-items: center; justify-content: center; font-size: 20px; color: #fff;\n    background: linear-gradient(145deg, var(--dqm-accent), #2d9d55);\n    border: 1px solid rgba(255,255,255,.12);\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 18px rgba(88,101,242,.3);\n    transition: transform .15s ease, box-shadow .15s ease;\n}\n#dqm-mini-icon:hover { transform: scale(1.06); }\n#dqm-mini-icon.dqm-mini--running {\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.5);\n    animation: dqm-pulse-ring 1.8s infinite;\n}\n@keyframes dqm-pulse {\n    0% { box-shadow: 0 0 0 0 rgba(87,242,135,.55); }\n    70% { box-shadow: 0 0 0 8px rgba(87,242,135,0); }\n    100% { box-shadow: 0 0 0 0 rgba(87,242,135,0); }\n}\n@keyframes dqm-pulse-ring {\n    0% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.45); }\n    70% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 12px rgba(87,242,135,0); }\n    100% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,0); }\n}\n@media (prefers-reduced-motion: reduce) {\n    #dqm-gui .dqm-card--running::after,\n    #dqm-mini-icon.dqm-mini--running { animation: none; }\n    #dqm-gui .quest-progress-bar,\n    #dqm-gui .dqm-btn { transition: none; }\n}\n#dqm-gui[dir=\"rtl\"] .dqm-card { border-left: 1px solid rgba(255,255,255,.04); border-right: 4px solid var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--not-enrolled { border-right-color: var(--dqm-warning); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--enrolled { border-right-color: var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--running { border-right-color: var(--dqm-success-bright); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--completed { border-right-color: var(--dqm-info); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--claimed { border-right-color: var(--dqm-success); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--error { border-right-color: var(--dqm-danger); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--stopped { border-right-color: var(--dqm-text-muted); }\n\n.dqm-modal-overlay {\n    position: fixed; inset: 0; z-index: 10000000;\n    background: rgba(0, 0, 0, 0.65);\n    display: flex; align-items: center; justify-content: center;\n    padding: 20px;\n}\n.dqm-modal {\n    width: min(480px, 100%); max-height: 90vh; overflow-y: auto;\n    background: var(--dqm-panel, #313338); color: var(--dqm-text, #f2f3f5);\n    border: 1px solid var(--dqm-border, #1e1f22);\n    border-radius: 12px; padding: 20px;\n    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);\n    font-family: \"gg sans\", \"Segoe UI\", Helvetica, Arial, sans-serif;\n}\n.dqm-modal-title {\n    margin: 0 0 8px; font-size: 18px; font-weight: 700;\n}\n.dqm-modal-desc {\n    margin: 0 0 14px; font-size: 13px; color: var(--dqm-text-muted, #b5bac1); line-height: 1.5;\n}\n.dqm-modal-steps {\n    margin: 0 0 16px; padding-left: 20px; font-size: 13px;\n    color: var(--dqm-text, #f2f3f5); line-height: 1.6;\n}\n.dqm-modal-steps li { margin-bottom: 8px; }\n.dqm-modal-error {\n    margin-bottom: 12px; padding: 10px 12px; border-radius: 8px;\n    background: rgba(237, 66, 69, 0.12); border: 1px solid rgba(237, 66, 69, 0.3);\n    color: #ed4245; font-size: 12px;\n}\n.dqm-modal-footer {\n    display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end;\n}\n.dqm-modal-footer .dqm-btn { font-size: 12px; padding: 8px 14px; border-radius: 8px; border: none; cursor: pointer; font-weight: 650; }\n.dqm-modal-footer .dqm-btn-gray { background: var(--dqm-panel-hover, #383a40); color: var(--dqm-text, #f2f3f5); }\n.dqm-modal-footer .dqm-btn-blurple { background: var(--dqm-accent, #5865F2); color: #fff; }\n");
+    injectDqmStyles("#dqm-gui, #dqm-mini-icon {\n    --dqm-bg: #2b2d31;\n    --dqm-bg-secondary: #1e1f22;\n    --dqm-panel: #313338;\n    --dqm-panel-hover: #383a40;\n    --dqm-surface: #2b2d31;\n    --dqm-border: #1e1f22;\n    --dqm-text: #f2f3f5;\n    --dqm-text-muted: #b5bac1;\n    --dqm-accent: #5865F2;\n    --dqm-accent-hover: #4752c4;\n    --dqm-success: #248046;\n    --dqm-success-bright: #57F287;\n    --dqm-warning: #faa61a;\n    --dqm-orbs: #f0b232;\n    --dqm-danger: #ed4245;\n    --dqm-info: #00b0f4;\n    --dqm-log: #4ade80;\n    --dqm-radius: 14px;\n    --dqm-shadow: 0 16px 48px rgba(0,0,0,.55), 0 0 0 1px rgba(88,101,242,.12);\n}\n#dqm-gui {\n    position: fixed; top: 100px; right: 30px; width: 540px; height: 680px;\n    min-width: 420px; min-height: 480px; z-index: 999999; resize: both;\n    display: flex; flex-direction: column; overflow: hidden;\n    color: var(--dqm-text);\n    font-family: \"gg sans\", \"Segoe UI\", \"Helvetica Neue\", Helvetica, Arial, sans-serif;\n    border-radius: var(--dqm-radius);\n    border: 1px solid var(--dqm-border);\n    box-shadow: var(--dqm-shadow);\n    background:\n        linear-gradient(165deg, rgba(88,101,242,.08) 0%, transparent 42%),\n        linear-gradient(180deg, var(--dqm-bg) 0%, var(--dqm-panel) 48%, #2a2c31 100%);\n}\n#dqm-gui * { box-sizing: border-box; }\n#dqm-gui button:focus-visible,\n#dqm-gui .tab-btn:focus-visible {\n    outline: 2px solid var(--dqm-accent);\n    outline-offset: 2px;\n}\n#dqm-gui .dqm-header {\n    display: flex; flex-direction: column; gap: 10px;\n    padding: 14px 16px 12px; background: rgba(30,31,34,.72);\n    border-bottom: 1px solid var(--dqm-border); cursor: grab; user-select: none;\n    backdrop-filter: blur(8px);\n}\n#dqm-gui .dqm-header-top {\n    display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-brand {\n    display: flex; align-items: center; gap: 10px; min-width: 0;\n}\n#dqm-gui .dqm-brand-mark {\n    width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;\n    background: linear-gradient(145deg, var(--dqm-accent), #7289da);\n    box-shadow: 0 0 18px rgba(88,101,242,.35); font-size: 16px; flex-shrink: 0;\n}\n#dqm-gui .dqm-brand-text { display: flex; flex-direction: column; min-width: 0; }\n#dqm-gui #dqm-title {\n    font-weight: 700; font-size: 16px; letter-spacing: .2px; color: var(--dqm-text);\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n}\n#dqm-gui .dqm-subtitle {\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 500;\n}\n#dqm-gui .dqm-win-btns { display: flex; gap: 2px; }\n#dqm-gui .dqm-btn-icon {\n    background: transparent; border: none; color: var(--dqm-text-muted);\n    cursor: pointer; font-size: 16px; width: 32px; height: 28px; border-radius: 6px;\n    line-height: 1;\n}\n#dqm-gui .dqm-btn-icon:hover { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-icon.dqm-close:hover { background: var(--dqm-danger); color: #fff; }\n#dqm-gui .dqm-stats {\n    display: flex; gap: 8px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-chip {\n    display: inline-flex; align-items: center; gap: 6px;\n    background: var(--dqm-bg-secondary); border: 1px solid rgba(255,255,255,.04);\n    padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-chip strong { color: var(--dqm-text); font-weight: 700; }\n#dqm-gui .dqm-chip--orbs { color: var(--dqm-orbs); }\n#dqm-gui .dqm-chip--run { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-chip--location { color: var(--dqm-info); }\n#dqm-gui .dqm-chip--version {\n    color: var(--dqm-accent);\n    border-color: rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-toolbar {\n    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;\n}\n#dqm-gui .dqm-update-group {\n    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;\n    margin-left: auto; min-width: 0; max-width: 100%;\n}\n#dqm-gui .dqm-update-status {\n    min-width: 0; max-width: 200px; font-size: 11px; color: var(--dqm-text-muted);\n    font-weight: 600; line-height: 1.3;\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n}\n#dqm-gui .dqm-update--ok { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-update--warn { color: var(--dqm-warning); }\n#dqm-gui .dqm-update--err { color: var(--dqm-danger); }\n#dqm-gui .dqm-btn-sm { padding: 5px 10px; font-size: 11px; border-radius: 7px; }\n#dqm-gui .dqm-card--claimable {\n    border-color: rgba(0,176,244,.35);\n}\n#dqm-gui .dqm-btn {\n    border: none; cursor: pointer; font-size: 12px; padding: 7px 12px;\n    border-radius: 8px; font-weight: 650; color: #fff;\n    transition: background .15s ease, transform .12s ease, box-shadow .15s ease;\n}\n#dqm-gui .dqm-btn:hover { transform: translateY(-1px); }\n#dqm-gui .dqm-btn:active { transform: translateY(0); }\n#dqm-gui .dqm-btn-green {\n    background: linear-gradient(180deg, #2d9d55, var(--dqm-success));\n    box-shadow: 0 4px 14px rgba(36,128,70,.35);\n}\n#dqm-gui .dqm-btn-danger {\n    background: linear-gradient(180deg, #f04747, var(--dqm-danger));\n}\n#dqm-gui .dqm-btn-gray { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-blurple {\n    background: linear-gradient(180deg, #6a76f4, var(--dqm-accent));\n    box-shadow: 0 4px 14px rgba(88,101,242,.28);\n}\n#dqm-gui .dqm-batch {\n    margin: 0 16px; padding: 8px 12px; border-radius: 8px;\n    background: rgba(88,101,242,.12); border: 1px solid rgba(88,101,242,.25);\n    font-size: 12px; color: var(--dqm-text); font-weight: 600;\n}\n#dqm-gui .dqm-tabs {\n    display: flex; gap: 12px; align-items: flex-end; padding: 10px 16px;\n    background: rgba(30,31,34,.45); border-bottom: 1px solid var(--dqm-border);\n}\n#dqm-gui .tab-col {\n    display: flex; flex-direction: column; align-items: center; gap: 6px;\n}\n#dqm-gui .dqm-tab-stats {\n    display: flex; gap: 6px; flex-wrap: wrap; justify-content: center;\n}\n#dqm-gui .dqm-chip--sm {\n    padding: 3px 8px; font-size: 11px;\n}\n#dqm-gui .tab-btn {\n    border: none; padding: 6px 14px; border-radius: 999px; font-size: 12px;\n    font-weight: 650; cursor: pointer; background: var(--dqm-panel-hover);\n    color: var(--dqm-text-muted); transition: background .15s, color .15s;\n}\n#dqm-gui .tab-btn .tab-label { line-height: 1.2; }\n#dqm-gui .tab-btn.active {\n    background: var(--dqm-accent); color: #fff;\n    box-shadow: 0 0 0 1px rgba(88,101,242,.4), 0 4px 12px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-country-filter-wrap {\n    margin-left: auto; display: flex; flex-direction: column; gap: 4px;\n    align-items: flex-end; min-width: 0; max-width: 180px;\n}\n#dqm-gui .dqm-country-filter-label {\n    font-size: 10px; color: var(--dqm-text-muted); font-weight: 600;\n    white-space: nowrap;\n}\n#dqm-gui .dqm-country-filter {\n    appearance: none; -webkit-appearance: none;\n    width: 100%; max-width: 180px;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 8px;\n    padding: 5px 24px 5px 10px; font-size: 11px; font-weight: 600;\n    cursor: pointer; line-height: 1.3;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-filter:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-filter:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-filter option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui[dir=\"rtl\"] .dqm-country-filter-wrap { margin-left: 0; margin-right: auto; align-items: flex-start; }\n#dqm-gui #dqm-list {\n    padding: 12px 14px; overflow-y: auto; flex: 1;\n    display: flex; flex-direction: column; gap: 10px;\n}\n#dqm-gui #dqm-list::-webkit-scrollbar { width: 8px; }\n#dqm-gui #dqm-list::-webkit-scrollbar-thumb {\n    background: #4e5058; border-radius: 8px;\n}\n#dqm-gui .dqm-empty {\n    text-align: center; color: var(--dqm-text-muted); padding: 36px 16px; font-size: 14px;\n}\n#dqm-gui .dqm-card {\n    background: linear-gradient(180deg, rgba(43,45,49,.95), rgba(35,37,41,.98));\n    padding: 12px 14px; border-radius: 12px;\n    border: 1px solid rgba(255,255,255,.04);\n    border-left: 4px solid var(--dqm-accent);\n    display: flex; flex-direction: column; gap: 8px;\n    box-shadow: 0 6px 18px rgba(0,0,0,.22);\n    transition: border-color .2s, box-shadow .2s, background .2s;\n}\n#dqm-gui .dqm-card:hover {\n    background: linear-gradient(180deg, rgba(48,50,55,.98), rgba(38,40,45,.98));\n    box-shadow: 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--not-enrolled { border-left-color: var(--dqm-warning); }\n#dqm-gui .dqm-card--enrolled { border-left-color: var(--dqm-accent); }\n#dqm-gui .dqm-card--ready-to-launch { border-left-color: var(--dqm-warning); }\n#dqm-gui .dqm-card--running {\n    border-left-color: var(--dqm-success-bright);\n    box-shadow: 0 0 0 1px rgba(87,242,135,.12), 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--running::after {\n    content: \"\"; position: absolute; top: 12px; inset-inline-end: 12px;\n    width: 8px; height: 8px; border-radius: 50%; background: var(--dqm-success-bright);\n    box-shadow: 0 0 0 0 rgba(87,242,135,.55); animation: dqm-pulse 1.6s infinite;\n}\n#dqm-gui .dqm-card { position: relative; }\n#dqm-gui .dqm-card--completed { border-left-color: var(--dqm-info); }\n#dqm-gui .dqm-card--claimed { border-left-color: var(--dqm-success); }\n#dqm-gui .dqm-card--error { border-left-color: var(--dqm-danger); }\n#dqm-gui .dqm-card--stopped { border-left-color: var(--dqm-text-muted); }\n#dqm-gui .dqm-card-name {\n    font-weight: 700; font-size: 14px; color: var(--dqm-text);\n    padding-inline-end: 16px; line-height: 1.3;\n}\n#dqm-gui .dqm-card-meta {\n    display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 12px;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-meta-item { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }\n#dqm-gui .dqm-meta-item b { font-weight: 650; color: var(--dqm-text-muted); }\n#dqm-gui .dqm-type-badge {\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;\n}\n#dqm-gui .dqm-orbs-val { color: var(--dqm-orbs); font-weight: 700; }\n#dqm-gui .dqm-status { font-weight: 700; }\n#dqm-gui .dqm-meta-country { grid-column: 1 / -1; }\n#dqm-gui .dqm-country-val {\n    display: inline-flex; align-items: center; gap: 6px; min-width: 0;\n}\n#dqm-gui .dqm-country-flag {\n    font-size: 14px; line-height: 1; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-label {\n    color: var(--dqm-text); font-weight: 650; font-size: 11px;\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;\n}\n#dqm-gui .dqm-country-extra {\n    color: var(--dqm-text-muted); font-weight: 700; font-size: 10px; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-select {\n    appearance: none; -webkit-appearance: none;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 6px;\n    padding: 2px 22px 2px 8px; font-size: 11px; font-weight: 600;\n    max-width: 100%; cursor: pointer; line-height: 1.4;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-select:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-select:disabled { opacity: 0.65; cursor: wait; }\n#dqm-gui .dqm-country-select:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-select option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui .dqm-progress-wrap { display: flex; flex-direction: column; gap: 4px; }\n#dqm-gui .dqm-progress-labels {\n    display: flex; justify-content: space-between; gap: 8px;\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 600;\n}\n#dqm-gui .dqm-progress-track {\n    width: 100%; height: 8px; background: var(--dqm-bg-secondary);\n    border-radius: 999px; overflow: hidden; direction: ltr;\n    box-shadow: inset 0 1px 3px rgba(0,0,0,.35);\n}\n#dqm-gui .quest-progress-bar {\n    height: 100%; width: 0; border-radius: 999px;\n    background: var(--dqm-accent);\n    transition: width .35s ease, background .25s ease;\n    box-shadow: 0 0 10px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-eta { font-size: 11px; color: var(--dqm-text-muted); }\n#dqm-gui .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }\n#dqm-gui .dqm-action-btn {\n    border: none; padding: 6px 11px; border-radius: 7px; cursor: pointer;\n    font-size: 11px; font-weight: 700; color: #fff; transition: filter .15s, transform .12s;\n}\n#dqm-gui .dqm-action-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }\n#dqm-gui .dqm-action-start { background: var(--dqm-success); }\n#dqm-gui .dqm-action-stop { background: var(--dqm-danger); }\n#dqm-gui .dqm-action-launch { background: var(--dqm-accent); }\n#dqm-gui .dqm-action-activate { background: var(--dqm-warning); color: #1e1f22; }\n#dqm-gui .dqm-action-activate:disabled { opacity: 0.6; cursor: wait; }\n#dqm-gui .dqm-action-claim { background: var(--dqm-orbs); color: #1e1f22; }\n#dqm-gui #dqm-logs {\n    background: var(--dqm-bg-secondary); font-family: Consolas, \"Courier New\", monospace;\n    font-size: 11px; padding: 10px 12px; height: 118px; min-height: 72px;\n    overflow-y: auto; border-top: 1px solid #000; color: var(--dqm-log);\n}\n#dqm-gui .dqm-log-line { margin-bottom: 2px; white-space: pre-wrap; word-break: break-word; }\n#dqm-gui .dqm-log-time { color: #6b7280; }\n#dqm-gui .dqm-log-level { font-weight: 700; }\n#dqm-gui .dqm-log--info .dqm-log-level { color: var(--dqm-info); }\n#dqm-gui .dqm-log--success .dqm-log-level { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-log--warning .dqm-log-level { color: var(--dqm-warning); }\n#dqm-gui .dqm-log--error .dqm-log-level { color: var(--dqm-danger); }\n#dqm-gui .dqm-log--debug .dqm-log-level { color: var(--dqm-text-muted); }\n#dqm-gui .dqm-log--running .dqm-log-level { color: var(--dqm-accent); }\n#dqm-mini-icon {\n    display: none; position: fixed; width: 52px; height: 52px; z-index: 999999;\n    border-radius: 16px; cursor: grab; user-select: none;\n    align-items: center; justify-content: center; font-size: 20px; color: #fff;\n    background: linear-gradient(145deg, var(--dqm-accent), #2d9d55);\n    border: 1px solid rgba(255,255,255,.12);\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 18px rgba(88,101,242,.3);\n    transition: transform .15s ease, box-shadow .15s ease;\n}\n#dqm-mini-icon:hover { transform: scale(1.06); }\n#dqm-mini-icon.dqm-mini--running {\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.5);\n    animation: dqm-pulse-ring 1.8s infinite;\n}\n@keyframes dqm-pulse {\n    0% { box-shadow: 0 0 0 0 rgba(87,242,135,.55); }\n    70% { box-shadow: 0 0 0 8px rgba(87,242,135,0); }\n    100% { box-shadow: 0 0 0 0 rgba(87,242,135,0); }\n}\n@keyframes dqm-pulse-ring {\n    0% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.45); }\n    70% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 12px rgba(87,242,135,0); }\n    100% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,0); }\n}\n@media (prefers-reduced-motion: reduce) {\n    #dqm-gui .dqm-card--running::after,\n    #dqm-mini-icon.dqm-mini--running { animation: none; }\n    #dqm-gui .quest-progress-bar,\n    #dqm-gui .dqm-btn { transition: none; }\n}\n#dqm-gui[dir=\"rtl\"] .dqm-card { border-left: 1px solid rgba(255,255,255,.04); border-right: 4px solid var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--not-enrolled { border-right-color: var(--dqm-warning); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--enrolled { border-right-color: var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--ready-to-launch { border-right-color: var(--dqm-warning); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--running { border-right-color: var(--dqm-success-bright); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--completed { border-right-color: var(--dqm-info); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--claimed { border-right-color: var(--dqm-success); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--error { border-right-color: var(--dqm-danger); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--stopped { border-right-color: var(--dqm-text-muted); }\n\n.dqm-modal-overlay {\n    position: fixed; inset: 0; z-index: 10000000;\n    background: rgba(0, 0, 0, 0.65);\n    display: flex; align-items: center; justify-content: center;\n    padding: 20px;\n}\n.dqm-modal {\n    width: min(480px, 100%); max-height: 90vh; overflow-y: auto;\n    background: var(--dqm-panel, #313338); color: var(--dqm-text, #f2f3f5);\n    border: 1px solid var(--dqm-border, #1e1f22);\n    border-radius: 12px; padding: 20px;\n    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);\n    font-family: \"gg sans\", \"Segoe UI\", Helvetica, Arial, sans-serif;\n}\n.dqm-modal-title {\n    margin: 0 0 8px; font-size: 18px; font-weight: 700;\n}\n.dqm-modal-desc {\n    margin: 0 0 14px; font-size: 13px; color: var(--dqm-text-muted, #b5bac1); line-height: 1.5;\n}\n.dqm-modal-steps {\n    margin: 0 0 16px; padding-left: 20px; font-size: 13px;\n    color: var(--dqm-text, #f2f3f5); line-height: 1.6;\n}\n.dqm-modal-steps li { margin-bottom: 8px; }\n.dqm-modal-error {\n    margin-bottom: 12px; padding: 10px 12px; border-radius: 8px;\n    background: rgba(237, 66, 69, 0.12); border: 1px solid rgba(237, 66, 69, 0.3);\n    color: #ed4245; font-size: 12px;\n}\n.dqm-modal-footer {\n    display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end;\n}\n.dqm-modal-footer .dqm-btn { font-size: 12px; padding: 8px 14px; border-radius: 8px; border: none; cursor: pointer; font-weight: 650; }\n.dqm-modal-footer .dqm-btn-gray { background: var(--dqm-panel-hover, #383a40); color: var(--dqm-text, #f2f3f5); }\n.dqm-modal-footer .dqm-btn-blurple { background: var(--dqm-accent, #5865F2); color: #fff; }\n");
 
     const { ok, missing } = await initializeDiscordModules();
     if (!ok) {

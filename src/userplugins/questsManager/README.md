@@ -1,6 +1,6 @@
 # Quests Manager (Vencord UserPlugin)
 
-Discord Quest Auto Completer — Vencord plugin (`v1.0.1`).
+Discord Quest Auto Completer — Vencord plugin (`v1.0.2`).
 
 ## Requirements
 
@@ -32,7 +32,7 @@ See: https://docs.vencord.dev/installing/custom-plugins/
 
 ## In-plugin updates
 
-The panel shows the current version (`v1.0.1`) and can check GitHub releases for newer builds. Use **Check update** / **Update now** to download `src.zip`, replace plugin files under your Vencord userplugins folder, rebuild, then fully restart Discord — no need to re-run the `.bat` for plugin-only updates.
+The panel shows the current version (`v1.0.2`) and can check GitHub releases for newer builds. Use **Check update** / **Update now** to download `src.zip`, replace plugin files under your Vencord userplugins folder, rebuild, then fully restart Discord — no need to re-run the `.bat` for plugin-only updates.
 
 ## Tabs
 

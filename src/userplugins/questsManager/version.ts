@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-export const PLUGIN_VERSION = "1.0.1";
+export const PLUGIN_VERSION = "1.0.2";
 export const PLUGIN_VERSION_LABEL = `v${PLUGIN_VERSION}`;
 
 export const GITHUB_OWNER = "Afrsto";

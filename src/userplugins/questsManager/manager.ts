@@ -229,6 +229,7 @@ export function mountQuestsManager() {
             logReadyServer: "Discord Server: https://discord.gg/btRCeujadA",
             statusNotEnrolled: "Not enrolled",
             statusInProgress: "In progress",
+            statusReadyToLaunch: "Ready to launch",
             statusCompleted: "Completed (Claim)",
             statusClaimable: "Ready to claim",
             statusClaimed: "Claimed",
@@ -252,6 +253,8 @@ export function mountQuestsManager() {
             btnActivating: "Activating...",
             logActivateClick: "Activating quest...",
             logActivateSuccess: "Quest activated.",
+            logActivatePending: "Activation submitted — waiting for Discord to confirm…",
+            logActivateNotConfirmed: "Discord did not confirm enrollment. Try again.",
             logActivateFailed: "Activation failed: ",
             logAlreadyRunning: "Quest already being processed.",
             logCompleted: "Completed!",
@@ -399,6 +402,7 @@ export function mountQuestsManager() {
             logReadyServer: "سيرفر ديسكورد: https://discord.gg/btRCeujadA",
             statusNotEnrolled: "لم يتم الالتحاق",
             statusInProgress: "قيد التنفيذ",
+            statusReadyToLaunch: "جاهزة للإطلاق",
             statusCompleted: "مكتملة (استلام)",
             statusClaimable: "جاهزة للاستلام",
             statusClaimed: "تم الاستلام",
@@ -422,6 +426,8 @@ export function mountQuestsManager() {
             btnActivating: "جاري التفعيل...",
             logActivateClick: "جاري تفعيل المهمة...",
             logActivateSuccess: "تم تفعيل المهمة.",
+            logActivatePending: "تم إرسال التفعيل — بانتظار تأكيد ديسكورد…",
+            logActivateNotConfirmed: "ديسكورد لم يؤكد الالتحاق. حاول مرة أخرى.",
             logActivateFailed: "فشل التفعيل: ",
             logAlreadyRunning: "المهمة قيد المعالجة بالفعل.",
             logCompleted: "مكتملة!",
@@ -1463,13 +1469,19 @@ export function mountQuestsManager() {
                 || resolvedType === "PLAY_ACTIVITY"
                 || resolvedType === "ACHIEVEMENT_IN_ACTIVITY"
                 || resolvedType.includes("ACHIEVEMENT")
-                || resolvedType.includes("ACTIVITY")
+                || (resolvedType.includes("ACTIVITY") && !resolvedType.includes("DESKTOP"))
             ) {
                 type = "Launch Quest"; label = "🚀 " + t("typeLaunch");
             }
         }
 
         if (type === "Other") {
+            const pureDesktopOrVideo = taskName === "PLAY_ON_DESKTOP"
+                || taskName === "STREAM_ON_DESKTOP"
+                || taskName === "WATCH_VIDEO"
+                || taskName === "WATCH_VIDEO_ON_MOBILE"
+                || resolvedType.includes("DESKTOP")
+                || resolvedType.includes("VIDEO");
             const app = quest.config?.application;
             const hasApp = !!(app?.id || app?.name || resolveQuestApplicationId(quest));
             const msg = quest.config?.messages || {};
@@ -1482,7 +1494,7 @@ export function mountQuestsManager() {
                 || cta.includes("launch")
                 || qName.includes("launch")
                 || cta.includes("activity");
-            if (hasApp || isLaunchCta) {
+            if (!pureDesktopOrVideo && (hasApp || isLaunchCta)) {
                 type = "Launch Quest"; label = "🚀 " + t("typeLaunch");
             }
         }
@@ -1845,7 +1857,16 @@ export function mountQuestsManager() {
         else if (rt.claimed) rt.status = "claimed";
         else if (rt.completed) rt.status = "claimable";
         else if (!flags.isEnrolled) rt.status = "not-enrolled";
-        else rt.status = "enrolled";
+        else if (
+            details.type === "Launch Quest"
+            && (rt.progress ?? 0) <= 0
+            && isLaunchQuestTask(details.taskName, getTaskConfig(quest))
+        ) {
+            // Enrolled but Discord still shows Launch Quest / 0 progress.
+            rt.status = "ready-to-launch";
+        } else {
+            rt.status = "enrolled";
+        }
         return rt;
     };
 
@@ -1963,7 +1984,8 @@ export function mountQuestsManager() {
     const setCardStatusClass = (card, status) => {
         card.classList.remove(
             "dqm-card--idle", "dqm-card--not-enrolled", "dqm-card--enrolled",
-            "dqm-card--running", "dqm-card--completed", "dqm-card--claimable", "dqm-card--claimed",
+            "dqm-card--ready-to-launch", "dqm-card--running", "dqm-card--completed",
+            "dqm-card--claimable", "dqm-card--claimed",
             "dqm-card--error", "dqm-card--stopped"
         );
         card.classList.add("dqm-card--" + status);
@@ -1973,6 +1995,7 @@ export function mountQuestsManager() {
         const map = {
             "not-enrolled": "var(--dqm-warning)",
             enrolled: "var(--dqm-accent)",
+            "ready-to-launch": "var(--dqm-warning)",
             running: "var(--dqm-success)",
             completed: "var(--dqm-info)",
             claimable: "var(--dqm-info)",
@@ -1988,6 +2011,7 @@ export function mountQuestsManager() {
         const map = {
             "not-enrolled": t("statusNotEnrolled"),
             enrolled: t("statusInProgress"),
+            "ready-to-launch": t("statusReadyToLaunch"),
             running: t("statusRunning"),
             completed: t("statusCompleted"),
             claimable: t("statusClaimable"),
@@ -2599,6 +2623,16 @@ export function mountQuestsManager() {
         patchCardStatus(questId);
     };
 
+    const clearOptimisticEnrollment = (questId) => {
+        const quest = QuestsStore.quests.get(questId);
+        if (!quest?.userStatus) return;
+        quest.userStatus = {
+            ...quest.userStatus,
+            enrolledAt: null
+        };
+        patchCardStatus(questId);
+    };
+
     const acceptQuest = async (quest) => {
         const canonical = getCanonicalQuest(quest);
         const questId = canonical.id;
@@ -2630,10 +2664,33 @@ export function mountQuestsManager() {
                 });
             }
 
+            // Optimistic UI, then confirm via QuestsStore /quests/@me (mirror claim).
             patchQuestEnrollment(questId, new Date().toISOString());
-            log.success(`[${name}] ${t("logActivateSuccess")}`);
+            log.info(`[${name}] ${t("logActivatePending")}`);
+
+            const deadline = Date.now() + 5000;
+            let confirmed = false;
+            while (Date.now() < deadline) {
+                await refreshQuestsFromApi();
+                if (getQuestDuplicateGroup(canonical).some(q => {
+                    const updated = QuestsStore.quests.get(q.id);
+                    return !!updated?.userStatus?.enrolledAt;
+                })) {
+                    confirmed = true;
+                    break;
+                }
+                await sleep(250);
+            }
+
+            if (confirmed) {
+                log.success(`[${name}] ${t("logActivateSuccess")}`);
+            } else {
+                clearOptimisticEnrollment(questId);
+                log.error(`[${name}] ${t("logActivateNotConfirmed")}`);
+            }
             scheduleRender();
         } catch (e) {
+            clearOptimisticEnrollment(questId);
             log.error(`[${name}] ${t("logActivateFailed")}${errMsg(e)}`);
         } finally {
             acceptsInFlight.delete(questId);
@@ -2700,13 +2757,14 @@ export function mountQuestsManager() {
     };
 
     const launchQuestUi = (quest) => {
-        const questId = quest.id;
-        const name = quest.config.messages?.questName || questId;
+        const canonical = getCanonicalQuest(quest);
+        const questId = canonical.id;
+        const name = canonical.config.messages?.questName || questId;
         if (launchesInFlight.has(questId)) return;
 
         launchesInFlight.add(questId);
         log.info(`[${name}] ${t("logLaunchClick")}`);
-        launchQuestInDiscord(quest, log, t).finally(() => {
+        launchQuestInDiscord(canonical, log, t).finally(() => {
             launchesInFlight.delete(questId);
         });
     };

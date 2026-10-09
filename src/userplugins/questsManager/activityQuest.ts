@@ -3,8 +3,9 @@
  * Launch Quest / Activity quest completion — ported from Discord Quest Helper
  */
 
-const DEFAULT_CHECKPOINT_MIN_SECS = 60;
-const DEFAULT_CHECKPOINT_MAX_SECS = 120;
+// Match Discord Quest Helper defaults (new installs; localStorage overrides still win).
+const DEFAULT_CHECKPOINT_MIN_SECS = 180;
+const DEFAULT_CHECKPOINT_MAX_SECS = 300;
 const CHECKPOINT_MIN_LIMIT = 30;
 const CHECKPOINT_MAX_LIMIT = 600;
 export const STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY = "questHelper_activityCheckpointMin";
@@ -417,6 +418,7 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
 
         let startTimerResult = null;
         let startTimerError = null;
+        let startTimerIgnored = false;
         try {
             startTimerResult = await withTimeout(
                 sdk.commands.questStartTimer({ quest_id: effectiveQuestId }),
@@ -425,10 +427,12 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             );
         } catch (e) {
             startTimerError = describeError(e);
+            // DQH: benign 4002 "Quest not found" with valid iframe quest context → continue.
             if (isKnownBenignQuestStartTimerError(e) && hasRetryableQuestContext) {
+                startTimerIgnored = true;
+            } else {
                 return JSON.stringify({
                     success: false,
-                    errorCode: "QUEST_PENDING",
                     error: "questStartTimer failed: " + startTimerError,
                     effectiveQuestId,
                     boundQuestId,
@@ -436,22 +440,15 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
                     waitedMs
                 });
             }
-            return JSON.stringify({
-                success: false,
-                error: "questStartTimer failed: " + startTimerError,
-                effectiveQuestId,
-                boundQuestId,
-                commands,
-                waitedMs
-            });
         }
 
         if (startTimerResult && typeof startTimerResult === "object" && startTimerResult.success === false) {
             startTimerError = describeError(startTimerResult);
             if (isKnownBenignQuestStartTimerError(startTimerResult) && hasRetryableQuestContext) {
+                startTimerIgnored = true;
+            } else {
                 return JSON.stringify({
                     success: false,
-                    errorCode: "QUEST_PENDING",
                     error: "questStartTimer returned failure: " + startTimerError,
                     effectiveQuestId,
                     boundQuestId,
@@ -459,14 +456,6 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
                     waitedMs
                 });
             }
-            return JSON.stringify({
-                success: false,
-                error: "questStartTimer returned failure: " + startTimerError,
-                effectiveQuestId,
-                boundQuestId,
-                commands,
-                waitedMs
-            });
         }
 
         return JSON.stringify({
@@ -474,8 +463,8 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             waitedMs,
             effectiveQuestId,
             boundQuestId,
-            startTimerError: null,
-            startTimerIgnored: false
+            startTimerError: startTimerIgnored ? startTimerError : null,
+            startTimerIgnored
         });
     } catch (e) {
         return JSON.stringify({ success: false, error: describeError(e) });
@@ -1137,12 +1126,9 @@ export function createActivityExecutors(deps) {
             }
 
             if (initResult.startTimerIgnored) {
+                // Match DQH: benign questStartTimer rejection with valid quest context → continue.
                 log.warn(`[${questName}] ${t("logActivityStartTimerIgnored")}${initResult.startTimerError || ""}`);
-                const timerOk = await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
-                if (!timerOk) {
-                    log.error(`[${questName}] ${t("logActivityTimerRequired")}`);
-                    return false;
-                }
+                await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
             }
 
             const freshCompleted = await resolveCompletedCheckpointsAsync(
@@ -1159,146 +1145,141 @@ export function createActivityExecutors(deps) {
             const remainingAfterInit = Math.max(0, checkpointCount - completedCheckpoints);
             if (remainingAfterInit === 0) {
                 log.warn(`[${questName}] ${t("logActivityCheckpointsDone")}`);
-                return true;
-            }
+            } else {
+                const { minSecs, maxSecs } = getActivityCheckpointSettings();
+                const allTimes = generateCheckpointTimes(checkpointCount, minSecs, maxSecs);
+                const checkpointTimes = allTimes.slice(completedCheckpoints);
+                const totalPlanSecs = checkpointTimes.reduce((sum, secs) => sum + secs, 0);
+                log.info(`[${questName}] ${t("logActivityCheckpointPlan")
+                    .replace("{count}", String(checkpointTimes.length))
+                    .replace("{min}", String(minSecs))
+                    .replace("{max}", String(maxSecs))
+                    .replace("{mins}", String(Math.ceil(totalPlanSecs / 60)))}`);
 
-            const { minSecs, maxSecs } = getActivityCheckpointSettings();
-            const allTimes = generateCheckpointTimes(checkpointCount, minSecs, maxSecs);
-            const checkpointTimes = allTimes.slice(completedCheckpoints);
-            const totalPlanSecs = checkpointTimes.reduce((sum, secs) => sum + secs, 0);
-            log.info(`[${questName}] ${t("logActivityCheckpointPlan")
-                .replace("{count}", String(checkpointTimes.length))
-                .replace("{min}", String(minSecs))
-                .replace("{max}", String(maxSecs))
-                .replace("{mins}", String(Math.ceil(totalPlanSecs / 60)))}`);
-
-            updateQuestProgress(quest.id, completedCheckpoints, checkpointCount, {
-                etaSecs: totalPlanSecs
-            });
-
-            let serverProgress = await resolveCompletedCheckpointsAsync(
-                questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
-            );
-            const progressAtStart = serverProgress;
-            let stalledDispatches = 0;
-
-            const onHeartbeat = (data) => {
-                if (!taskState.active) return;
-                const eventQuestId = data?.questId ?? data?.quest?.id ?? data?.quest_id;
-                if (eventQuestId && !groupQuestIds.some(id => String(id) === String(eventQuestId))) return;
-                const us = data?.userStatus ?? data?.user_status;
-                if (!us?.progress) return;
-                const vals = Object.values(us.progress);
-                const val = vals[0]?.value;
-                if (val == null) return;
-                const progress = Math.min(checkpointCount, Math.max(0, Math.floor(val)));
-                serverProgress = Math.max(serverProgress, progress);
-                updateQuestProgress(quest.id, serverProgress, checkpointCount);
-            };
-            if (FluxDispatcher?.subscribe) {
-                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
-                taskState.addUnsub(() => {
-                    try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat); } catch (_) {}
+                updateQuestProgress(quest.id, completedCheckpoints, checkpointCount, {
+                    etaSecs: totalPlanSecs
                 });
-            }
 
-            for (let i = 0; i < checkpointTimes.length; i++) {
-                if (!taskState.active) return false;
+                let serverProgress = await resolveCompletedCheckpointsAsync(
+                    questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
+                );
+                const progressAtStart = serverProgress;
+                let stalledDispatches = 0;
 
-                const checkpointNum = completedCheckpoints + i + 1;
-                const isLast = checkpointNum >= checkpointCount;
-                const waitSecs = checkpointTimes[i];
+                const onHeartbeat = (data) => {
+                    if (!taskState.active) return;
+                    const eventQuestId = data?.questId ?? data?.quest?.id ?? data?.quest_id;
+                    if (eventQuestId && !groupQuestIds.some(id => String(id) === String(eventQuestId))) return;
+                    const us = data?.userStatus ?? data?.user_status;
+                    if (!us?.progress) return;
+                    const vals = Object.values(us.progress);
+                    const val = vals[0]?.value;
+                    if (val == null) return;
+                    const progress = Math.min(checkpointCount, Math.max(0, Math.floor(val)));
+                    serverProgress = Math.max(serverProgress, progress);
+                    updateQuestProgress(quest.id, serverProgress, checkpointCount);
+                };
+                if (FluxDispatcher?.subscribe) {
+                    FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
+                    taskState.addUnsub(() => {
+                        try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat); } catch (_) {}
+                    });
+                }
 
-                log.info(`[${questName}] ${t("logCheckpointWait")}${checkpointNum}/${checkpointCount} (${waitSecs}s)`);
-
-                const waitStart = Date.now();
-                let lastFeedbackAt = waitStart;
-                while (Date.now() - waitStart < waitSecs * 1000) {
+                for (let i = 0; i < checkpointTimes.length; i++) {
                     if (!taskState.active) return false;
 
-                    const elapsedSecs = Math.floor((Date.now() - waitStart) / 1000);
-                    const remainingSecs = Math.max(0, waitSecs - elapsedSecs);
-                    const etaSecs = estimateRemainingCheckpointSecs(checkpointTimes, i, elapsedSecs);
+                    const checkpointNum = completedCheckpoints + i + 1;
+                    const isLast = checkpointNum >= checkpointCount;
+                    const waitSecs = checkpointTimes[i];
 
-                    if (Date.now() - lastFeedbackAt >= CHECKPOINT_WAIT_FEEDBACK_MS) {
-                        lastFeedbackAt = Date.now();
-                        log.info(`[${questName}] ${t("logCheckpointWaitRemaining")
-                            .replace("{n}", String(checkpointNum))
-                            .replace("{total}", String(checkpointCount))
-                            .replace("{secs}", String(remainingSecs))}`);
-                        updateQuestProgress(
-                            quest.id,
-                            Math.max(completedCheckpoints, serverProgress),
-                            checkpointCount,
-                            { etaSecs }
+                    log.info(`[${questName}] ${t("logCheckpointWait")}${checkpointNum}/${checkpointCount} (${waitSecs}s)`);
+
+                    const waitStart = Date.now();
+                    let lastFeedbackAt = waitStart;
+                    while (Date.now() - waitStart < waitSecs * 1000) {
+                        if (!taskState.active) return false;
+
+                        const elapsedSecs = Math.floor((Date.now() - waitStart) / 1000);
+                        const remainingSecs = Math.max(0, waitSecs - elapsedSecs);
+                        const etaSecs = estimateRemainingCheckpointSecs(checkpointTimes, i, elapsedSecs);
+
+                        if (Date.now() - lastFeedbackAt >= CHECKPOINT_WAIT_FEEDBACK_MS) {
+                            lastFeedbackAt = Date.now();
+                            log.info(`[${questName}] ${t("logCheckpointWaitRemaining")
+                                .replace("{n}", String(checkpointNum))
+                                .replace("{total}", String(checkpointCount))
+                                .replace("{secs}", String(remainingSecs))}`);
+                            updateQuestProgress(
+                                quest.id,
+                                Math.max(completedCheckpoints, serverProgress),
+                                checkpointCount,
+                                { etaSecs }
+                            );
+                        }
+
+                        await sleep(1000);
+                    }
+
+                    if (!taskState.active) return false;
+
+                    log.running(`[${questName}] ${t("logCheckpoint")}${checkpointNum}/${checkpointCount}`);
+
+                    let dispatchResult;
+                    try {
+                        if (isLast) {
+                            const completedPayload = JSON.stringify({ quest_id: questId, completed: true });
+                            const completedJs = buildDispatchMessageEventJs("quest-completed", completedPayload);
+                            dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, completedJs));
+                        } else {
+                            const progressJs = buildDispatchMessageEventJs("quest-progress", String(checkpointNum));
+                            dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, progressJs));
+                        }
+                    } catch (e) {
+                        log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
+                        return false;
+                    }
+
+                    if (dispatchResult?.success) {
+                        log.info(`[${questName}] ${t("logActivityDispatchOk")}`);
+                    } else {
+                        log.warn(`[${questName}] ${t("logActivityDispatchFailed")}${dispatchResult?.error || "unknown"}`);
+                    }
+
+                    const progressBeforePoll = serverProgress;
+                    let polledProgress = progressBeforePoll;
+                    for (const id of groupQuestIds) {
+                        polledProgress = Math.max(
+                            polledProgress,
+                            await pollServerCheckpointProgress(
+                                id, taskName, checkpointCount, polledProgress, QuestsStore, sleep
+                            )
                         );
                     }
-
-                    await sleep(1000);
-                }
-
-                if (!taskState.active) return false;
-
-                log.running(`[${questName}] ${t("logCheckpoint")}${checkpointNum}/${checkpointCount}`);
-
-                let dispatchResult;
-                try {
-                    if (isLast) {
-                        const completedPayload = JSON.stringify({ quest_id: questId, completed: true });
-                        const completedJs = buildDispatchMessageEventJs("quest-completed", completedPayload);
-                        dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, completedJs));
-                    } else {
-                        const progressJs = buildDispatchMessageEventJs("quest-progress", String(checkpointNum));
-                        dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, progressJs));
-                    }
-                } catch (e) {
-                    log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
-                    return false;
-                }
-
-                if (dispatchResult?.success) {
-                    log.info(`[${questName}] ${t("logActivityDispatchOk")}`);
-                } else {
-                    log.warn(`[${questName}] ${t("logActivityDispatchFailed")}${dispatchResult?.error || "unknown"}`);
-                }
-
-                const progressBeforePoll = serverProgress;
-                let polledProgress = progressBeforePoll;
-                for (const id of groupQuestIds) {
-                    polledProgress = Math.max(
-                        polledProgress,
-                        await pollServerCheckpointProgress(
-                            id, taskName, checkpointCount, polledProgress, QuestsStore, sleep
-                        )
-                    );
-                }
-                const apiPolled = await fetchBestProgressForGroup(groupQuestIds, apiGet);
-                const confirmedProgress = Math.max(polledProgress, apiPolled);
-                if (dispatchResult?.success) {
-                    const displayProgress = Math.max(serverProgress, confirmedProgress);
-                    serverProgress = displayProgress;
-                    updateQuestProgress(quest.id, displayProgress, checkpointCount);
-                    if (confirmedProgress > progressBeforePoll) {
-                        stalledDispatches = 0;
-                        log.info(`[${questName}] ${t("logActivityServerProgress")
-                            .replace("{n}", String(confirmedProgress))
-                            .replace("{total}", String(checkpointCount))}`);
-                    } else {
-                        stalledDispatches += 1;
-                        log.warn(`[${questName}] ${t("logActivityServerProgressPending")}`);
-                        if (stalledDispatches >= 2 && confirmedProgress <= progressAtStart) {
-                            log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
-                            return false;
+                    const apiPolled = await fetchBestProgressForGroup(groupQuestIds, apiGet);
+                    const confirmedProgress = Math.max(polledProgress, apiPolled);
+                    if (dispatchResult?.success) {
+                        const displayProgress = Math.max(serverProgress, confirmedProgress);
+                        serverProgress = displayProgress;
+                        updateQuestProgress(quest.id, displayProgress, checkpointCount);
+                        if (confirmedProgress > progressBeforePoll) {
+                            stalledDispatches = 0;
+                            log.info(`[${questName}] ${t("logActivityServerProgress")
+                                .replace("{n}", String(confirmedProgress))
+                                .replace("{total}", String(checkpointCount))}`);
+                        } else {
+                            stalledDispatches += 1;
+                            log.warn(`[${questName}] ${t("logActivityServerProgressPending")}`);
+                            if (stalledDispatches >= 2 && confirmedProgress <= progressAtStart) {
+                                log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
+                                return false;
+                            }
                         }
                     }
                 }
             }
 
-            if (serverProgress >= checkpointCount) {
-                updateQuestProgress(quest.id, checkpointCount, checkpointCount);
-                return true;
-            }
-
+            // Never treat local MessageEvents alone as completion — require Discord confirmation.
             log.info(`[${questName}] ${t("logActivityVerify")}`);
             for (let attempt = 0; attempt < 6; attempt++) {
                 if (!taskState.active) return false;
@@ -1329,8 +1310,14 @@ export function createActivityExecutors(deps) {
                     questId, taskName, checkpointCount, QuestsStore, apiGet, groupQuestIds
                 );
                 if (liveProgress >= checkpointCount) {
-                    updateQuestProgress(quest.id, checkpointCount, checkpointCount);
-                    return true;
+                    // Progress hit target on Discord's side; still require completedAt when possible.
+                    const anyCompleted = groupQuestIds.some(id => QuestsStore.quests.get(id)?.userStatus?.completedAt);
+                    if (anyCompleted || status?.completed) {
+                        updateQuestProgress(quest.id, checkpointCount, checkpointCount);
+                        return true;
+                    }
+                    // If Discord reports full progress but not completed_at yet, keep polling.
+                    updateQuestProgress(quest.id, liveProgress, checkpointCount);
                 }
 
                 await sleep(2000);

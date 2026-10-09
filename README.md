@@ -2,7 +2,7 @@
 
 **Discord Quest Auto Completer** — a Vencord userplugin that helps you enroll, track, and complete Discord Quests from a floating panel on the Quests tab.
 
-**Current version:** `v1.0.1`
+**Current version:** `v1.0.2`
 
 ---
 
@@ -60,7 +60,7 @@ The installer clones Vencord to `%USERPROFILE%\Documents\Vencord`, installs this
 
 ## In-plugin updates
 
-The panel shows **`v1.0.1`** and can check [GitHub Releases](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases).
+The panel shows **`v1.0.2`** and can check [GitHub Releases](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases).
 
 1. Click **Check update**
 2. If a newer release has `src.zip`, click **Update now**
