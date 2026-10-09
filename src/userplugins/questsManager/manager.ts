@@ -2638,9 +2638,16 @@ export function mountQuestsManager() {
         const questId = canonical.id;
         const name = canonical.config.messages?.questName || questId;
         const live = QuestsStore.quests.get(questId) || canonical;
+        const group = getQuestDuplicateGroup(canonical);
+        const regionPeers = group.filter(questMatchesUserRegion);
+        const enrollPool = regionPeers.length ? regionPeers : [canonical];
 
         if (acceptsInFlight.has(questId)) return;
-        if (getQuestDuplicateGroup(canonical).some(q => q.userStatus?.enrolledAt)) return;
+        // Only skip if display listing or a region peer is already enrolled — not an out-of-region sibling.
+        if (getQuestCompletionFlags(canonical).isEnrolled
+            || enrollPool.some(q => getQuestCompletionFlags(q).isEnrolled)) {
+            return;
+        }
         if (isExpired(live)) return;
 
         acceptsInFlight.add(questId);
@@ -2672,9 +2679,14 @@ export function mountQuestsManager() {
             let confirmed = false;
             while (Date.now() < deadline) {
                 await refreshQuestsFromApi();
-                if (getQuestDuplicateGroup(canonical).some(q => {
-                    const updated = QuestsStore.quests.get(q.id);
-                    return !!updated?.userStatus?.enrolledAt;
+                const updated = QuestsStore.quests.get(questId);
+                if (updated && getQuestCompletionFlags(updated).isEnrolled) {
+                    confirmed = true;
+                    break;
+                }
+                if (enrollPool.some(q => {
+                    const liveQ = QuestsStore.quests.get(q.id);
+                    return liveQ && getQuestCompletionFlags(liveQ).isEnrolled;
                 })) {
                     confirmed = true;
                     break;
@@ -2946,9 +2958,13 @@ export function mountQuestsManager() {
         actions.textContent = "";
         const canonical = getCanonicalQuest(quest);
         const group = getQuestDuplicateGroup(canonical);
-        const enrolled = group.some(q => getQuestCompletionFlags(q).isEnrolled);
-        const completed = group.some(q => getQuestCompletionFlags(q).isCompleted);
-        const claimed = group.some(q => getQuestCompletionFlags(q).isClaimed);
+        // Match ensureRuntime / getQuestProgress: never let another region hide Start.
+        const regionPeers = group.filter(questMatchesUserRegion);
+        const actionPool = regionPeers.length ? regionPeers : [canonical];
+        const flags = getQuestCompletionFlags(canonical);
+        const enrolled = flags.isEnrolled;
+        const completed = flags.isCompleted;
+        const claimed = flags.isClaimed;
         const running = isDuplicateGroupRunning(canonical);
         const details = getQuestTypeDetails(canonical);
         const taskConfig = getTaskConfig(canonical);
@@ -2965,15 +2981,14 @@ export function mountQuestsManager() {
             actions.appendChild(b);
         };
 
+        // DQH-style exclusive ladder on the display/canonical listing only.
         if (!enrolled && !completed && !claimed && !isExpired(canonical)) {
             if (acceptsInFlight.has(canonical.id)) {
                 addBtn("dqm-action-activate", t("btnActivating"), null, null, true);
             } else {
                 addBtn("dqm-action-activate", t("btnActivate"), () => acceptQuest(canonical));
             }
-        }
-
-        if (enrolled && !completed && !claimed) {
+        } else if (enrolled && !completed && !claimed) {
             if (running) {
                 addBtn("dqm-action-stop", t("btnStop"), () => stopQuest(canonical.id));
             } else if (isRunnableQuest(canonical) || isLaunchQuest || rt.status === "ready-to-launch") {
@@ -2982,13 +2997,17 @@ export function mountQuestsManager() {
             if (isLaunchQuest) {
                 addBtn("dqm-action-launch", t("btnOpenDiscord"), () => launchQuestUi(canonical));
             }
-        }
-        if (completed && !claimed) {
-            const claimTarget = group.find(q => {
-                const flags = getQuestCompletionFlags(q);
-                return flags.isClaimable;
-            }) ?? canonical;
+        } else if (completed && !claimed) {
+            const claimTarget = actionPool.find(q => getQuestCompletionFlags(q).isClaimable)
+                ?? (flags.isClaimable ? canonical : null)
+                ?? canonical;
             addBtn("dqm-action-claim", t("btnClaim"), () => claimQuest(claimTarget));
+        }
+
+        // Safety net: ready-to-launch must never show an empty action row.
+        if (rt.status === "ready-to-launch" && actions.childElementCount === 0) {
+            addBtn("dqm-action-start", t("btnStart"), () => executeQuest(canonical));
+            addBtn("dqm-action-launch", t("btnOpenDiscord"), () => launchQuestUi(canonical));
         }
     };
 
