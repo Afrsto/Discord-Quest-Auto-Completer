@@ -372,6 +372,7 @@ export function mountQuestsManager() {
             logActivityDomFound: "Activity iframe visible in Discord — waiting for native frame access…",
             logActivityWaitHint: "If this times out, click Open in Discord, complete Launch Quest + authorization, then try Start again.",
             logActivityCheckpointPlan: "{count} checkpoints × {min}–{max}s ≈ {mins} min total",
+            logActivityCompletedIn: "Completed in {secs}s",
             logCheckpointWaitRemaining: "Checkpoint {n}/{total} — {secs}s remaining",
             logActivityDispatchOk: "Checkpoint event dispatched successfully.",
             logActivityDispatchFailed: "Checkpoint event dispatch failed: ",
@@ -545,6 +546,7 @@ export function mountQuestsManager() {
             logActivityDomFound: "إطار النشاط ظاهر في ديسكورد — بانتظار الوصول الأصلي للإطار…",
             logActivityWaitHint: "إذا انتهت المهلة، انقر على فتح في ديسكورد، أكمل تشغيل المهمة والتفويض، ثم حاول البدء مرة أخرى.",
             logActivityCheckpointPlan: "{count} نقاط تفتيش × {min}–{max}ث ≈ {mins} دقيقة إجمالاً",
+            logActivityCompletedIn: "اكتملت في {secs}ث",
             logCheckpointWaitRemaining: "نقطة التفتيش {n}/{total} — متبقي {secs}ث",
             logActivityDispatchOk: "تم إرسال حدث نقطة التفتيش بنجاح.",
             logActivityDispatchFailed: "فشل إرسال حدث نقطة التفتيش: ",
@@ -2169,10 +2171,13 @@ export function mountQuestsManager() {
             : questId;
         const state = dqmTasks.get(runningId);
         if (!state) return;
+        const runningQuest = QuestsStore.quests.get(runningId) || quest;
+        const skipGameHold = runningQuest && isLaunchQuestType(runningQuest);
         state.active = false;
         finishTask(runningId, { stopped: true });
         log.warn(`[${questRuntime.get(runningId)?.name || runningId}] ${t("logStopped")}`);
-        log.warn(t("logStopGameHold"));
+        // Play Game pause hint is wrong for Launch / activity quests.
+        if (!skipGameHold) log.warn(t("logStopGameHold"));
     };
 
     const stopAllQuests = () => {

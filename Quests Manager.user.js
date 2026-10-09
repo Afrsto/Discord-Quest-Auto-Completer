@@ -450,7 +450,8 @@ const INIT_RETRY_ATTEMPTS = 18;
 const INIT_RETRY_DELAY_MS = 5000;
 const TIMER_RETRY_ATTEMPTS = 6;
 const TIMER_RETRY_DELAY_MS = 5000;
-const CHECKPOINT_WAIT_FEEDBACK_MS = 30000;
+/** At most this many "Checkpoint N/M — Xs remaining" lines per checkpoint wait. */
+const CHECKPOINT_REMAINING_LOG_MAX = 3;
 const SERVER_PROGRESS_POLL_MS = 2000;
 const SERVER_PROGRESS_POLL_MAX_MS = 10000;
 
@@ -1376,14 +1377,18 @@ async function initActivityWithRetry(applicationId, questId, taskState, sleep, l
                 await execInActivityFrame(applicationId, buildInitActivityQuestJs(questId, allowedQuestIds))
             );
         } catch (e) {
+            if (!taskState.active) return null;
             log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
             return null;
         }
 
+        if (!taskState.active) return null;
         if (initResult?.success) return initResult;
 
         if (!isInitRetryableError(initResult)) {
-            log.error(`[${questName}] ${t("logActivityInitFailed")}${formatInitResultError(initResult, t)}`);
+            if (taskState.active) {
+                log.error(`[${questName}] ${t("logActivityInitFailed")}${formatInitResultError(initResult, t)}`);
+            }
             return null;
         }
 
@@ -1391,14 +1396,16 @@ async function initActivityWithRetry(applicationId, questId, taskState, sleep, l
             lastRetryReason = "sdk";
         } else {
             lastRetryReason = "auth";
-            if (!authPendingLogged) {
+            if (!authPendingLogged && taskState.active) {
                 log.warn(`[${questName}] ${t("logActivityAuthPending")}`);
                 authPendingLogged = true;
             }
         }
 
         if (attempt >= INIT_RETRY_ATTEMPTS) {
-            log.error(`[${questName}] ${t("logActivityInitFailed")}${formatInitResultError(initResult, t)}`);
+            if (taskState.active) {
+                log.error(`[${questName}] ${t("logActivityInitFailed")}${formatInitResultError(initResult, t)}`);
+            }
             return null;
         }
 
@@ -1536,6 +1543,8 @@ function createActivityExecutors(deps) {
                 { log, t, questName }
             );
             if (!iframeReady) {
+                // User Stop already logged "Stopped." — do not add a false frame error.
+                if (!taskState.active) return false;
                 log.error(`[${questName}] ${t("logActivityFrameNotReady")} (${applicationId}) ${t("logActivityWaitHint")}`);
                 return false;
             }
@@ -1544,6 +1553,7 @@ function createActivityExecutors(deps) {
                 applicationId, questId, taskState, sleep, log, t, questName, allowedQuestIds
             );
             if (!initResult) return false;
+            if (!taskState.active) return false;
 
             const effectiveFromInit = initResult.effectiveQuestId || initResult.boundQuestId;
             if (effectiveFromInit && allowedQuestIds.includes(String(effectiveFromInit))) {
@@ -1590,15 +1600,18 @@ function createActivityExecutors(deps) {
             const allTimes = generateCheckpointTimes(checkpointCount, minSecs, maxSecs);
             const checkpointTimes = allTimes.slice(completedCheckpoints);
             const totalPlanSecs = checkpointTimes.reduce((sum, secs) => sum + secs, 0);
-            log.info(`[${questName}] ${t("logActivityCheckpointPlan")
-                .replace("{count}", String(checkpointTimes.length))
-                .replace("{min}", String(minSecs))
-                .replace("{max}", String(maxSecs))
-                .replace("{mins}", String(Math.ceil(totalPlanSecs / 60)))}`);
+            // Do not log the planned 180–300s / "~N min" estimate — it misleads vs real wait.
+            // Actual wall time is logged once on verified success.
 
             updateQuestProgress(quest.id, completedCheckpoints, checkpointCount, {
                 etaSecs: totalPlanSecs
             });
+
+            const runStartedAt = Date.now();
+            const logActualElapsed = () => {
+                const secs = Math.max(0, Math.round((Date.now() - runStartedAt) / 1000));
+                log.info(`[${questName}] ${t("logActivityCompletedIn").replace("{secs}", String(secs))}`);
+            };
 
             let serverProgress = await resolveCompletedCheckpointsAsync(
                 questId, taskName, checkpointCount, QuestsStore, apiGet
@@ -1637,7 +1650,14 @@ function createActivityExecutors(deps) {
                 log.info(`[${questName}] ${t("logCheckpointWait")}${checkpointNum}/${checkpointCount} (${waitSecs}s)`);
 
                 const waitStart = Date.now();
-                let lastFeedbackAt = waitStart;
+                // At most 3 remaining logs, spaced at ~25% / 50% / 75% of this wait.
+                const feedbackMarks = [];
+                if (waitSecs >= 4) {
+                    for (let m = 1; m <= CHECKPOINT_REMAINING_LOG_MAX; m++) {
+                        feedbackMarks.push(Math.floor((waitSecs * m) / (CHECKPOINT_REMAINING_LOG_MAX + 1)));
+                    }
+                }
+                let nextFeedbackIdx = 0;
                 while (Date.now() - waitStart < waitSecs * 1000) {
                     if (!taskState.active) return false;
 
@@ -1645,8 +1665,11 @@ function createActivityExecutors(deps) {
                     const remainingSecs = Math.max(0, waitSecs - elapsedSecs);
                     const etaSecs = estimateRemainingCheckpointSecs(checkpointTimes, i, elapsedSecs);
 
-                    if (Date.now() - lastFeedbackAt >= CHECKPOINT_WAIT_FEEDBACK_MS) {
-                        lastFeedbackAt = Date.now();
+                    if (
+                        nextFeedbackIdx < feedbackMarks.length
+                        && elapsedSecs >= feedbackMarks[nextFeedbackIdx]
+                    ) {
+                        nextFeedbackIdx += 1;
                         log.info(`[${questName}] ${t("logCheckpointWaitRemaining")
                             .replace("{n}", String(checkpointNum))
                             .replace("{total}", String(checkpointCount))
@@ -1677,6 +1700,7 @@ function createActivityExecutors(deps) {
                         dispatchResult = parseFrameResult(await execInActivityFrame(applicationId, progressJs));
                     }
                 } catch (e) {
+                    if (!taskState.active) return false;
                     log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
                     return false;
                 }
@@ -1709,6 +1733,7 @@ function createActivityExecutors(deps) {
                         stalledDispatches += 1;
                         log.warn(`[${questName}] ${t("logActivityServerProgressPending")}`);
                         if (stalledDispatches >= 2 && confirmedProgress <= progressAtStart) {
+                            if (!taskState.active) return false;
                             log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
                             return false;
                         }
@@ -1728,17 +1753,20 @@ function createActivityExecutors(deps) {
                         await execInActivityFrame(applicationId, buildCheckActivityQuestStatusJs(questId))
                     );
                 } catch (e) {
+                    if (!taskState.active) return false;
                     log.error(`[${questName}] ${t("logActivityInitFailed")}${formatActivityFrameError(e, t)}`);
                     return false;
                 }
                 if (status?.completed) {
                     updateQuestProgress(quest.id, checkpointCount, checkpointCount);
+                    logActualElapsed();
                     return true;
                 }
 
                 const live = QuestsStore.quests.get(questId);
                 if (live?.userStatus?.completedAt) {
                     updateQuestProgress(quest.id, checkpointCount, checkpointCount);
+                    logActualElapsed();
                     return true;
                 }
 
@@ -2071,6 +2099,7 @@ function mountQuestsManager() {
             logActivityDomFound: "Activity iframe visible in Discord — waiting for native frame access…",
             logActivityWaitHint: "If this times out, click Open in Discord, complete Launch Quest + authorization, then try Start again.",
             logActivityCheckpointPlan: "{count} checkpoints × {min}–{max}s ≈ {mins} min total",
+            logActivityCompletedIn: "Completed in {secs}s",
             logCheckpointWaitRemaining: "Checkpoint {n}/{total} — {secs}s remaining",
             logActivityDispatchOk: "Checkpoint event dispatched successfully.",
             logActivityDispatchFailed: "Checkpoint event dispatch failed: ",
@@ -2244,6 +2273,7 @@ function mountQuestsManager() {
             logActivityDomFound: "إطار النشاط ظاهر في ديسكورد — بانتظار الوصول الأصلي للإطار…",
             logActivityWaitHint: "إذا انتهت المهلة، انقر على فتح في ديسكورد، أكمل تشغيل المهمة والتفويض، ثم حاول البدء مرة أخرى.",
             logActivityCheckpointPlan: "{count} نقاط تفتيش × {min}–{max}ث ≈ {mins} دقيقة إجمالاً",
+            logActivityCompletedIn: "اكتملت في {secs}ث",
             logCheckpointWaitRemaining: "نقطة التفتيش {n}/{total} — متبقي {secs}ث",
             logActivityDispatchOk: "تم إرسال حدث نقطة التفتيش بنجاح.",
             logActivityDispatchFailed: "فشل إرسال حدث نقطة التفتيش: ",
@@ -3868,10 +3898,13 @@ function mountQuestsManager() {
             : questId;
         const state = dqmTasks.get(runningId);
         if (!state) return;
+        const runningQuest = QuestsStore.quests.get(runningId) || quest;
+        const skipGameHold = runningQuest && isLaunchQuestType(runningQuest);
         state.active = false;
         finishTask(runningId, { stopped: true });
         log.warn(`[${questRuntime.get(runningId)?.name || runningId}] ${t("logStopped")}`);
-        log.warn(t("logStopGameHold"));
+        // Play Game pause hint is wrong for Launch / activity quests.
+        if (!skipGameHold) log.warn(t("logStopGameHold"));
     };
 
     const stopAllQuests = () => {
