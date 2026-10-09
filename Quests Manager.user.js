@@ -3356,9 +3356,21 @@ function mountQuestsManager() {
     };
 
     const getQuestProgress = (quest) => {
+        // Prefer the display/canonical listing only — never inflate progress from a
+        // sibling regional variant (e.g. another country completed while EG is still 0/1).
+        const display = getCanonicalQuest(quest);
+        const displayProgress = getSingleQuestProgress(display);
+
+        // While running, allow max among region-matching peers only.
+        if (!isDuplicateGroupRunning(quest)) {
+            return displayProgress;
+        }
+
         const group = getQuestDuplicateGroup(quest);
-        let best = { taskName: null, progress: 0, total: 1 };
-        for (const q of group) {
+        const regionPeers = group.filter(questMatchesUserRegion);
+        const pool = regionPeers.length ? regionPeers : [display];
+        let best = displayProgress;
+        for (const q of pool) {
             const p = getSingleQuestProgress(q);
             if (p.progress > best.progress) best = p;
         }

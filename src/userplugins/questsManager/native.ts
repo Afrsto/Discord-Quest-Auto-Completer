@@ -17,6 +17,37 @@ import http from "http";
 const PLUGIN_NAME = "Quests Manager";
 const execFileAsync = promisify(execFile);
 
+function quoteCmdArg(arg: string): string {
+    if (!/[ \t"&<>|^]/.test(arg)) return arg;
+    return `"${arg.replace(/"/g, '\\"')}"`;
+}
+
+/** Run a process in a way that works under Electron on Windows (avoids spawn EINVAL on .cmd). */
+async function runCommand(
+    command: string,
+    args: string[],
+    cwd: string,
+    maxBuffer = 20 * 1024 * 1024
+): Promise<{ stdout: string; stderr: string }> {
+    const opts = {
+        cwd,
+        windowsHide: true,
+        maxBuffer,
+        env: process.env
+    } as const;
+
+    if (process.platform === "win32") {
+        const cmdline = [command, ...args].map(quoteCmdArg).join(" ");
+        return execFileAsync(
+            process.env.ComSpec || "cmd.exe",
+            ["/d", "/s", "/c", cmdline],
+            opts
+        );
+    }
+
+    return execFileAsync(command, args, opts);
+}
+
 interface FrameRef {
     processId: number;
     routingId: number;
@@ -351,18 +382,33 @@ export async function rebuildVencord(_: IpcMainInvokeEvent): Promise<{ ok: boole
     if (!root) {
         return { ok: false, message: "Vencord source folder not found under Documents." };
     }
-    try {
-        await execFileAsync(
-            process.platform === "win32" ? "pnpm.cmd" : "pnpm",
-            ["build"],
-            { cwd: root, windowsHide: true, maxBuffer: 20 * 1024 * 1024 }
-        );
-        return { ok: true, message: "Vencord rebuild complete." };
-    } catch (error: any) {
-        const detail = error?.stderr || error?.message || String(error);
-        console.error(`[${PLUGIN_NAME}] pnpm build failed:`, detail);
-        return { ok: false, message: `pnpm build failed: ${String(detail).slice(0, 400)}` };
+
+    const attempts: Array<{ command: string; args: string[] }> = process.platform === "win32"
+        ? [
+            { command: "pnpm.cmd", args: ["build"] },
+            { command: "pnpm", args: ["build"] },
+            { command: "npx.cmd", args: ["--yes", "pnpm", "build"] }
+        ]
+        : [
+            { command: "pnpm", args: ["build"] },
+            { command: "npx", args: ["--yes", "pnpm", "build"] }
+        ];
+
+    let lastDetail = "";
+    for (const attempt of attempts) {
+        try {
+            await runCommand(attempt.command, attempt.args, root);
+            return { ok: true, message: "Vencord rebuild complete." };
+        } catch (error: any) {
+            lastDetail = error?.stderr || error?.message || String(error);
+            console.error(`[${PLUGIN_NAME}] ${attempt.command} build failed:`, lastDetail);
+        }
     }
+
+    return {
+        ok: false,
+        message: `pnpm build failed: ${String(lastDetail).slice(0, 400)}. You can run pnpm build in ${root} manually, then restart Discord.`
+    };
 }
 
 export async function applyPluginUpdateFromUrl(
@@ -389,7 +435,7 @@ export async function applyPluginUpdateFromUrl(
         await downloadFile(String(zipUrl), zipPath);
 
         if (process.platform === "win32") {
-            await execFileAsync(
+            await runCommand(
                 "powershell.exe",
                 [
                     "-NoProfile",
@@ -397,13 +443,11 @@ export async function applyPluginUpdateFromUrl(
                     "-Command",
                     `Expand-Archive -Path '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`
                 ],
-                { windowsHide: true, maxBuffer: 10 * 1024 * 1024 }
+                root,
+                10 * 1024 * 1024
             );
         } else {
-            await execFileAsync("unzip", ["-o", zipPath, "-d", extractDir], {
-                windowsHide: true,
-                maxBuffer: 10 * 1024 * 1024
-            });
+            await runCommand("unzip", ["-o", zipPath, "-d", extractDir], root, 10 * 1024 * 1024);
         }
 
         const sourcePlugin = await findPluginRootInExtract(extractDir);
