@@ -27,7 +27,7 @@ const HEADER = `// Quests Manager — paste into Discord DevTools Console (Ctrl+
 const USERSCRIPT_HEADER = `// ==UserScript==
 // @name         Quests Manager
 // @namespace    https://discord.gg/btRCeujadA
-// @version      1.0.0
+// @version      1.0.1
 // @description  Discord Quest Auto Completer — rework by X2 Salah
 // @author       X2 Salah
 // @match        https://discord.com/*

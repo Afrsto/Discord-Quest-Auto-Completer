@@ -277,21 +277,30 @@ export function getActivityTaskEntry(quest) {
     return null;
 }
 
+function normalizeTaskType(taskName, taskConfig) {
+    const task = taskName ? taskConfig?.tasks?.[taskName] : null;
+    return String(task?.type || taskName || "").toUpperCase();
+}
+
 export function isPlayActivityTask(taskName, taskConfig) {
-    if (taskName === "PLAY_ACTIVITY") return true;
-    const task = taskConfig?.tasks?.[taskName];
-    return (task?.type || taskName) === "PLAY_ACTIVITY";
+    const type = normalizeTaskType(taskName, taskConfig);
+    if (type === "PLAY_ACTIVITY") return true;
+    return type.includes("ACTIVITY") && type.includes("PLAY") && !type.includes("WATCH");
 }
 
 export function isAchievementActivityTask(taskName, taskConfig) {
-    if (taskName === "ACHIEVEMENT_IN_ACTIVITY") return true;
-    const task = taskConfig?.tasks?.[taskName];
-    const type = String(task?.type || taskName || "").toUpperCase();
-    return type === "ACHIEVEMENT_IN_ACTIVITY" || type.includes("ACHIEVEMENT");
+    const type = normalizeTaskType(taskName, taskConfig);
+    if (type === "ACHIEVEMENT_IN_ACTIVITY") return true;
+    return type.includes("ACHIEVEMENT");
 }
 
 export function isLaunchQuestTask(taskName, taskConfig) {
-    return isAchievementActivityTask(taskName, taskConfig) || isPlayActivityTask(taskName, taskConfig);
+    if (isAchievementActivityTask(taskName, taskConfig) || isPlayActivityTask(taskName, taskConfig)) {
+        return true;
+    }
+    const type = normalizeTaskType(taskName, taskConfig);
+    if (type.includes("WATCH")) return false;
+    return type.includes("ACTIVITY") || type.includes("ACHIEVEMENT");
 }
 
 export function isBatchRunnableActivity(taskName, taskConfig) {

@@ -1472,17 +1472,16 @@ export function mountQuestsManager() {
         if (type === "Other") {
             const app = quest.config?.application;
             const hasApp = !!(app?.id || app?.name || resolveQuestApplicationId(quest));
+            const msg = quest.config?.messages || {};
             const cta = String(
-                quest.config?.messages?.ctaButton
-                ?? quest.config?.messages?.cta_button
-                ?? ""
+                msg.ctaButton ?? msg.cta_button ?? msg.actionButton ?? msg.action_button ?? ""
             ).toLowerCase();
-            const qName = String(
-                quest.config?.messages?.questName
-                ?? quest.config?.messages?.quest_name
-                ?? ""
-            ).toLowerCase();
-            const isLaunchCta = cta.includes("launch") || qName.includes("launch") || cta.includes("activity");
+            const qName = String(msg.questName ?? msg.quest_name ?? "").toLowerCase();
+            const msgBlob = `${cta} ${qName} ${String(msg.description || "")}`.toLowerCase();
+            const isLaunchCta = msgBlob.includes("launch quest")
+                || cta.includes("launch")
+                || qName.includes("launch")
+                || cta.includes("activity");
             if (hasApp || isLaunchCta) {
                 type = "Launch Quest"; label = "🚀 " + t("typeLaunch");
             }
@@ -1570,8 +1569,54 @@ export function mountQuestsManager() {
         })[0];
     };
 
+    const questCountryKey = (quest) => countryFilterKey(resolveQuestCountrySync(quest.id));
+
+    const questMatchesUserRegion = (quest) => {
+        const resolved = resolveQuestCountrySync(quest.id);
+        if (!resolved) return true;
+        if (resolved.mode === "global" || resolved.mode === "exclude") return true;
+        const key = countryFilterKey(resolved);
+        if (key === "global" || key === "unknown") return true;
+        const userCountry = normalizeCountryCode(currentIpCountry);
+        if (!userCountry) return true;
+        if (key === userCountry) return true;
+        if (Array.isArray(resolved.include) && resolved.include.map(normalizeCountryCode).includes(userCountry)) {
+            return true;
+        }
+        return false;
+    };
+
+    const isQuestIncompleteForDisplay = (quest) => {
+        const flags = getQuestCompletionFlags(quest);
+        return !flags.isCompleted && !flags.isClaimed;
+    };
+
+    const pickDisplayQuest = (duplicates) => {
+        if (!duplicates?.length) return null;
+        if (duplicates.length === 1) return duplicates[0];
+
+        const running = duplicates.find(q => dqmTasks.has(q.id));
+        if (running) return running;
+
+        const regionMatches = duplicates.filter(questMatchesUserRegion);
+
+        const enrolledInRegion = regionMatches.find(q => getQuestCompletionFlags(q).isEnrolled);
+        if (enrolledInRegion) return enrolledInRegion;
+
+        const incompleteInRegion = regionMatches.find(isQuestIncompleteForDisplay);
+        if (incompleteInRegion) return incompleteInRegion;
+
+        if (regionMatches.length) return pickCanonicalQuest(regionMatches);
+
+        return pickCanonicalQuest(duplicates);
+    };
+
     const getCanonicalQuest = (quest, allQuests = null) => {
-        return pickCanonicalQuest(getQuestDuplicateGroup(quest, allQuests)) ?? quest;
+        const group = getQuestDuplicateGroup(quest, allQuests);
+        if (isLaunchQuestType(quest)) {
+            return pickDisplayQuest(group) ?? quest;
+        }
+        return pickCanonicalQuest(group) ?? quest;
     };
 
     const dedupeQuests = (quests) => {
@@ -1588,7 +1633,7 @@ export function mountQuestsManager() {
         }
         const result = [...otherQuests];
         for (const group of launchGroups.values()) {
-            const canonical = pickCanonicalQuest(group);
+            const canonical = pickDisplayQuest(group);
             if (canonical) result.push(canonical);
         }
         return result;
@@ -3055,7 +3100,7 @@ export function mountQuestsManager() {
         if (!listContainer) return;
         if (bustOrbs) orbsCache.clear();
 
-        const allQuests = dedupeQuests([...QuestsStore.quests.values()]);
+        const allQuests = dedupeQuests(getAllStoreQuests());
         const visible = allQuests.filter(matchesFilter);
         const visibleIds = new Set(visible.map(q => q.id));
 
@@ -3241,11 +3286,11 @@ export function mountQuestsManager() {
                 <button id="dqm-refresh" class="dqm-btn dqm-btn-gray" type="button"></button>
                 <button id="dqm-copy-logs" class="dqm-btn dqm-btn-gray" type="button"></button>
                 <button id="dqm-lang-toggle" class="dqm-btn dqm-btn-blurple" type="button"></button>
-            </div>
-            <div class="dqm-update-bar">
-                <span id="dqm-update-status" class="dqm-update-status"></span>
-                <button id="dqm-check-update" class="dqm-btn dqm-btn-gray dqm-btn-sm" type="button"></button>
-                <button id="dqm-apply-update" class="dqm-btn dqm-btn-blurple dqm-btn-sm" type="button" hidden></button>
+                <div class="dqm-update-group">
+                    <span id="dqm-update-status" class="dqm-update-status"></span>
+                    <button id="dqm-check-update" class="dqm-btn dqm-btn-gray dqm-btn-sm" type="button"></button>
+                    <button id="dqm-apply-update" class="dqm-btn dqm-btn-blurple dqm-btn-sm" type="button" hidden></button>
+                </div>
             </div>
         </div>
         <div id="dqm-batch" class="dqm-batch" hidden></div>

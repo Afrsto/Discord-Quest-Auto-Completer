@@ -91,12 +91,14 @@
 #dqm-gui .dqm-toolbar {
     display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
 }
-#dqm-gui .dqm-update-bar {
-    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+#dqm-gui .dqm-update-group {
+    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+    margin-left: auto; min-width: 0; max-width: 100%;
 }
 #dqm-gui .dqm-update-status {
-    flex: 1 1 140px; min-width: 0; font-size: 11px; color: var(--dqm-text-muted);
+    min-width: 0; max-width: 200px; font-size: 11px; color: var(--dqm-text-muted);
     font-weight: 600; line-height: 1.3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #dqm-gui .dqm-update--ok { color: var(--dqm-success-bright); }
 #dqm-gui .dqm-update--warn { color: var(--dqm-warning); }
