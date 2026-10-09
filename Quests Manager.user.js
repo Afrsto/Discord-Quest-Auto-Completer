@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quests Manager
 // @namespace    https://discord.gg/btRCeujadA
-// @version      1.0.2
+// @version      1.0.3
 // @description  Discord Quest Auto Completer — rework by X2 Salah
 // @author       X2 Salah
 // @match        https://discord.com/*
@@ -4631,11 +4631,14 @@ function mountQuestsManager() {
         actions.textContent = "";
         const canonical = getCanonicalQuest(quest);
         const group = getQuestDuplicateGroup(canonical);
-        const enrolled = group.some(q => q.userStatus?.enrolledAt);
-        const completed = group.some(q => q.userStatus?.completedAt);
-        const claimed = group.some(q => q.userStatus?.claimedAt);
+        const enrolled = group.some(q => getQuestCompletionFlags(q).isEnrolled);
+        const completed = group.some(q => getQuestCompletionFlags(q).isCompleted);
+        const claimed = group.some(q => getQuestCompletionFlags(q).isClaimed);
         const running = isDuplicateGroupRunning(canonical);
         const details = getQuestTypeDetails(canonical);
+        const taskConfig = getTaskConfig(canonical);
+        const isLaunchQuest = details.type === "Launch Quest"
+            || isLaunchQuestTask(details.taskName, taskConfig);
 
         const addBtn = (cls, label, onClick, aria, disabled = false) => {
             const b = document.createElement("button");
@@ -4658,15 +4661,18 @@ function mountQuestsManager() {
         if (enrolled && !completed && !claimed) {
             if (running) {
                 addBtn("dqm-action-stop", t("btnStop"), () => stopQuest(canonical.id));
-            } else if (isRunnableQuest(canonical)) {
+            } else if (isRunnableQuest(canonical) || isLaunchQuest || rt.status === "ready-to-launch") {
                 addBtn("dqm-action-start", t("btnStart"), () => executeQuest(canonical));
             }
-            if (details.type === "Launch Quest" && isAchievementActivityTask(details.taskName, getTaskConfig(canonical))) {
+            if (isLaunchQuest) {
                 addBtn("dqm-action-launch", t("btnOpenDiscord"), () => launchQuestUi(canonical));
             }
         }
         if (completed && !claimed) {
-            const claimTarget = group.find(q => q.userStatus?.completedAt && !q.userStatus?.claimedAt) ?? canonical;
+            const claimTarget = group.find(q => {
+                const flags = getQuestCompletionFlags(q);
+                return flags.isClaimable;
+            }) ?? canonical;
             addBtn("dqm-action-claim", t("btnClaim"), () => claimQuest(claimTarget));
         }
     };
