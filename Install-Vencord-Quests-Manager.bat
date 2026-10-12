@@ -117,6 +117,8 @@ goto :phase5
 :phase5
 call :print_step 5 9 "Preparing Vencord source ..."
 if not exist "%USERPROFILE%\Documents" mkdir "%USERPROFILE%\Documents"
+REM Never wipe while cwd is inside the locked tree.
+cd /d "%USERPROFILE%\Documents"
 
 REM Close apps that commonly lock Documents\Vencord before wipe.
 call :info "Closing Discord / Node processes that may lock the folder..."
@@ -140,12 +142,18 @@ if !WIPE_TRY! LSS 3 (
     goto :wipe_retry
 )
 
-REM Delete failed — rename aside so a fresh clone can use Documents\Vencord.
+REM Delete failed — try rename aside (cmd + PowerShell).
 set "VEN_OLD=%USERPROFILE%\Documents\Vencord_old_!RANDOM!"
 call :warn "Folder locked - moving aside to !VEN_OLD!"
 move /Y "%VEN_DIR%" "!VEN_OLD!" >nul 2>&1
-if exist "%VEN_DIR%" goto :err_vencord_locked
-call :info "Old folder kept as !VEN_OLD! - you can delete it later."
+if not exist "%VEN_DIR%" goto :phase5_clone
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Rename-Item -LiteralPath '%VEN_DIR%' -NewName (Split-Path -Leaf '!VEN_OLD!') -Force -ErrorAction Stop; exit 0 } catch { try { Move-Item -LiteralPath '%VEN_DIR%' -Destination '!VEN_OLD!' -Force -ErrorAction Stop; exit 0 } catch { exit 1 } }"
+if not exist "%VEN_DIR%" goto :phase5_clone
+
+REM Still locked — install to a fresh path; leave the old folder alone.
+set "VEN_DIR=%USERPROFILE%\Documents\Vencord_QM_!RANDOM!"
+call :warn "Could not free Documents\Vencord - installing to !VEN_DIR! instead"
+call :pathline "!VEN_DIR!"
 
 :phase5_clone
 call :info "Cloning Vencord ..."
