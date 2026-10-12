@@ -1507,15 +1507,9 @@ function createActivityExecutors(deps) {
             }
 
             if (initResult.startTimerIgnored) {
-                // Match DQH: benign questStartTimer rejection with valid quest context → retry.
+                // Match DQH: benign 4002 with valid iframe quest context → continue checkpoints.
+                // Discord Launch Quest often already started the real timer; SDK 4002 is expected.
                 log.warn(`[${questName}] ${t("logActivityStartTimerIgnored")}${initResult.startTimerError || ""}`);
-                const timerOk = await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
-                if (!timerOk) {
-                    // Do not continue to fake checkpoints without an active timer.
-                    log.error(`[${questName}] ${t("logActivityTimerRequired")}`);
-                    log.warn(`[${questName}] ${t("logActivityAuthPending")}`);
-                    return false;
-                }
             }
 
             // Active quest only — do not max() with regional siblings.
@@ -1740,8 +1734,8 @@ const NITRO_3DAY_SKU_ID = "1333912750274904064";
 const NITRO_3DAY_ORB_PRICE = 1400;
 const STORAGE_PURCHASE_TOKEN_KEY = "questHelper_purchaseToken";
 
-/** Entitlement types that grant Nitro / fractional Nitro credit. */
-const NITRO_ENTITLEMENT_TYPES = new Set([2, 11, 12]);
+/** Nitro Credit entitlements only (not full PREMIUM_SUBSCRIPTION type 2). */
+const NITRO_CREDIT_ENTITLEMENT_TYPES = new Set([11, 12]);
 
 function newUuid() {
     try {
@@ -1784,7 +1778,7 @@ function daysFromEndMs(endMs, now) {
     return Math.max(1, Math.ceil((endMs - now) / 86400000));
 }
 
-/** Remaining premium days from subscriptions and/or entitlements. Empty → null (UI shows —). */
+/** Remaining Nitro Credit days from credit entitlements. Empty → null (UI shows —). */
 function computeNitroDaysRemaining(sources, now = Date.now()) {
     const list = Array.isArray(sources) ? sources : [];
     if (!list.length) return null;
@@ -1831,22 +1825,13 @@ async function fetchNitroDaysRemaining(apiGet) {
             ? entBody
             : (Array.isArray(entBody?.entitlements) ? entBody.entitlements : []);
         for (const e of entitlements) {
-            const type = Number(e?.type);
-            if (NITRO_ENTITLEMENT_TYPES.has(type) || e?.ends_at || e?.endsAt) {
+            if (NITRO_CREDIT_ENTITLEMENT_TYPES.has(Number(e?.type))) {
                 bags.push(e);
             }
         }
     } catch (_) {}
 
-    try {
-        const subRes = await apiGet({ url: "/users/@me/billing/subscriptions?sync_level=2" });
-        const subBody = subRes?.body;
-        const subs = Array.isArray(subBody)
-            ? subBody
-            : (Array.isArray(subBody?.subscriptions) ? subBody.subscriptions : []);
-        bags.push(...subs);
-    } catch (_) {}
-
+    // Do not merge billing subscriptions — that is Premium period, not Credits.
     return computeNitroDaysRemaining(bags);
 }
 

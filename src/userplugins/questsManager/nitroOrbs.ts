@@ -7,8 +7,8 @@ export const NITRO_3DAY_SKU_ID = "1333912750274904064";
 export const NITRO_3DAY_ORB_PRICE = 1400;
 export const STORAGE_PURCHASE_TOKEN_KEY = "questHelper_purchaseToken";
 
-/** Entitlement types that grant Nitro / fractional Nitro credit. */
-const NITRO_ENTITLEMENT_TYPES = new Set([2, 11, 12]);
+/** Nitro Credit entitlements only (not full PREMIUM_SUBSCRIPTION type 2). */
+const NITRO_CREDIT_ENTITLEMENT_TYPES = new Set([11, 12]);
 
 function newUuid() {
     try {
@@ -51,7 +51,7 @@ function daysFromEndMs(endMs, now) {
     return Math.max(1, Math.ceil((endMs - now) / 86400000));
 }
 
-/** Remaining premium days from subscriptions and/or entitlements. Empty → null (UI shows —). */
+/** Remaining Nitro Credit days from credit entitlements. Empty → null (UI shows —). */
 export function computeNitroDaysRemaining(sources, now = Date.now()) {
     const list = Array.isArray(sources) ? sources : [];
     if (!list.length) return null;
@@ -98,22 +98,13 @@ export async function fetchNitroDaysRemaining(apiGet) {
             ? entBody
             : (Array.isArray(entBody?.entitlements) ? entBody.entitlements : []);
         for (const e of entitlements) {
-            const type = Number(e?.type);
-            if (NITRO_ENTITLEMENT_TYPES.has(type) || e?.ends_at || e?.endsAt) {
+            if (NITRO_CREDIT_ENTITLEMENT_TYPES.has(Number(e?.type))) {
                 bags.push(e);
             }
         }
     } catch (_) {}
 
-    try {
-        const subRes = await apiGet({ url: "/users/@me/billing/subscriptions?sync_level=2" });
-        const subBody = subRes?.body;
-        const subs = Array.isArray(subBody)
-            ? subBody
-            : (Array.isArray(subBody?.subscriptions) ? subBody.subscriptions : []);
-        bags.push(...subs);
-    } catch (_) {}
-
+    // Do not merge billing subscriptions — that is Premium period, not Credits.
     return computeNitroDaysRemaining(bags);
 }
 

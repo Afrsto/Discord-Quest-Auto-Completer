@@ -1195,15 +1195,9 @@ export function createActivityExecutors(deps) {
             }
 
             if (initResult.startTimerIgnored) {
-                // Match DQH: benign questStartTimer rejection with valid quest context → retry.
+                // Match DQH: benign 4002 with valid iframe quest context → continue checkpoints.
+                // Discord Launch Quest often already started the real timer; SDK 4002 is expected.
                 log.warn(`[${questName}] ${t("logActivityStartTimerIgnored")}${initResult.startTimerError || ""}`);
-                const timerOk = await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
-                if (!timerOk) {
-                    // Do not continue to fake checkpoints without an active timer.
-                    log.error(`[${questName}] ${t("logActivityTimerRequired")}`);
-                    log.warn(`[${questName}] ${t("logActivityAuthPending")}`);
-                    return false;
-                }
             }
 
             // Active quest only — do not max() with regional siblings.

@@ -125,10 +125,7 @@ if exist "%VEN_DIR%" (
         timeout /t 2 /nobreak >nul
         rmdir /s /q "%VEN_DIR%" >nul 2>&1
     )
-    if exist "%VEN_DIR%" (
-        set "VEN_DIR=%USERPROFILE%\Documents\Vencord_%RANDOM%"
-        call :warn "Old folder locked - cloning to !VEN_DIR!"
-    )
+    if exist "%VEN_DIR%" goto :err_vencord_locked
 )
 
 call :info "Cloning Vencord ..."
@@ -289,6 +286,8 @@ call :fail "npm not found. Re-open this script after Node.js install finishes."
 call :fail "pnpm install failed or pnpm not on PATH."
 :err_clone
 call :fail "git clone failed. Check your network connection and retry."
+:err_vencord_locked
+call :fail "Could not delete %%USERPROFILE%%\Documents\Vencord. Close Discord and any programs using that folder, then retry."
 :err_dlmkdir
 call :fail "Could not create download folder _dl. Check folder permissions."
 :err_srczip
