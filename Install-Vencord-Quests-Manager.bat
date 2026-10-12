@@ -118,16 +118,36 @@ goto :phase5
 call :print_step 5 9 "Preparing Vencord source ..."
 if not exist "%USERPROFILE%\Documents" mkdir "%USERPROFILE%\Documents"
 
-if exist "%VEN_DIR%" (
-    call :info "Removing existing Vencord folder..."
-    rmdir /s /q "%VEN_DIR%" >nul 2>&1
-    if exist "%VEN_DIR%" (
-        timeout /t 2 /nobreak >nul
-        rmdir /s /q "%VEN_DIR%" >nul 2>&1
-    )
-    if exist "%VEN_DIR%" goto :err_vencord_locked
+REM Close apps that commonly lock Documents\Vencord before wipe.
+call :info "Closing Discord / Node processes that may lock the folder..."
+taskkill /f /im Discord.exe >nul 2>&1
+taskkill /f /im DiscordCanary.exe >nul 2>&1
+taskkill /f /im DiscordPTB.exe >nul 2>&1
+taskkill /f /im node.exe >nul 2>&1
+taskkill /f /im pnpm.exe >nul 2>&1
+timeout /t 3 /nobreak >nul
+
+if not exist "%VEN_DIR%" goto :phase5_clone
+call :info "Removing existing Vencord folder..."
+set "WIPE_TRY=0"
+
+:wipe_retry
+set /a WIPE_TRY+=1
+rmdir /s /q "%VEN_DIR%" >nul 2>&1
+if not exist "%VEN_DIR%" goto :phase5_clone
+if !WIPE_TRY! LSS 3 (
+    timeout /t 2 /nobreak >nul
+    goto :wipe_retry
 )
 
+REM Delete failed — rename aside so a fresh clone can use Documents\Vencord.
+set "VEN_OLD=%USERPROFILE%\Documents\Vencord_old_!RANDOM!"
+call :warn "Folder locked - moving aside to !VEN_OLD!"
+move /Y "%VEN_DIR%" "!VEN_OLD!" >nul 2>&1
+if exist "%VEN_DIR%" goto :err_vencord_locked
+call :info "Old folder kept as !VEN_OLD! - you can delete it later."
+
+:phase5_clone
 call :info "Cloning Vencord ..."
 git clone -q --depth 1 https://github.com/Vencord/Vencord.git "%VEN_DIR%"
 if errorlevel 1 goto :err_clone
@@ -288,7 +308,7 @@ call :fail "pnpm install failed or pnpm not on PATH."
 :err_clone
 call :fail "git clone failed. Check your network connection and retry."
 :err_vencord_locked
-call :fail "Could not delete %%USERPROFILE%%\Documents\Vencord. Close Discord and any programs using that folder, then retry."
+call :fail "Could not remove or rename %%USERPROFILE%%\Documents\Vencord. Close Discord, File Explorer windows in that folder, and any terminals using it, then retry."
 :err_dlmkdir
 call :fail "Could not create download folder _dl. Check folder permissions."
 :err_srczip
