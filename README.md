@@ -15,7 +15,7 @@
 - Country / region filters and Orbs stats
 - English and Arabic UI
 - **In-plugin updater** — check GitHub releases and install plugin updates without re-running the installer
-- One-click Windows installer (`Quests Manager.bat`) for Vencord + plugin setup
+- One-click Windows installer (`Install-Vencord-Quests-Manager.bat`) for Vencord + plugin setup
 
 ---
 
@@ -31,9 +31,8 @@ Launch Quest (activity) quests require `native.ts` in a source-built Vencord ins
 
 ## Quick install (Windows)
 
-1. Download or clone this repository.
-2. Double-click **`Quests Manager.bat`**  
-   (also provided as `Install Vencord + Quests Manager.bat` — same installer).
+1. Download **`Install-Vencord-Quests-Manager.bat`** from the [latest release](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases/latest) (or clone this repository).
+2. Double-click **`Install-Vencord-Quests-Manager.bat`**.
 3. The installer works as a **normal user or Administrator**. Match Discord’s privilege level if patching fails.
 4. When finished:
    - Wait for Discord to load
@@ -73,13 +72,12 @@ This updates plugin sources under your local Vencord userplugins folder and rebu
 ## Project layout
 
 ```
-├── Quests Manager.bat              # Windows installer
-├── Install Vencord + Quests Manager.bat  # same installer (legacy name)
-├── patch-discord.mjs               # Discord Stable patcher
-├── src/userplugins/questsManager/  # Vencord plugin source
-├── scripts/                        # Console / userscript build helpers
-├── Quests Manager.txt              # Optional DevTools paste script
-└── Quests Manager.user.js          # Optional Tampermonkey userscript
+├── Install-Vencord-Quests-Manager.bat  # Windows installer
+├── patch-discord.mjs                   # Discord Stable patcher
+├── src/userplugins/questsManager/      # Vencord plugin source
+├── scripts/                            # Console / userscript build helpers
+├── Quests Manager.txt                  # Optional DevTools paste script
+└── Quests Manager.user.js              # Optional Tampermonkey userscript
 ```
 
 ---

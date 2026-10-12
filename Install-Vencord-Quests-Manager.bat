@@ -36,7 +36,7 @@ if errorlevel 1 goto :err_winget
 goto :step1
 
 :step1
-call :step 1 9 "Checking Node.js ..."
+call :print_step 1 9 "Checking Node.js ..."
 call :refresh_path
 where node >nul 2>&1
 if not errorlevel 1 (
@@ -57,7 +57,7 @@ for /f "delims=" %%V in ('node --version 2^>nul') do call :ok "Node.js %%V insta
 goto :step2
 
 :step2
-call :step 2 9 "Checking Git ..."
+call :print_step 2 9 "Checking Git ..."
 call :refresh_path
 where git >nul 2>&1
 if not errorlevel 1 (
@@ -78,7 +78,7 @@ for /f "delims=" %%V in ('git --version 2^>nul') do call :ok "%%V installed"
 goto :step3
 
 :step3
-call :step 3 9 "Checking pnpm ..."
+call :print_step 3 9 "Checking pnpm ..."
 call :refresh_path
 where npm >nul 2>&1
 if errorlevel 1 (
@@ -107,7 +107,7 @@ for /f "delims=" %%V in ('pnpm --version 2^>nul') do call :ok "pnpm %%V"
 goto :step4
 
 :step4
-call :step 4 9 "Toolchain ready"
+call :print_step 4 9 "Toolchain ready"
 for /f "delims=" %%V in ('node --version 2^>nul') do call :ok "node %%V"
 for /f "delims=" %%V in ('pnpm --version 2^>nul') do call :ok "pnpm %%V"
 for /f "delims=" %%V in ('git --version 2^>nul') do call :ok "%%V"
@@ -115,7 +115,7 @@ echo.
 goto :step5
 
 :step5
-call :step 5 9 "Preparing Vencord source ..."
+call :print_step 5 9 "Preparing Vencord source ..."
 if not exist "%USERPROFILE%\Documents" mkdir "%USERPROFILE%\Documents"
 
 if exist "%VEN_DIR%" (
@@ -129,7 +129,7 @@ if exist "%VEN_DIR%" (
 )
 
 call :info "Cloning Vencord ..."
-git clone --depth 1 https://github.com/Vencord/Vencord.git "%VEN_DIR%"
+git clone -q --depth 1 https://github.com/Vencord/Vencord.git "%VEN_DIR%"
 if errorlevel 1 goto :err_clone
 cd /d "%VEN_DIR%"
 if errorlevel 1 goto :err_clone
@@ -137,13 +137,13 @@ call :ok "Vencord cloned"
 goto :step6
 
 :step6
-call :step 6 9 "Downloading Quests Manager assets ..."
+call :print_step 6 9 "Downloading Quests Manager assets ..."
 if exist "%DL_DIR%" rmdir /s /q "%DL_DIR%" >nul 2>&1
 mkdir "%DL_DIR%"
 if not exist "%DL_DIR%" goto :err_dlmkdir
 
 call :info "Fetching latest release from GitHub..."
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $dl='%DL_DIR%'; $api='%RELEASE_API%'; $hApi=@{ 'User-Agent'='Vencord-QM'; 'Accept'='application/vnd.github+json' }; $r=Invoke-RestMethod -Uri $api -Headers $hApi; $s=($r.assets | Where-Object { $_.name -eq 'src.zip' } | Select-Object -First 1); $p=($r.assets | Where-Object { $_.name -eq 'patch-discord.mjs' } | Select-Object -First 1); if (-not $s -or -not $s.browser_download_url) { throw 'src.zip missing from release' }; Write-Host ('    Release: ' + $r.tag_name) -ForegroundColor DarkGray; $srcOut=Join-Path $dl 'src.zip'; $patchOut=Join-Path $dl 'patch-discord.mjs'; function Get-Asset([string]$url,[string]$out){ $curl=Get-Command curl.exe -ErrorAction SilentlyContinue; if($curl){ & curl.exe -L --fail --retry 3 -A 'Vencord-QM' -o $out -- $url; if($LASTEXITCODE -ne 0){ throw ('curl failed (' + $LASTEXITCODE + ') for ' + $url) } } else { Invoke-WebRequest -Uri $url -OutFile $out -UserAgent 'Vencord-QM' } }; Get-Asset $s.browser_download_url $srcOut; if($p -and $p.browser_download_url){ Get-Asset $p.browser_download_url $patchOut }; $len=(Get-Item -LiteralPath $srcOut).Length; if($len -le 1024){ throw ('src.zip too small (' + $len + ' bytes)') }; Write-Host ('    src.zip: ' + $len + ' bytes') -ForegroundColor DarkGray"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $dl='%DL_DIR%'; $api='%RELEASE_API%'; $hApi=@{ 'User-Agent'='Vencord-QM'; 'Accept'='application/vnd.github+json' }; $r=Invoke-RestMethod -Uri $api -Headers $hApi; $s=($r.assets | Where-Object { $_.name -eq 'src.zip' } | Select-Object -First 1); $p=($r.assets | Where-Object { $_.name -eq 'patch-discord.mjs' } | Select-Object -First 1); if (-not $s -or -not $s.browser_download_url) { throw 'src.zip missing from release' }; Write-Host ('    Release: ' + $r.tag_name) -ForegroundColor DarkGray; $srcOut=Join-Path $dl 'src.zip'; $patchOut=Join-Path $dl 'patch-discord.mjs'; function Get-Asset([string]$url,[string]$out){ $curl=Get-Command curl.exe -ErrorAction SilentlyContinue; if($curl){ & curl.exe -sS -L --fail --retry 3 -A 'Vencord-QM' -o $out -- $url; if($LASTEXITCODE -ne 0){ throw ('curl failed (' + $LASTEXITCODE + ') for ' + $url) } } else { Invoke-WebRequest -Uri $url -OutFile $out -UserAgent 'Vencord-QM' } }; Get-Asset $s.browser_download_url $srcOut; if($p -and $p.browser_download_url){ Get-Asset $p.browser_download_url $patchOut }; $len=(Get-Item -LiteralPath $srcOut).Length; if($len -le 1024){ throw ('src.zip too small (' + $len + ' bytes)') }; Write-Host ('    src.zip: ' + $len + ' bytes') -ForegroundColor DarkGray"
 if errorlevel 1 goto :err_srczip
 
 if not exist "%DL_DIR%\src.zip" goto :err_srczip
@@ -187,10 +187,10 @@ call :ok "Plugin installed"
 goto :step7
 
 :step7
-call :step 7 9 "Installing dependencies and building ..."
+call :print_step 7 9 "Installing dependencies and building ..."
 cd /d "%VEN_DIR%"
 call :info "pnpm install - this may take a minute..."
-call pnpm install --frozen-lockfile
+call pnpm install --frozen-lockfile --reporter=append-only
 if errorlevel 1 goto :err_install
 call :info "pnpm build ..."
 call pnpm build
@@ -200,7 +200,7 @@ call :ok "Build complete"
 goto :step8
 
 :step8
-call :step 8 9 "Checking existing Vencord patch ..."
+call :print_step 8 9 "Checking existing Vencord patch ..."
 call :check_discord_priv
 if errorlevel 1 (
     call :warn "Discord privilege mismatch detected. Closing Discord and continuing..."
@@ -232,7 +232,7 @@ call :ok "Previous patch removed"
 goto :step9
 
 :step9
-call :step 9 9 "Installing into Discord ..."
+call :print_step 9 9 "Installing into Discord ..."
 
 if not exist "%DL_DIR%\patch-discord.mjs" (
     if exist "%LOCAL_PATCH%" (
@@ -320,7 +320,7 @@ goto :eof
 
 :banner
 echo.
-powershell -NoProfile -Command "Write-Host '============================================================' -ForegroundColor Cyan; Write-Host '           Quests Manager Installer' -ForegroundColor Cyan; Write-Host '        Vencord + Discord Quest Auto Completer' -ForegroundColor White; Write-Host '============================================================' -ForegroundColor Cyan"
+powershell -NoProfile -Command "Write-Host ''; Write-Host '  ==========================================================' -ForegroundColor Cyan; Write-Host '             Quests Manager Installer' -ForegroundColor Cyan; Write-Host '        Vencord + Discord Quest Auto Completer' -ForegroundColor White; Write-Host '  ==========================================================' -ForegroundColor Cyan; Write-Host ''"
 exit /b 0
 
 :privline
@@ -332,9 +332,9 @@ set "UI_MSG=%~1"
 powershell -NoProfile -Command "Write-Host '  Install path: ' -NoNewline -ForegroundColor DarkGray; Write-Host $env:UI_MSG -ForegroundColor Cyan"
 exit /b 0
 
-:step
+:print_step
 echo.
-powershell -NoProfile -Command "Write-Host '[%~1/%~2]' -NoNewline -ForegroundColor Cyan; Write-Host ' %~3' -ForegroundColor White"
+powershell -NoProfile -Command "Write-Host ('  --- [' + '%~1' + '/' + '%~2' + '] ') -NoNewline -ForegroundColor DarkCyan; Write-Host '%~3' -ForegroundColor White"
 exit /b 0
 
 :ok

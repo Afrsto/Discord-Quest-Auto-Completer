@@ -1194,11 +1194,8 @@ export function createActivityExecutors(deps) {
                 }
             }
 
-            if (initResult.startTimerIgnored) {
-                // Match DQH: benign 4002 with valid iframe quest context → continue checkpoints.
-                // Discord Launch Quest often already started the real timer; SDK 4002 is expected.
-                log.warn(`[${questName}] ${t("logActivityStartTimerIgnored")}${initResult.startTimerError || ""}`);
-            }
+            // Benign SDK 4002 (questStartTimer) with valid iframe context: continue silently.
+            // Discord Launch Quest often already started the real timer; no user-facing warn.
 
             // Active quest only — do not max() with regional siblings.
             try {

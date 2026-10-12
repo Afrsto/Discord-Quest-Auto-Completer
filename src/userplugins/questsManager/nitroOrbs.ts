@@ -51,40 +51,55 @@ function daysFromEndMs(endMs, now) {
     return Math.max(1, Math.ceil((endMs - now) / 86400000));
 }
 
-/** Remaining Nitro Credit days from credit entitlements. Empty → null (UI shows —). */
+function entitlementSkuId(item) {
+    return String(
+        item?.sku_id
+        || item?.skuId
+        || item?.sku?.id
+        || item?.subscription_plan?.sku_id
+        || ""
+    );
+}
+
+/** Days remaining for one Nitro Credit entitlement (banked inventory uses sum, not max). */
+function daysForCreditEntitlement(item, now = Date.now()) {
+    if (!item || typeof item !== "object") return 0;
+
+    const days = item.remaining_days ?? item.remainingDays;
+    if (days != null && Number.isFinite(Number(days)) && Number(days) > 0) {
+        return Math.max(1, Math.ceil(Number(days)));
+    }
+    const secs = item.remaining_seconds ?? item.remainingSeconds;
+    if (secs != null && Number.isFinite(Number(secs)) && Number(secs) > 0) {
+        return Math.max(1, Math.ceil(Number(secs) / 86400));
+    }
+
+    const endRaw = item.current_period_end
+        || item.currentPeriodEnd
+        || item.ends_at
+        || item.endsAt
+        || item.trial_ends_at
+        || item.trialEndsAt
+        || item.expires_at
+        || item.expiresAt;
+    const end = parseEndMs(endRaw);
+    const fromEnd = daysFromEndMs(end, now);
+    if (fromEnd > 0) return fromEnd;
+
+    // Unused / banked Orbs 3-day credit with no active ends_at yet.
+    if (entitlementSkuId(item) === NITRO_3DAY_SKU_ID) return 3;
+    return 0;
+}
+
+/** Remaining Nitro Credit days (sum of banked credits). Empty → null (UI shows —). */
 export function computeNitroDaysRemaining(sources, now = Date.now()) {
     const list = Array.isArray(sources) ? sources : [];
     if (!list.length) return null;
 
-    let bestEnd = 0;
-    let extraDays = 0;
-
+    let total = 0;
     for (const item of list) {
-        if (!item || typeof item !== "object") continue;
-
-        const endRaw = item.current_period_end
-            || item.currentPeriodEnd
-            || item.ends_at
-            || item.endsAt
-            || item.trial_ends_at
-            || item.trialEndsAt
-            || item.expires_at
-            || item.expiresAt;
-        const end = parseEndMs(endRaw);
-        if (end > bestEnd) bestEnd = end;
-
-        const days = item.remaining_days ?? item.remainingDays;
-        if (days != null && Number.isFinite(Number(days))) {
-            extraDays = Math.max(extraDays, Math.ceil(Number(days)));
-        }
-        const secs = item.remaining_seconds ?? item.remainingSeconds;
-        if (secs != null && Number.isFinite(Number(secs))) {
-            extraDays = Math.max(extraDays, Math.ceil(Number(secs) / 86400));
-        }
+        total += daysForCreditEntitlement(item, now);
     }
-
-    const fromPeriod = daysFromEndMs(bestEnd, now);
-    const total = Math.max(fromPeriod, extraDays);
     return total > 0 ? total : null;
 }
 
