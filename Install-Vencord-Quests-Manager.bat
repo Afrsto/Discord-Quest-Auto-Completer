@@ -33,15 +33,15 @@ if errorlevel 1 (
 where winget >nul 2>&1
 if errorlevel 1 goto :err_winget
 
-goto :step1
+goto :phase1
 
-:step1
+:phase1
 call :print_step 1 9 "Checking Node.js ..."
 call :refresh_path
 where node >nul 2>&1
 if not errorlevel 1 (
     for /f "delims=" %%V in ('node --version 2^>nul') do call :ok "Node.js %%V"
-    goto :step2
+    goto :phase2
 )
 
 call :info "Installing Node.js LTS via winget - may prompt for UAC..."
@@ -54,15 +54,15 @@ if errorlevel 1 (
 where node >nul 2>&1
 if errorlevel 1 goto :err_node
 for /f "delims=" %%V in ('node --version 2^>nul') do call :ok "Node.js %%V installed"
-goto :step2
+goto :phase2
 
-:step2
+:phase2
 call :print_step 2 9 "Checking Git ..."
 call :refresh_path
 where git >nul 2>&1
 if not errorlevel 1 (
     for /f "delims=" %%V in ('git --version 2^>nul') do call :ok "%%V"
-    goto :step3
+    goto :phase3
 )
 
 call :info "Installing Git via winget - may prompt for UAC..."
@@ -75,9 +75,9 @@ if errorlevel 1 (
 where git >nul 2>&1
 if errorlevel 1 goto :err_git
 for /f "delims=" %%V in ('git --version 2^>nul') do call :ok "%%V installed"
-goto :step3
+goto :phase3
 
-:step3
+:phase3
 call :print_step 3 9 "Checking pnpm ..."
 call :refresh_path
 where npm >nul 2>&1
@@ -90,7 +90,7 @@ if errorlevel 1 goto :err_npm
 where pnpm >nul 2>&1
 if not errorlevel 1 (
     for /f "delims=" %%V in ('pnpm --version 2^>nul') do call :ok "pnpm %%V"
-    goto :step4
+    goto :phase4
 )
 
 call :info "Installing pnpm ..."
@@ -104,17 +104,17 @@ if errorlevel 1 (
 where pnpm >nul 2>&1
 if errorlevel 1 goto :err_pnpm
 for /f "delims=" %%V in ('pnpm --version 2^>nul') do call :ok "pnpm %%V"
-goto :step4
+goto :phase4
 
-:step4
+:phase4
 call :print_step 4 9 "Toolchain ready"
 for /f "delims=" %%V in ('node --version 2^>nul') do call :ok "node %%V"
 for /f "delims=" %%V in ('pnpm --version 2^>nul') do call :ok "pnpm %%V"
 for /f "delims=" %%V in ('git --version 2^>nul') do call :ok "%%V"
 echo.
-goto :step5
+goto :phase5
 
-:step5
+:phase5
 call :print_step 5 9 "Preparing Vencord source ..."
 if not exist "%USERPROFILE%\Documents" mkdir "%USERPROFILE%\Documents"
 
@@ -134,9 +134,9 @@ if errorlevel 1 goto :err_clone
 cd /d "%VEN_DIR%"
 if errorlevel 1 goto :err_clone
 call :ok "Vencord cloned"
-goto :step6
+goto :phase6
 
-:step6
+:phase6
 call :print_step 6 9 "Downloading Quests Manager assets ..."
 if exist "%DL_DIR%" rmdir /s /q "%DL_DIR%" >nul 2>&1
 mkdir "%DL_DIR%"
@@ -184,9 +184,9 @@ goto :err_plugin
 rmdir /s /q "%VEN_DIR%\_extract" >nul 2>&1
 if not exist "%VEN_DIR%\src\userplugins\questsManager\index.tsx" goto :err_plugin
 call :ok "Plugin installed"
-goto :step7
+goto :phase7
 
-:step7
+:phase7
 call :print_step 7 9 "Installing dependencies and building ..."
 cd /d "%VEN_DIR%"
 call :info "pnpm install - this may take a minute..."
@@ -197,9 +197,9 @@ call pnpm build
 if errorlevel 1 goto :err_build
 if not exist "%VEN_DIR%\dist\patcher.js" goto :err_patcherjs
 call :ok "Build complete"
-goto :step8
+goto :phase8
 
-:step8
+:phase8
 call :print_step 8 9 "Checking existing Vencord patch ..."
 call :check_discord_priv
 if errorlevel 1 (
@@ -218,7 +218,7 @@ for /d %%D in ("%LOCALAPPDATA%\Discord\app-*") do (
 
 if not defined WAS_PATCHED (
     call :ok "No existing patch - skipped"
-    goto :step9
+    goto :phase9
 )
 
 call :info "Existing Vencord patch found - restoring stock Discord..."
@@ -229,9 +229,9 @@ for /d %%D in ("%LOCALAPPDATA%\Discord\app-*") do (
     )
 )
 call :ok "Previous patch removed"
-goto :step9
+goto :phase9
 
-:step9
+:phase9
 call :print_step 9 9 "Installing into Discord ..."
 
 if not exist "%DL_DIR%\patch-discord.mjs" (
@@ -271,7 +271,7 @@ call :ok "Discord started"
 
 if exist "%DL_DIR%" rmdir /s /q "%DL_DIR%" >nul 2>&1
 
-call :done
+call :finish
 pause >nul
 exit /b 0
 
@@ -373,7 +373,7 @@ echo.
 pause
 exit 1
 
-:done
+:finish
 echo.
 powershell -NoProfile -Command "Write-Host '============================================================' -ForegroundColor Cyan; Write-Host '                 Installation complete' -ForegroundColor Green; Write-Host '============================================================' -ForegroundColor Cyan; Write-Host ''; Write-Host '  Installed from: ' -NoNewline -ForegroundColor DarkGray; Write-Host $env:VEN_DIR -ForegroundColor Cyan; Write-Host '  Privilege:     ' -NoNewline -ForegroundColor DarkGray; Write-Host $env:PRIV_LABEL -ForegroundColor Yellow; Write-Host ''; Write-Host '  Next steps:' -ForegroundColor White; Write-Host '  1. Wait for Discord to finish loading' -ForegroundColor White; Write-Host '  2. Open Settings  >  Vencord  >  Plugins' -ForegroundColor White; Write-Host '  3. Search for ' -NoNewline -ForegroundColor White; Write-Host ('\"' + 'Quests Manager' + '\"') -NoNewline -ForegroundColor Magenta; Write-Host ' and enable it' -ForegroundColor White; Write-Host '  4. Open the Quests tab and click Quests Manager' -ForegroundColor White; Write-Host ''"
 exit /b 0
