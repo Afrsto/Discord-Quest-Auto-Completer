@@ -7,6 +7,9 @@ export const NITRO_3DAY_SKU_ID = "1333912750274904064";
 export const NITRO_3DAY_ORB_PRICE = 1400;
 export const STORAGE_PURCHASE_TOKEN_KEY = "questHelper_purchaseToken";
 
+/** Entitlement types that grant Nitro / fractional Nitro credit. */
+const NITRO_ENTITLEMENT_TYPES = new Set([2, 11, 12]);
+
 function newUuid() {
     try {
         if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -33,78 +36,100 @@ export function getOrCreatePurchaseToken() {
     }
 }
 
-/** Remaining premium days from billing subscriptions (credits stack). */
-export function computeNitroDaysRemaining(subscriptions, now = Date.now()) {
-    if (!Array.isArray(subscriptions) || !subscriptions.length) return 0;
-    let bestEnd = 0;
-    for (const sub of subscriptions) {
-        if (!sub || sub.type != null && Number(sub.type) !== 1 && String(sub.type).toUpperCase() !== "PREMIUM") {
-            // Keep scanning — Discord shapes vary; prefer period end when present.
-        }
-        const endRaw = sub.current_period_end
-            || sub.currentPeriodEnd
-            || sub.ends_at
-            || sub.endsAt
-            || sub.trial_ends_at
-            || sub.trialEndsAt;
-        if (!endRaw) continue;
-        const end = new Date(endRaw).getTime();
-        if (!Number.isFinite(end)) continue;
-        if (end > bestEnd) bestEnd = end;
-        // Stack unused credit seconds when Discord exposes them.
-        const creditMs = Number(sub.streak_started_at ? 0 : 0);
-        void creditMs;
+function parseEndMs(raw) {
+    if (raw == null || raw === "") return 0;
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+        // Unix seconds vs milliseconds
+        return raw < 1e12 ? raw * 1000 : raw;
     }
-    // Also sum remaining_time / credit_balance style fields when present.
+    const ms = new Date(raw).getTime();
+    return Number.isFinite(ms) ? ms : 0;
+}
+
+function daysFromEndMs(endMs, now) {
+    if (!endMs || endMs <= now) return 0;
+    return Math.max(1, Math.ceil((endMs - now) / 86400000));
+}
+
+/** Remaining premium days from subscriptions and/or entitlements. Empty → null (UI shows —). */
+export function computeNitroDaysRemaining(sources, now = Date.now()) {
+    const list = Array.isArray(sources) ? sources : [];
+    if (!list.length) return null;
+
+    let bestEnd = 0;
     let extraDays = 0;
-    for (const sub of subscriptions) {
-        const days = sub.remaining_days ?? sub.remainingDays;
+
+    for (const item of list) {
+        if (!item || typeof item !== "object") continue;
+
+        const endRaw = item.current_period_end
+            || item.currentPeriodEnd
+            || item.ends_at
+            || item.endsAt
+            || item.trial_ends_at
+            || item.trialEndsAt
+            || item.expires_at
+            || item.expiresAt;
+        const end = parseEndMs(endRaw);
+        if (end > bestEnd) bestEnd = end;
+
+        const days = item.remaining_days ?? item.remainingDays;
         if (days != null && Number.isFinite(Number(days))) {
             extraDays = Math.max(extraDays, Math.ceil(Number(days)));
         }
-        const secs = sub.remaining_seconds ?? sub.remainingSeconds;
+        const secs = item.remaining_seconds ?? item.remainingSeconds;
         if (secs != null && Number.isFinite(Number(secs))) {
             extraDays = Math.max(extraDays, Math.ceil(Number(secs) / 86400));
         }
     }
-    if (bestEnd > now) {
-        const fromPeriod = Math.max(1, Math.ceil((bestEnd - now) / 86400));
-        return Math.max(fromPeriod, extraDays);
-    }
-    return Math.max(0, extraDays);
+
+    const fromPeriod = daysFromEndMs(bestEnd, now);
+    const total = Math.max(fromPeriod, extraDays);
+    return total > 0 ? total : null;
 }
 
 export async function fetchNitroDaysRemaining(apiGet) {
+    const bags = [];
+
     try {
-        const res = await apiGet({ url: "/users/@me/billing/subscriptions?sync_level=2" });
-        const body = res?.body;
-        const list = Array.isArray(body) ? body : (Array.isArray(body?.subscriptions) ? body.subscriptions : []);
-        return computeNitroDaysRemaining(list);
-    } catch (_) {
-        return null;
-    }
+        const entRes = await apiGet({ url: "/users/@me/entitlements?exclude_ended=true" });
+        const entBody = entRes?.body;
+        const entitlements = Array.isArray(entBody)
+            ? entBody
+            : (Array.isArray(entBody?.entitlements) ? entBody.entitlements : []);
+        for (const e of entitlements) {
+            const type = Number(e?.type);
+            if (NITRO_ENTITLEMENT_TYPES.has(type) || e?.ends_at || e?.endsAt) {
+                bags.push(e);
+            }
+        }
+    } catch (_) {}
+
+    try {
+        const subRes = await apiGet({ url: "/users/@me/billing/subscriptions?sync_level=2" });
+        const subBody = subRes?.body;
+        const subs = Array.isArray(subBody)
+            ? subBody
+            : (Array.isArray(subBody?.subscriptions) ? subBody.subscriptions : []);
+        bags.push(...subs);
+    } catch (_) {}
+
+    return computeNitroDaysRemaining(bags);
 }
 
 /**
- * Purchase 3-Day Nitro Credit with Orbs.
+ * Redeem 3-Day Nitro Credit with Orbs via virtual-currency SKU redeem.
  * @returns {{ ok: boolean, error?: string, code?: number, body?: any }}
  */
 export async function purchaseThreeDayNitroCredit(apiPost, {
-    expectedAmount = NITRO_3DAY_ORB_PRICE,
     skuId = NITRO_3DAY_SKU_ID
 } = {}) {
-    const loadId = newUuid();
-    const purchaseToken = getOrCreatePurchaseToken();
+    const checkoutSessionId = newUuid();
     try {
         const res = await apiPost({
-            url: `/store/skus/${skuId}/purchase`,
+            url: `/virtual-currency/skus/${skuId}/redeem`,
             body: {
-                expected_amount: expectedAmount,
-                expected_currency: "discord_orb",
-                currency: "discord_orb",
-                purchase_token: purchaseToken,
-                load_id: loadId,
-                gift: false
+                checkout_session_id: checkoutSessionId
             }
         });
         const body = res?.body;
@@ -118,10 +143,13 @@ export async function purchaseThreeDayNitroCredit(apiPost, {
             };
         }
         if (res?.ok === false || (typeof res?.status === "number" && res.status >= 400)) {
+            const detail = body?.errors
+                ? JSON.stringify(body.errors)
+                : (body?.message || `HTTP ${res.status}`);
             return {
                 ok: false,
                 code: body?.code ?? res.status,
-                error: body?.message || `HTTP ${res.status}`,
+                error: detail,
                 body
             };
         }
@@ -129,9 +157,15 @@ export async function purchaseThreeDayNitroCredit(apiPost, {
     } catch (e) {
         const msg = e?.body?.message || e?.message || String(e);
         const code = e?.body?.code ?? e?.code;
+        const errors = e?.body?.errors;
         if (code === 100056 || /authorize|payment client|email/i.test(msg)) {
             return { ok: false, code: 100056, error: "purchase_auth_required", body: e?.body };
         }
-        return { ok: false, code, error: msg, body: e?.body };
+        return {
+            ok: false,
+            code,
+            error: errors ? `${msg} ${JSON.stringify(errors)}` : msg,
+            body: e?.body
+        };
     }
 }

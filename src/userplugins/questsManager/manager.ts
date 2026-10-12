@@ -347,8 +347,9 @@ export function mountQuestsManager() {
             statOrbs: "Orbs",
             statRunning: "Running",
             batchPreparing: "Preparing…",
-            batchProgress: "Quest {i} of {n}",
+            batchProgress: "Done {i} of {n}",
             batchCurrent: "Current: ",
+            batchRunning: "Running: {n}",
             batchOverall: "Overall",
             typeVideo: "Video",
             typePlay: "Play Game",
@@ -531,8 +532,9 @@ export function mountQuestsManager() {
             statOrbs: "الأورب",
             statRunning: "قيد التشغيل",
             batchPreparing: "جاري التحضير…",
-            batchProgress: "مهمة {i} من {n}",
+            batchProgress: "تم {i} من {n}",
             batchCurrent: "الحالية: ",
+            batchRunning: "قيد التشغيل: {n}",
             batchOverall: "الإجمالي",
             typeVideo: "فيديو",
             typePlay: "لعب",
@@ -2898,10 +2900,14 @@ export function mountQuestsManager() {
             batchStrip.textContent = t("batchPreparing");
             return;
         }
-        const line1 = t("batchProgress").replace("{i}", info.i).replace("{n}", info.n);
-        const line2 = t("batchCurrent") + (info.name || "");
+        const line1 = t("batchProgress").replace("{i}", String(info.i)).replace("{n}", String(info.n));
+        const runningN = info.runningCount != null ? info.runningCount : (info.name ? 1 : 0);
+        const line2 = t("batchRunning").replace("{n}", String(runningN));
+        const names = info.names?.length
+            ? ` · ${info.names.slice(0, 3).join(", ")}${info.names.length > 3 ? "…" : ""}`
+            : (info.name ? ` · ${t("batchCurrent")}${info.name}` : "");
         const pct = info.overall != null ? ` — ${t("batchOverall")}: ${info.overall}%` : "";
-        batchStrip.textContent = `${line1} · ${line2}${pct}`;
+        batchStrip.textContent = `${line1} · ${line2}${names}${pct}`;
     };
 
     const updateStopAllVisibility = () => {
@@ -2909,6 +2915,15 @@ export function mountQuestsManager() {
         const show = batchRunning || dqmTasks.size > 0;
         stopAllBtn.hidden = !show;
         stopAllBtn.disabled = !show;
+    };
+
+    const BATCH_POOL_SIZE = 3;
+
+    const getBatchSlotKind = (quest) => {
+        const taskName = resolveTaskName(quest) || "";
+        if (taskName === "PLAY_ON_DESKTOP") return "desktop";
+        if (taskName === "STREAM_ON_DESKTOP") return "stream";
+        return "other";
     };
 
     const runAllQuests = async () => {
@@ -2936,34 +2951,102 @@ export function mountQuestsManager() {
         }
 
         log.info(t("logBatchStart") + quests.length + t("logBatchEnd"));
-        let ok = 0, skipped = 0, failed = 0;
+        let ok = 0, skipped = 0, failed = 0, done = 0;
+        const queue = [...quests];
+        const activeNames = new Set();
+        const slotInUse = { desktop: 0, stream: 0, other: 0 };
+        const slotCap = { desktop: 1, stream: 1, other: BATCH_POOL_SIZE };
 
-        for (let i = 0; i < quests.length; i++) {
-            if (batchStopRequested) break;
-            const quest = quests[i];
-            const name = resolveQuestDisplayName(quest);
-            const overall = Math.round((i / quests.length) * 100);
-            updateBatchStrip({ i: i + 1, n: quests.length, name, overall });
+        const refreshStrip = () => {
+            updateBatchStrip({
+                i: done,
+                n: quests.length,
+                runningCount: activeNames.size,
+                names: [...activeNames],
+                overall: Math.round((done / Math.max(1, quests.length)) * 100)
+            });
+            updateStopAllVisibility();
+        };
 
-            const flags = getQuestCompletionFlags(quest);
-            if (!flags.isEnrolled) {
-                const enrolled = await acceptQuest(quest);
-                if (!enrolled) {
-                    skipped++;
-                    continue;
-                }
+        const takeNextQuest = () => {
+            for (let i = 0; i < queue.length; i++) {
+                const q = queue[i];
+                const kind = getBatchSlotKind(q);
+                if (slotInUse[kind] >= slotCap[kind]) continue;
+                queue.splice(i, 1);
+                slotInUse[kind] += 1;
+                return { quest: q, kind };
             }
+            return null;
+        };
 
-            const result = await new Promise(resolve => executeQuest(quest, resolve));
-            if (!result || result.skipped) skipped++;
-            else if (result.ok) ok++;
-            else failed++;
+        const runOne = async (quest, kind) => {
+            const name = resolveQuestDisplayName(quest);
+            activeNames.add(name);
+            refreshStrip();
+            try {
+                if (batchStopRequested) {
+                    skipped++;
+                    return;
+                }
+                const flags = getQuestCompletionFlags(quest);
+                if (!flags.isEnrolled) {
+                    const enrolled = await acceptQuest(quest);
+                    if (!enrolled || batchStopRequested) {
+                        skipped++;
+                        return;
+                    }
+                }
+                if (batchStopRequested) {
+                    skipped++;
+                    return;
+                }
+                const result = await new Promise(resolve => executeQuest(quest, resolve));
+                if (!result || result.skipped) skipped++;
+                else if (result.ok) ok++;
+                else failed++;
+            } finally {
+                activeNames.delete(name);
+                slotInUse[kind] = Math.max(0, slotInUse[kind] - 1);
+                done++;
+                refreshStrip();
+            }
+        };
+
+        const worker = async () => {
+            while (!batchStopRequested) {
+                const next = takeNextQuest();
+                if (!next) {
+                    if (activeNames.size === 0 && queue.length === 0) break;
+                    // Wait for a slot to free (desktop/stream cap).
+                    if (queue.length > 0) {
+                        await sleep(400);
+                        continue;
+                    }
+                    break;
+                }
+                await runOne(next.quest, next.kind);
+            }
+        };
+
+        const workers = Array.from(
+            { length: Math.min(BATCH_POOL_SIZE, quests.length) },
+            () => worker()
+        );
+        await Promise.all(workers);
+
+        // Any leftover after stop
+        while (queue.length) {
+            queue.shift();
+            skipped++;
+            done++;
         }
 
         updateBatchStrip({
             i: quests.length,
             n: quests.length,
-            name: "—",
+            runningCount: 0,
+            names: [],
             overall: batchStopRequested ? Math.round((ok / Math.max(1, quests.length)) * 100) : 100
         });
         log.success(t("logBatchSummary") + ok + t("logBatchSkipped") + skipped + t("logBatchFailed") + failed);
@@ -3020,17 +3103,20 @@ export function mountQuestsManager() {
     const countTotalQuests = () => getListedQuests().length;
 
     const updateTabStats = () => {
-        const pairs = [
-            ["incomplete", "dqm-tab-quests-incomplete", "dqm-tab-orbs-incomplete"],
-            ["claimable", "dqm-tab-quests-claimable", "dqm-tab-orbs-claimable"],
-            ["complete", "dqm-tab-quests-complete", "dqm-tab-orbs-complete"]
-        ];
-        for (const [filter, qId, oId] of pairs) {
-            const qEl = document.getElementById(qId);
-            const oEl = document.getElementById(oId);
-            if (qEl) qEl.textContent = String(countQuestsForFilter(filter));
-            if (oEl) oEl.textContent = String(sumQuestOrbsForFilter(filter));
-        }
+        if (!gui) return;
+        const labels = {
+            incomplete: t("tabIncomplete"),
+            claimable: t("tabClaimable"),
+            complete: t("tabComplete")
+        };
+        gui.querySelectorAll(".tab-btn").forEach(btn => {
+            const filter = btn.getAttribute("data-filter");
+            const label = btn.querySelector(".tab-label");
+            if (!label || !filter) return;
+            const q = countQuestsForFilter(filter);
+            const o = sumQuestOrbsForFilter(filter);
+            label.textContent = `${labels[filter] || filter} · ${q} · ${o}`;
+        });
     };
 
     const updateNitroButtonState = () => {
@@ -3045,8 +3131,7 @@ export function mountQuestsManager() {
     };
 
     const fetchUserNitroDays = async () => {
-        const days = await fetchNitroDaysRemaining(apiGet);
-        if (days != null) userNitroDays = days;
+        userNitroDays = await fetchNitroDaysRemaining(apiGet);
         updateRunningStats();
     };
 
@@ -3084,7 +3169,7 @@ export function mountQuestsManager() {
         updateNitroButtonState();
         log.info(t("logNitroBuying"));
         try {
-            const result = await purchaseThreeDayNitroCredit(apiPost, { expectedAmount: price });
+            const result = await purchaseThreeDayNitroCredit(apiPost);
             if (result.ok) {
                 log.success(t("logNitroSuccess"));
                 await fetchUserOrbsBalance();
@@ -3102,12 +3187,10 @@ export function mountQuestsManager() {
     };
 
     const updateRunningStats = () => {
-        const qEl = document.getElementById("dqm-stat-quests");
         const oEl = document.getElementById("dqm-stat-orbs");
         const nEl = document.getElementById("dqm-stat-nitro");
         const rEl = document.getElementById("dqm-stat-running");
         if (!listContainer) return;
-        if (qEl) qEl.textContent = String(countTotalQuests());
         if (oEl) oEl.textContent = userOrbsBalance != null ? String(userOrbsBalance) : "—";
         if (nEl) {
             nEl.textContent = userNitroDays != null
@@ -3163,6 +3246,7 @@ export function mountQuestsManager() {
             b.disabled = disabled;
             if (onClick) b.onclick = onClick;
             actions.appendChild(b);
+            return b;
         };
 
         // DQH-style exclusive ladder on the display/canonical listing only.
@@ -3179,7 +3263,7 @@ export function mountQuestsManager() {
                 addBtn("dqm-action-start", t("btnStart"), () => executeQuest(canonical));
             }
             if (isLaunchQuest) {
-                addBtn("dqm-action-launch", t("btnOpenDiscord"), () => launchQuestUi(canonical));
+                addBtn("dqm-action-link", t("btnOpenDiscord"), () => launchQuestUi(canonical));
             }
         } else if (completed && !claimed) {
             const claimTarget = actionPool.find(q => getQuestCompletionFlags(q).isClaimable)
@@ -3191,7 +3275,7 @@ export function mountQuestsManager() {
         // Safety net: ready-to-launch must never show an empty action row.
         if (rt.status === "ready-to-launch" && actions.childElementCount === 0) {
             addBtn("dqm-action-start", t("btnStart"), () => executeQuest(canonical));
-            addBtn("dqm-action-launch", t("btnOpenDiscord"), () => launchQuestUi(canonical));
+            addBtn("dqm-action-link", t("btnOpenDiscord"), () => launchQuestUi(canonical));
         }
     };
 
@@ -3445,16 +3529,7 @@ export function mountQuestsManager() {
         if (min) { min.setAttribute("aria-label", t("btnMinimize")); min.title = t("btnMinimize"); }
         if (close) { close.setAttribute("aria-label", t("btnClose")); close.title = t("btnClose"); }
 
-        const tabLabels = {
-            incomplete: t("tabIncomplete"),
-            claimable: t("tabClaimable"),
-            complete: t("tabComplete")
-        };
-        gui.querySelectorAll(".tab-btn").forEach(btn => {
-            const filter = btn.getAttribute("data-filter");
-            const label = btn.querySelector(".tab-label");
-            if (label && tabLabels[filter]) label.textContent = tabLabels[filter];
-        });
+        updateTabStats();
 
         const countryFilterLbl = gui.querySelector(".dqm-country-filter-label");
         if (countryFilterLbl) countryFilterLbl.textContent = t("labelCountryFilter");
@@ -3549,28 +3624,28 @@ export function mountQuestsManager() {
                     <div class="dqm-brand-text">
                         <span id="dqm-title"></span>
                         <span id="dqm-subtitle" class="dqm-subtitle"></span>
-                </div>
                     </div>
+                </div>
                 <div class="dqm-win-btns">
                     <button id="dqm-minimize" class="dqm-btn-icon" type="button">─</button>
                     <button id="dqm-close" class="dqm-btn-icon dqm-close" type="button">✕</button>
-                    </div>
                 </div>
+            </div>
             <div class="dqm-stats">
-                <span class="dqm-chip"><span class="dqm-chip-quests-label"></span> <strong id="dqm-stat-quests">0</strong></span>
                 <span class="dqm-chip dqm-chip--orbs"><span class="dqm-chip-orbs-label"></span> <strong id="dqm-stat-orbs">0</strong></span>
                 <span class="dqm-chip dqm-chip--nitro"><span class="dqm-chip-nitro-label"></span> <strong id="dqm-stat-nitro">—</strong></span>
                 <span class="dqm-chip dqm-chip--run"><span class="dqm-chip-run-label"></span> <strong id="dqm-stat-running">0</strong></span>
                 <span class="dqm-chip dqm-chip--location"><span class="dqm-chip-location-label"></span> <strong id="dqm-stat-location">—</strong></span>
-                <span class="dqm-chip dqm-chip--version" title="Plugin version"><strong id="dqm-version">${PLUGIN_VERSION_LABEL}</strong></span>
             </div>
-            <div class="dqm-toolbar">
+            <div class="dqm-toolbar dqm-toolbar-primary">
                 <button id="dqm-run-all" class="dqm-btn dqm-btn-green" type="button"></button>
-                <button id="dqm-buy-nitro" class="dqm-btn dqm-btn-nitro" type="button"></button>
                 <button id="dqm-stop-all" class="dqm-btn dqm-btn-danger" type="button" hidden></button>
                 <button id="dqm-refresh" class="dqm-btn dqm-btn-gray" type="button"></button>
-                <button id="dqm-copy-logs" class="dqm-btn dqm-btn-gray" type="button"></button>
-                <button id="dqm-lang-toggle" class="dqm-btn dqm-btn-blurple" type="button"></button>
+            </div>
+            <div class="dqm-toolbar dqm-toolbar-secondary">
+                <button id="dqm-buy-nitro" class="dqm-btn dqm-btn-nitro dqm-btn-sm" type="button"></button>
+                <button id="dqm-copy-logs" class="dqm-btn dqm-btn-gray dqm-btn-sm" type="button"></button>
+                <button id="dqm-lang-toggle" class="dqm-btn dqm-btn-blurple dqm-btn-sm" type="button"></button>
                 <div class="dqm-update-group">
                     <span id="dqm-update-status" class="dqm-update-status"></span>
                     <button id="dqm-check-update" class="dqm-btn dqm-btn-gray dqm-btn-sm" type="button"></button>
@@ -3580,45 +3655,15 @@ export function mountQuestsManager() {
         </div>
         <div id="dqm-batch" class="dqm-batch" hidden></div>
         <div class="dqm-tabs">
-            <div class="tab-col">
-                <div class="dqm-tab-stats">
-                    <span class="dqm-chip dqm-chip--sm">
-                        <span class="dqm-tab-quests-label"></span> <strong id="dqm-tab-quests-incomplete">0</strong>
-                    </span>
-                    <span class="dqm-chip dqm-chip--sm dqm-chip--orbs">
-                        <span class="dqm-tab-orbs-label"></span> <strong id="dqm-tab-orbs-incomplete">0</strong>
-                    </span>
-                </div>
-                <button class="tab-btn active" data-filter="incomplete" type="button">
-                    <span class="tab-label"></span>
-                </button>
-            </div>
-            <div class="tab-col">
-                <div class="dqm-tab-stats">
-                    <span class="dqm-chip dqm-chip--sm">
-                        <span class="dqm-tab-quests-label"></span> <strong id="dqm-tab-quests-claimable">0</strong>
-                    </span>
-                    <span class="dqm-chip dqm-chip--sm dqm-chip--orbs">
-                        <span class="dqm-tab-orbs-label"></span> <strong id="dqm-tab-orbs-claimable">0</strong>
-                    </span>
-                </div>
-                <button class="tab-btn" data-filter="claimable" type="button">
-                    <span class="tab-label"></span>
-                </button>
-            </div>
-            <div class="tab-col">
-                <div class="dqm-tab-stats">
-                    <span class="dqm-chip dqm-chip--sm">
-                        <span class="dqm-tab-quests-label"></span> <strong id="dqm-tab-quests-complete">0</strong>
-                    </span>
-                    <span class="dqm-chip dqm-chip--sm dqm-chip--orbs">
-                        <span class="dqm-tab-orbs-label"></span> <strong id="dqm-tab-orbs-complete">0</strong>
-                    </span>
-                </div>
-                <button class="tab-btn" data-filter="complete" type="button">
-                    <span class="tab-label"></span>
-                </button>
-            </div>
+            <button class="tab-btn active" data-filter="incomplete" type="button">
+                <span class="tab-label"></span>
+            </button>
+            <button class="tab-btn" data-filter="claimable" type="button">
+                <span class="tab-label"></span>
+            </button>
+            <button class="tab-btn" data-filter="complete" type="button">
+                <span class="tab-label"></span>
+            </button>
             <div class="dqm-country-filter-wrap">
                 <label class="dqm-country-filter-label" for="dqm-country-filter"></label>
                 <select id="dqm-country-filter" class="dqm-country-filter" aria-label="Filter by country"></select>

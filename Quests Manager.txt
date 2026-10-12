@@ -328,9 +328,9 @@ globalThis.__DQM_REGIONS_SNAPSHOT = {"1545205635577290893":{"isGlobal":false,"in
  * Launch Quest / Activity quest completion — ported from Discord Quest Helper
  */
 
-// Match Discord Quest Helper defaults (new installs; localStorage overrides still win).
-const DEFAULT_CHECKPOINT_MIN_SECS = 180;
-const DEFAULT_CHECKPOINT_MAX_SECS = 300;
+// Minimum safe wait Discord tooling allows (new installs; localStorage overrides still win).
+const DEFAULT_CHECKPOINT_MIN_SECS = 30;
+const DEFAULT_CHECKPOINT_MAX_SECS = 30;
 const CHECKPOINT_MIN_LIMIT = 30;
 const CHECKPOINT_MAX_LIMIT = 600;
 const STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY = "questHelper_activityCheckpointMin";
@@ -366,6 +366,13 @@ function getActivityCheckpointSettings() {
     let minSecs = DEFAULT_CHECKPOINT_MIN_SECS;
     let maxSecs = DEFAULT_CHECKPOINT_MAX_SECS;
     try {
+        // Migrate legacy DQH defaults (180–300) to the 30s floor so ETA matches v1.0.4 hotfix.
+        const rawMin = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY);
+        const rawMax = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY);
+        if (rawMin === "180" && (rawMax == null || rawMax === "300")) {
+            localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY, "30");
+            localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY, "30");
+        }
         const savedMin = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY);
         const savedMax = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY);
         if (savedMin != null) {
@@ -565,6 +572,17 @@ const JS_ACTIVITY_HELPERS = `
             && value.code === 4002
             && String(value.message || "").includes("Quest not found");
     }
+
+    function isAuthPendingQuestStartTimerError(value) {
+        if (!value) return false;
+        const code = typeof value === "object" ? value.code : null;
+        const msg = typeof value === "object"
+            ? String(value.message || value.error || "")
+            : String(value);
+        return code === 4005
+            || code === 4006
+            || /not authenticated|invalid scope|"code":\\s*4005|"code":\\s*4006/i.test(msg);
+    }
 `;
 
 function getTaskConfig(quest) {
@@ -746,6 +764,16 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             // DQH: benign 4002 "Quest not found" with valid iframe quest context → continue.
             if (isKnownBenignQuestStartTimerError(e) && hasRetryableQuestContext) {
                 startTimerIgnored = true;
+            } else if (isAuthPendingQuestStartTimerError(e)) {
+                return JSON.stringify({
+                    success: false,
+                    errorCode: "AUTH_PENDING",
+                    error: "questStartTimer failed: " + startTimerError,
+                    effectiveQuestId,
+                    boundQuestId,
+                    commands,
+                    waitedMs
+                });
             } else {
                 return JSON.stringify({
                     success: false,
@@ -762,6 +790,16 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             startTimerError = describeError(startTimerResult);
             if (isKnownBenignQuestStartTimerError(startTimerResult) && hasRetryableQuestContext) {
                 startTimerIgnored = true;
+            } else if (isAuthPendingQuestStartTimerError(startTimerResult)) {
+                return JSON.stringify({
+                    success: false,
+                    errorCode: "AUTH_PENDING",
+                    error: "questStartTimer returned failure: " + startTimerError,
+                    effectiveQuestId,
+                    boundQuestId,
+                    commands,
+                    waitedMs
+                });
             } else {
                 return JSON.stringify({
                     success: false,
@@ -1241,7 +1279,7 @@ function isInitRetryableError(initResult) {
     if (isSdkNotReadyError(initResult)) return true;
     if (isQuestNotReadyError(initResult)) return true;
     const err = String(initResult.error || "");
-    return /not authenticated|invalid scope|"code":\s*4006/i.test(err);
+    return /not authenticated|invalid scope|"code":\s*4005|"code":\s*4006/i.test(err);
 }
 
 async function initActivityWithRetry(applicationId, questId, taskState, sleep, log, t, questName, allowedQuestIds = []) {
@@ -1469,12 +1507,21 @@ function createActivityExecutors(deps) {
             }
 
             if (initResult.startTimerIgnored) {
-                // Match DQH: benign questStartTimer rejection with valid quest context → continue.
+                // Match DQH: benign questStartTimer rejection with valid quest context → retry.
                 log.warn(`[${questName}] ${t("logActivityStartTimerIgnored")}${initResult.startTimerError || ""}`);
-                await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
+                const timerOk = await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
+                if (!timerOk) {
+                    // Do not continue to fake checkpoints without an active timer.
+                    log.error(`[${questName}] ${t("logActivityTimerRequired")}`);
+                    log.warn(`[${questName}] ${t("logActivityAuthPending")}`);
+                    return false;
+                }
             }
 
             // Active quest only — do not max() with regional siblings.
+            try {
+                await apiGet({ url: "/quests/@me" });
+            } catch (_) {}
             const freshCompleted = await resolveCompletedCheckpointsAsync(
                 questId, taskName, checkpointCount, QuestsStore, apiGet
             );
@@ -1693,6 +1740,9 @@ const NITRO_3DAY_SKU_ID = "1333912750274904064";
 const NITRO_3DAY_ORB_PRICE = 1400;
 const STORAGE_PURCHASE_TOKEN_KEY = "questHelper_purchaseToken";
 
+/** Entitlement types that grant Nitro / fractional Nitro credit. */
+const NITRO_ENTITLEMENT_TYPES = new Set([2, 11, 12]);
+
 function newUuid() {
     try {
         if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -1719,78 +1769,100 @@ function getOrCreatePurchaseToken() {
     }
 }
 
-/** Remaining premium days from billing subscriptions (credits stack). */
-function computeNitroDaysRemaining(subscriptions, now = Date.now()) {
-    if (!Array.isArray(subscriptions) || !subscriptions.length) return 0;
-    let bestEnd = 0;
-    for (const sub of subscriptions) {
-        if (!sub || sub.type != null && Number(sub.type) !== 1 && String(sub.type).toUpperCase() !== "PREMIUM") {
-            // Keep scanning — Discord shapes vary; prefer period end when present.
-        }
-        const endRaw = sub.current_period_end
-            || sub.currentPeriodEnd
-            || sub.ends_at
-            || sub.endsAt
-            || sub.trial_ends_at
-            || sub.trialEndsAt;
-        if (!endRaw) continue;
-        const end = new Date(endRaw).getTime();
-        if (!Number.isFinite(end)) continue;
-        if (end > bestEnd) bestEnd = end;
-        // Stack unused credit seconds when Discord exposes them.
-        const creditMs = Number(sub.streak_started_at ? 0 : 0);
-        void creditMs;
+function parseEndMs(raw) {
+    if (raw == null || raw === "") return 0;
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+        // Unix seconds vs milliseconds
+        return raw < 1e12 ? raw * 1000 : raw;
     }
-    // Also sum remaining_time / credit_balance style fields when present.
+    const ms = new Date(raw).getTime();
+    return Number.isFinite(ms) ? ms : 0;
+}
+
+function daysFromEndMs(endMs, now) {
+    if (!endMs || endMs <= now) return 0;
+    return Math.max(1, Math.ceil((endMs - now) / 86400000));
+}
+
+/** Remaining premium days from subscriptions and/or entitlements. Empty → null (UI shows —). */
+function computeNitroDaysRemaining(sources, now = Date.now()) {
+    const list = Array.isArray(sources) ? sources : [];
+    if (!list.length) return null;
+
+    let bestEnd = 0;
     let extraDays = 0;
-    for (const sub of subscriptions) {
-        const days = sub.remaining_days ?? sub.remainingDays;
+
+    for (const item of list) {
+        if (!item || typeof item !== "object") continue;
+
+        const endRaw = item.current_period_end
+            || item.currentPeriodEnd
+            || item.ends_at
+            || item.endsAt
+            || item.trial_ends_at
+            || item.trialEndsAt
+            || item.expires_at
+            || item.expiresAt;
+        const end = parseEndMs(endRaw);
+        if (end > bestEnd) bestEnd = end;
+
+        const days = item.remaining_days ?? item.remainingDays;
         if (days != null && Number.isFinite(Number(days))) {
             extraDays = Math.max(extraDays, Math.ceil(Number(days)));
         }
-        const secs = sub.remaining_seconds ?? sub.remainingSeconds;
+        const secs = item.remaining_seconds ?? item.remainingSeconds;
         if (secs != null && Number.isFinite(Number(secs))) {
             extraDays = Math.max(extraDays, Math.ceil(Number(secs) / 86400));
         }
     }
-    if (bestEnd > now) {
-        const fromPeriod = Math.max(1, Math.ceil((bestEnd - now) / 86400));
-        return Math.max(fromPeriod, extraDays);
-    }
-    return Math.max(0, extraDays);
+
+    const fromPeriod = daysFromEndMs(bestEnd, now);
+    const total = Math.max(fromPeriod, extraDays);
+    return total > 0 ? total : null;
 }
 
 async function fetchNitroDaysRemaining(apiGet) {
+    const bags = [];
+
     try {
-        const res = await apiGet({ url: "/users/@me/billing/subscriptions?sync_level=2" });
-        const body = res?.body;
-        const list = Array.isArray(body) ? body : (Array.isArray(body?.subscriptions) ? body.subscriptions : []);
-        return computeNitroDaysRemaining(list);
-    } catch (_) {
-        return null;
-    }
+        const entRes = await apiGet({ url: "/users/@me/entitlements?exclude_ended=true" });
+        const entBody = entRes?.body;
+        const entitlements = Array.isArray(entBody)
+            ? entBody
+            : (Array.isArray(entBody?.entitlements) ? entBody.entitlements : []);
+        for (const e of entitlements) {
+            const type = Number(e?.type);
+            if (NITRO_ENTITLEMENT_TYPES.has(type) || e?.ends_at || e?.endsAt) {
+                bags.push(e);
+            }
+        }
+    } catch (_) {}
+
+    try {
+        const subRes = await apiGet({ url: "/users/@me/billing/subscriptions?sync_level=2" });
+        const subBody = subRes?.body;
+        const subs = Array.isArray(subBody)
+            ? subBody
+            : (Array.isArray(subBody?.subscriptions) ? subBody.subscriptions : []);
+        bags.push(...subs);
+    } catch (_) {}
+
+    return computeNitroDaysRemaining(bags);
 }
 
 /**
- * Purchase 3-Day Nitro Credit with Orbs.
+ * Redeem 3-Day Nitro Credit with Orbs via virtual-currency SKU redeem.
  * @returns {{ ok: boolean, error?: string, code?: number, body?: any }}
  */
 async function purchaseThreeDayNitroCredit(apiPost, {
-    expectedAmount = NITRO_3DAY_ORB_PRICE,
     skuId = NITRO_3DAY_SKU_ID
 } = {}) {
-    const loadId = newUuid();
-    const purchaseToken = getOrCreatePurchaseToken();
+    const checkoutSessionId = newUuid();
     try {
         const res = await apiPost({
-            url: `/store/skus/${skuId}/purchase`,
+            url: `/virtual-currency/skus/${skuId}/redeem`,
             body: {
-                expected_amount: expectedAmount,
-                expected_currency: "discord_orb",
-                currency: "discord_orb",
-                purchase_token: purchaseToken,
-                load_id: loadId,
-                gift: false
+                checkout_session_id: checkoutSessionId
             }
         });
         const body = res?.body;
@@ -1804,10 +1876,13 @@ async function purchaseThreeDayNitroCredit(apiPost, {
             };
         }
         if (res?.ok === false || (typeof res?.status === "number" && res.status >= 400)) {
+            const detail = body?.errors
+                ? JSON.stringify(body.errors)
+                : (body?.message || `HTTP ${res.status}`);
             return {
                 ok: false,
                 code: body?.code ?? res.status,
-                error: body?.message || `HTTP ${res.status}`,
+                error: detail,
                 body
             };
         }
@@ -1815,10 +1890,16 @@ async function purchaseThreeDayNitroCredit(apiPost, {
     } catch (e) {
         const msg = e?.body?.message || e?.message || String(e);
         const code = e?.body?.code ?? e?.code;
+        const errors = e?.body?.errors;
         if (code === 100056 || /authorize|payment client|email/i.test(msg)) {
             return { ok: false, code: 100056, error: "purchase_auth_required", body: e?.body };
         }
-        return { ok: false, code, error: msg, body: e?.body };
+        return {
+            ok: false,
+            code,
+            error: errors ? `${msg} ${JSON.stringify(errors)}` : msg,
+            body: e?.body
+        };
     }
 }
 
@@ -2103,8 +2184,9 @@ function mountQuestsManager() {
             statOrbs: "Orbs",
             statRunning: "Running",
             batchPreparing: "Preparing…",
-            batchProgress: "Quest {i} of {n}",
+            batchProgress: "Done {i} of {n}",
             batchCurrent: "Current: ",
+            batchRunning: "Running: {n}",
             batchOverall: "Overall",
             typeVideo: "Video",
             typePlay: "Play Game",
@@ -2287,8 +2369,9 @@ function mountQuestsManager() {
             statOrbs: "الأورب",
             statRunning: "قيد التشغيل",
             batchPreparing: "جاري التحضير…",
-            batchProgress: "مهمة {i} من {n}",
+            batchProgress: "تم {i} من {n}",
             batchCurrent: "الحالية: ",
+            batchRunning: "قيد التشغيل: {n}",
             batchOverall: "الإجمالي",
             typeVideo: "فيديو",
             typePlay: "لعب",
@@ -4654,10 +4737,14 @@ function mountQuestsManager() {
             batchStrip.textContent = t("batchPreparing");
             return;
         }
-        const line1 = t("batchProgress").replace("{i}", info.i).replace("{n}", info.n);
-        const line2 = t("batchCurrent") + (info.name || "");
+        const line1 = t("batchProgress").replace("{i}", String(info.i)).replace("{n}", String(info.n));
+        const runningN = info.runningCount != null ? info.runningCount : (info.name ? 1 : 0);
+        const line2 = t("batchRunning").replace("{n}", String(runningN));
+        const names = info.names?.length
+            ? ` · ${info.names.slice(0, 3).join(", ")}${info.names.length > 3 ? "…" : ""}`
+            : (info.name ? ` · ${t("batchCurrent")}${info.name}` : "");
         const pct = info.overall != null ? ` — ${t("batchOverall")}: ${info.overall}%` : "";
-        batchStrip.textContent = `${line1} · ${line2}${pct}`;
+        batchStrip.textContent = `${line1} · ${line2}${names}${pct}`;
     };
 
     const updateStopAllVisibility = () => {
@@ -4665,6 +4752,15 @@ function mountQuestsManager() {
         const show = batchRunning || dqmTasks.size > 0;
         stopAllBtn.hidden = !show;
         stopAllBtn.disabled = !show;
+    };
+
+    const BATCH_POOL_SIZE = 3;
+
+    const getBatchSlotKind = (quest) => {
+        const taskName = resolveTaskName(quest) || "";
+        if (taskName === "PLAY_ON_DESKTOP") return "desktop";
+        if (taskName === "STREAM_ON_DESKTOP") return "stream";
+        return "other";
     };
 
     const runAllQuests = async () => {
@@ -4692,34 +4788,102 @@ function mountQuestsManager() {
         }
 
         log.info(t("logBatchStart") + quests.length + t("logBatchEnd"));
-        let ok = 0, skipped = 0, failed = 0;
+        let ok = 0, skipped = 0, failed = 0, done = 0;
+        const queue = [...quests];
+        const activeNames = new Set();
+        const slotInUse = { desktop: 0, stream: 0, other: 0 };
+        const slotCap = { desktop: 1, stream: 1, other: BATCH_POOL_SIZE };
 
-        for (let i = 0; i < quests.length; i++) {
-            if (batchStopRequested) break;
-            const quest = quests[i];
-            const name = resolveQuestDisplayName(quest);
-            const overall = Math.round((i / quests.length) * 100);
-            updateBatchStrip({ i: i + 1, n: quests.length, name, overall });
+        const refreshStrip = () => {
+            updateBatchStrip({
+                i: done,
+                n: quests.length,
+                runningCount: activeNames.size,
+                names: [...activeNames],
+                overall: Math.round((done / Math.max(1, quests.length)) * 100)
+            });
+            updateStopAllVisibility();
+        };
 
-            const flags = getQuestCompletionFlags(quest);
-            if (!flags.isEnrolled) {
-                const enrolled = await acceptQuest(quest);
-                if (!enrolled) {
-                    skipped++;
-                    continue;
-                }
+        const takeNextQuest = () => {
+            for (let i = 0; i < queue.length; i++) {
+                const q = queue[i];
+                const kind = getBatchSlotKind(q);
+                if (slotInUse[kind] >= slotCap[kind]) continue;
+                queue.splice(i, 1);
+                slotInUse[kind] += 1;
+                return { quest: q, kind };
             }
+            return null;
+        };
 
-            const result = await new Promise(resolve => executeQuest(quest, resolve));
-            if (!result || result.skipped) skipped++;
-            else if (result.ok) ok++;
-            else failed++;
+        const runOne = async (quest, kind) => {
+            const name = resolveQuestDisplayName(quest);
+            activeNames.add(name);
+            refreshStrip();
+            try {
+                if (batchStopRequested) {
+                    skipped++;
+                    return;
+                }
+                const flags = getQuestCompletionFlags(quest);
+                if (!flags.isEnrolled) {
+                    const enrolled = await acceptQuest(quest);
+                    if (!enrolled || batchStopRequested) {
+                        skipped++;
+                        return;
+                    }
+                }
+                if (batchStopRequested) {
+                    skipped++;
+                    return;
+                }
+                const result = await new Promise(resolve => executeQuest(quest, resolve));
+                if (!result || result.skipped) skipped++;
+                else if (result.ok) ok++;
+                else failed++;
+            } finally {
+                activeNames.delete(name);
+                slotInUse[kind] = Math.max(0, slotInUse[kind] - 1);
+                done++;
+                refreshStrip();
+            }
+        };
+
+        const worker = async () => {
+            while (!batchStopRequested) {
+                const next = takeNextQuest();
+                if (!next) {
+                    if (activeNames.size === 0 && queue.length === 0) break;
+                    // Wait for a slot to free (desktop/stream cap).
+                    if (queue.length > 0) {
+                        await sleep(400);
+                        continue;
+                    }
+                    break;
+                }
+                await runOne(next.quest, next.kind);
+            }
+        };
+
+        const workers = Array.from(
+            { length: Math.min(BATCH_POOL_SIZE, quests.length) },
+            () => worker()
+        );
+        await Promise.all(workers);
+
+        // Any leftover after stop
+        while (queue.length) {
+            queue.shift();
+            skipped++;
+            done++;
         }
 
         updateBatchStrip({
             i: quests.length,
             n: quests.length,
-            name: "—",
+            runningCount: 0,
+            names: [],
             overall: batchStopRequested ? Math.round((ok / Math.max(1, quests.length)) * 100) : 100
         });
         log.success(t("logBatchSummary") + ok + t("logBatchSkipped") + skipped + t("logBatchFailed") + failed);
@@ -4776,17 +4940,20 @@ function mountQuestsManager() {
     const countTotalQuests = () => getListedQuests().length;
 
     const updateTabStats = () => {
-        const pairs = [
-            ["incomplete", "dqm-tab-quests-incomplete", "dqm-tab-orbs-incomplete"],
-            ["claimable", "dqm-tab-quests-claimable", "dqm-tab-orbs-claimable"],
-            ["complete", "dqm-tab-quests-complete", "dqm-tab-orbs-complete"]
-        ];
-        for (const [filter, qId, oId] of pairs) {
-            const qEl = document.getElementById(qId);
-            const oEl = document.getElementById(oId);
-            if (qEl) qEl.textContent = String(countQuestsForFilter(filter));
-            if (oEl) oEl.textContent = String(sumQuestOrbsForFilter(filter));
-        }
+        if (!gui) return;
+        const labels = {
+            incomplete: t("tabIncomplete"),
+            claimable: t("tabClaimable"),
+            complete: t("tabComplete")
+        };
+        gui.querySelectorAll(".tab-btn").forEach(btn => {
+            const filter = btn.getAttribute("data-filter");
+            const label = btn.querySelector(".tab-label");
+            if (!label || !filter) return;
+            const q = countQuestsForFilter(filter);
+            const o = sumQuestOrbsForFilter(filter);
+            label.textContent = `${labels[filter] || filter} · ${q} · ${o}`;
+        });
     };
 
     const updateNitroButtonState = () => {
@@ -4801,8 +4968,7 @@ function mountQuestsManager() {
     };
 
     const fetchUserNitroDays = async () => {
-        const days = await fetchNitroDaysRemaining(apiGet);
-        if (days != null) userNitroDays = days;
+        userNitroDays = await fetchNitroDaysRemaining(apiGet);
         updateRunningStats();
     };
 
@@ -4840,7 +5006,7 @@ function mountQuestsManager() {
         updateNitroButtonState();
         log.info(t("logNitroBuying"));
         try {
-            const result = await purchaseThreeDayNitroCredit(apiPost, { expectedAmount: price });
+            const result = await purchaseThreeDayNitroCredit(apiPost);
             if (result.ok) {
                 log.success(t("logNitroSuccess"));
                 await fetchUserOrbsBalance();
@@ -4858,12 +5024,10 @@ function mountQuestsManager() {
     };
 
     const updateRunningStats = () => {
-        const qEl = document.getElementById("dqm-stat-quests");
         const oEl = document.getElementById("dqm-stat-orbs");
         const nEl = document.getElementById("dqm-stat-nitro");
         const rEl = document.getElementById("dqm-stat-running");
         if (!listContainer) return;
-        if (qEl) qEl.textContent = String(countTotalQuests());
         if (oEl) oEl.textContent = userOrbsBalance != null ? String(userOrbsBalance) : "—";
         if (nEl) {
             nEl.textContent = userNitroDays != null
@@ -4919,6 +5083,7 @@ function mountQuestsManager() {
             b.disabled = disabled;
             if (onClick) b.onclick = onClick;
             actions.appendChild(b);
+            return b;
         };
 
         // DQH-style exclusive ladder on the display/canonical listing only.
@@ -4935,7 +5100,7 @@ function mountQuestsManager() {
                 addBtn("dqm-action-start", t("btnStart"), () => executeQuest(canonical));
             }
             if (isLaunchQuest) {
-                addBtn("dqm-action-launch", t("btnOpenDiscord"), () => launchQuestUi(canonical));
+                addBtn("dqm-action-link", t("btnOpenDiscord"), () => launchQuestUi(canonical));
             }
         } else if (completed && !claimed) {
             const claimTarget = actionPool.find(q => getQuestCompletionFlags(q).isClaimable)
@@ -4947,7 +5112,7 @@ function mountQuestsManager() {
         // Safety net: ready-to-launch must never show an empty action row.
         if (rt.status === "ready-to-launch" && actions.childElementCount === 0) {
             addBtn("dqm-action-start", t("btnStart"), () => executeQuest(canonical));
-            addBtn("dqm-action-launch", t("btnOpenDiscord"), () => launchQuestUi(canonical));
+            addBtn("dqm-action-link", t("btnOpenDiscord"), () => launchQuestUi(canonical));
         }
     };
 
@@ -5201,16 +5366,7 @@ function mountQuestsManager() {
         if (min) { min.setAttribute("aria-label", t("btnMinimize")); min.title = t("btnMinimize"); }
         if (close) { close.setAttribute("aria-label", t("btnClose")); close.title = t("btnClose"); }
 
-        const tabLabels = {
-            incomplete: t("tabIncomplete"),
-            claimable: t("tabClaimable"),
-            complete: t("tabComplete")
-        };
-        gui.querySelectorAll(".tab-btn").forEach(btn => {
-            const filter = btn.getAttribute("data-filter");
-            const label = btn.querySelector(".tab-label");
-            if (label && tabLabels[filter]) label.textContent = tabLabels[filter];
-        });
+        updateTabStats();
 
         const countryFilterLbl = gui.querySelector(".dqm-country-filter-label");
         if (countryFilterLbl) countryFilterLbl.textContent = t("labelCountryFilter");
@@ -5305,28 +5461,28 @@ function mountQuestsManager() {
                     <div class="dqm-brand-text">
                         <span id="dqm-title"></span>
                         <span id="dqm-subtitle" class="dqm-subtitle"></span>
-                </div>
                     </div>
+                </div>
                 <div class="dqm-win-btns">
                     <button id="dqm-minimize" class="dqm-btn-icon" type="button">─</button>
                     <button id="dqm-close" class="dqm-btn-icon dqm-close" type="button">✕</button>
-                    </div>
                 </div>
+            </div>
             <div class="dqm-stats">
-                <span class="dqm-chip"><span class="dqm-chip-quests-label"></span> <strong id="dqm-stat-quests">0</strong></span>
                 <span class="dqm-chip dqm-chip--orbs"><span class="dqm-chip-orbs-label"></span> <strong id="dqm-stat-orbs">0</strong></span>
                 <span class="dqm-chip dqm-chip--nitro"><span class="dqm-chip-nitro-label"></span> <strong id="dqm-stat-nitro">—</strong></span>
                 <span class="dqm-chip dqm-chip--run"><span class="dqm-chip-run-label"></span> <strong id="dqm-stat-running">0</strong></span>
                 <span class="dqm-chip dqm-chip--location"><span class="dqm-chip-location-label"></span> <strong id="dqm-stat-location">—</strong></span>
-                <span class="dqm-chip dqm-chip--version" title="Plugin version"><strong id="dqm-version">${PLUGIN_VERSION_LABEL}</strong></span>
             </div>
-            <div class="dqm-toolbar">
+            <div class="dqm-toolbar dqm-toolbar-primary">
                 <button id="dqm-run-all" class="dqm-btn dqm-btn-green" type="button"></button>
-                <button id="dqm-buy-nitro" class="dqm-btn dqm-btn-nitro" type="button"></button>
                 <button id="dqm-stop-all" class="dqm-btn dqm-btn-danger" type="button" hidden></button>
                 <button id="dqm-refresh" class="dqm-btn dqm-btn-gray" type="button"></button>
-                <button id="dqm-copy-logs" class="dqm-btn dqm-btn-gray" type="button"></button>
-                <button id="dqm-lang-toggle" class="dqm-btn dqm-btn-blurple" type="button"></button>
+            </div>
+            <div class="dqm-toolbar dqm-toolbar-secondary">
+                <button id="dqm-buy-nitro" class="dqm-btn dqm-btn-nitro dqm-btn-sm" type="button"></button>
+                <button id="dqm-copy-logs" class="dqm-btn dqm-btn-gray dqm-btn-sm" type="button"></button>
+                <button id="dqm-lang-toggle" class="dqm-btn dqm-btn-blurple dqm-btn-sm" type="button"></button>
                 <div class="dqm-update-group">
                     <span id="dqm-update-status" class="dqm-update-status"></span>
                     <button id="dqm-check-update" class="dqm-btn dqm-btn-gray dqm-btn-sm" type="button"></button>
@@ -5336,45 +5492,15 @@ function mountQuestsManager() {
         </div>
         <div id="dqm-batch" class="dqm-batch" hidden></div>
         <div class="dqm-tabs">
-            <div class="tab-col">
-                <div class="dqm-tab-stats">
-                    <span class="dqm-chip dqm-chip--sm">
-                        <span class="dqm-tab-quests-label"></span> <strong id="dqm-tab-quests-incomplete">0</strong>
-                    </span>
-                    <span class="dqm-chip dqm-chip--sm dqm-chip--orbs">
-                        <span class="dqm-tab-orbs-label"></span> <strong id="dqm-tab-orbs-incomplete">0</strong>
-                    </span>
-                </div>
-                <button class="tab-btn active" data-filter="incomplete" type="button">
-                    <span class="tab-label"></span>
-                </button>
-            </div>
-            <div class="tab-col">
-                <div class="dqm-tab-stats">
-                    <span class="dqm-chip dqm-chip--sm">
-                        <span class="dqm-tab-quests-label"></span> <strong id="dqm-tab-quests-claimable">0</strong>
-                    </span>
-                    <span class="dqm-chip dqm-chip--sm dqm-chip--orbs">
-                        <span class="dqm-tab-orbs-label"></span> <strong id="dqm-tab-orbs-claimable">0</strong>
-                    </span>
-                </div>
-                <button class="tab-btn" data-filter="claimable" type="button">
-                    <span class="tab-label"></span>
-                </button>
-            </div>
-            <div class="tab-col">
-                <div class="dqm-tab-stats">
-                    <span class="dqm-chip dqm-chip--sm">
-                        <span class="dqm-tab-quests-label"></span> <strong id="dqm-tab-quests-complete">0</strong>
-                    </span>
-                    <span class="dqm-chip dqm-chip--sm dqm-chip--orbs">
-                        <span class="dqm-tab-orbs-label"></span> <strong id="dqm-tab-orbs-complete">0</strong>
-                    </span>
-                </div>
-                <button class="tab-btn" data-filter="complete" type="button">
-                    <span class="tab-label"></span>
-                </button>
-            </div>
+            <button class="tab-btn active" data-filter="incomplete" type="button">
+                <span class="tab-label"></span>
+            </button>
+            <button class="tab-btn" data-filter="claimable" type="button">
+                <span class="tab-label"></span>
+            </button>
+            <button class="tab-btn" data-filter="complete" type="button">
+                <span class="tab-label"></span>
+            </button>
             <div class="dqm-country-filter-wrap">
                 <label class="dqm-country-filter-label" for="dqm-country-filter"></label>
                 <select id="dqm-country-filter" class="dqm-country-filter" aria-label="Filter by country"></select>
@@ -5607,7 +5733,7 @@ function mountQuestsManager() {
 
 
 (async () => {
-    injectDqmStyles("#dqm-gui, #dqm-mini-icon {\n    --dqm-bg: #2b2d31;\n    --dqm-bg-secondary: #1e1f22;\n    --dqm-panel: #313338;\n    --dqm-panel-hover: #383a40;\n    --dqm-surface: #2b2d31;\n    --dqm-border: #1e1f22;\n    --dqm-text: #f2f3f5;\n    --dqm-text-muted: #b5bac1;\n    --dqm-accent: #5865F2;\n    --dqm-accent-hover: #4752c4;\n    --dqm-success: #248046;\n    --dqm-success-bright: #57F287;\n    --dqm-warning: #faa61a;\n    --dqm-orbs: #f0b232;\n    --dqm-danger: #ed4245;\n    --dqm-info: #00b0f4;\n    --dqm-log: #4ade80;\n    --dqm-radius: 14px;\n    --dqm-shadow: 0 16px 48px rgba(0,0,0,.55), 0 0 0 1px rgba(88,101,242,.12);\n}\n#dqm-gui {\n    position: fixed; top: 100px; right: 30px; width: 540px; height: 680px;\n    min-width: 420px; min-height: 480px; z-index: 999999; resize: both;\n    display: flex; flex-direction: column; overflow: hidden;\n    color: var(--dqm-text);\n    font-family: \"gg sans\", \"Segoe UI\", \"Helvetica Neue\", Helvetica, Arial, sans-serif;\n    border-radius: var(--dqm-radius);\n    border: 1px solid var(--dqm-border);\n    box-shadow: var(--dqm-shadow);\n    background:\n        linear-gradient(165deg, rgba(88,101,242,.08) 0%, transparent 42%),\n        linear-gradient(180deg, var(--dqm-bg) 0%, var(--dqm-panel) 48%, #2a2c31 100%);\n}\n#dqm-gui * { box-sizing: border-box; }\n#dqm-gui button:focus-visible,\n#dqm-gui .tab-btn:focus-visible {\n    outline: 2px solid var(--dqm-accent);\n    outline-offset: 2px;\n}\n#dqm-gui .dqm-header {\n    display: flex; flex-direction: column; gap: 10px;\n    padding: 14px 16px 12px; background: rgba(30,31,34,.72);\n    border-bottom: 1px solid var(--dqm-border); cursor: grab; user-select: none;\n    backdrop-filter: blur(8px);\n}\n#dqm-gui .dqm-header-top {\n    display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-brand {\n    display: flex; align-items: center; gap: 10px; min-width: 0;\n}\n#dqm-gui .dqm-brand-mark {\n    width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;\n    background: linear-gradient(145deg, var(--dqm-accent), #7289da);\n    box-shadow: 0 0 18px rgba(88,101,242,.35); font-size: 16px; flex-shrink: 0;\n}\n#dqm-gui .dqm-brand-text { display: flex; flex-direction: column; min-width: 0; }\n#dqm-gui #dqm-title {\n    font-weight: 700; font-size: 16px; letter-spacing: .2px; color: var(--dqm-text);\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n}\n#dqm-gui .dqm-subtitle {\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 500;\n}\n#dqm-gui .dqm-win-btns { display: flex; gap: 2px; }\n#dqm-gui .dqm-btn-icon {\n    background: transparent; border: none; color: var(--dqm-text-muted);\n    cursor: pointer; font-size: 16px; width: 32px; height: 28px; border-radius: 6px;\n    line-height: 1;\n}\n#dqm-gui .dqm-btn-icon:hover { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-icon.dqm-close:hover { background: var(--dqm-danger); color: #fff; }\n#dqm-gui .dqm-stats {\n    display: flex; gap: 8px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-chip {\n    display: inline-flex; align-items: center; gap: 6px;\n    background: var(--dqm-bg-secondary); border: 1px solid rgba(255,255,255,.04);\n    padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-chip strong { color: var(--dqm-text); font-weight: 700; }\n#dqm-gui .dqm-chip--orbs { color: var(--dqm-orbs); }\n#dqm-gui .dqm-chip--nitro {\n    color: #f0b132;\n    border-color: rgba(240,177,50,.35);\n}\n#dqm-gui .dqm-chip--run { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-chip--location { color: var(--dqm-info); }\n#dqm-gui .dqm-chip--version {\n    color: var(--dqm-accent);\n    border-color: rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-toolbar {\n    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;\n}\n#dqm-gui .dqm-btn-nitro {\n    background: linear-gradient(180deg, #f0c14b, #c89b2c);\n    color: #1a1a1a;\n    box-shadow: 0 4px 14px rgba(200,155,44,.35);\n}\n#dqm-gui .dqm-btn-nitro:disabled {\n    opacity: .55;\n    cursor: not-allowed;\n    transform: none;\n    box-shadow: none;\n}\n#dqm-gui .dqm-update-group {\n    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;\n    margin-left: auto; min-width: 0; max-width: 100%;\n}\n#dqm-gui .dqm-update-status {\n    min-width: 0; max-width: 200px; font-size: 11px; color: var(--dqm-text-muted);\n    font-weight: 600; line-height: 1.3;\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n}\n#dqm-gui .dqm-update--ok { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-update--warn { color: var(--dqm-warning); }\n#dqm-gui .dqm-update--err { color: var(--dqm-danger); }\n#dqm-gui .dqm-btn-sm { padding: 5px 10px; font-size: 11px; border-radius: 7px; }\n#dqm-gui .dqm-card--claimable {\n    border-color: rgba(0,176,244,.35);\n}\n#dqm-gui .dqm-btn {\n    border: none; cursor: pointer; font-size: 12px; padding: 7px 12px;\n    border-radius: 8px; font-weight: 650; color: #fff;\n    transition: background .15s ease, transform .12s ease, box-shadow .15s ease;\n}\n#dqm-gui .dqm-btn:hover { transform: translateY(-1px); }\n#dqm-gui .dqm-btn:active { transform: translateY(0); }\n#dqm-gui .dqm-btn-green {\n    background: linear-gradient(180deg, #2d9d55, var(--dqm-success));\n    box-shadow: 0 4px 14px rgba(36,128,70,.35);\n}\n#dqm-gui .dqm-btn-danger {\n    background: linear-gradient(180deg, #f04747, var(--dqm-danger));\n}\n#dqm-gui .dqm-btn-gray { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-blurple {\n    background: linear-gradient(180deg, #6a76f4, var(--dqm-accent));\n    box-shadow: 0 4px 14px rgba(88,101,242,.28);\n}\n#dqm-gui .dqm-batch {\n    margin: 0 16px; padding: 8px 12px; border-radius: 8px;\n    background: rgba(88,101,242,.12); border: 1px solid rgba(88,101,242,.25);\n    font-size: 12px; color: var(--dqm-text); font-weight: 600;\n}\n#dqm-gui .dqm-tabs {\n    display: flex; gap: 12px; align-items: flex-end; padding: 10px 16px;\n    background: rgba(30,31,34,.45); border-bottom: 1px solid var(--dqm-border);\n}\n#dqm-gui .tab-col {\n    display: flex; flex-direction: column; align-items: center; gap: 6px;\n}\n#dqm-gui .dqm-tab-stats {\n    display: flex; gap: 6px; flex-wrap: wrap; justify-content: center;\n}\n#dqm-gui .dqm-chip--sm {\n    padding: 3px 8px; font-size: 11px;\n}\n#dqm-gui .tab-btn {\n    border: none; padding: 6px 14px; border-radius: 999px; font-size: 12px;\n    font-weight: 650; cursor: pointer; background: var(--dqm-panel-hover);\n    color: var(--dqm-text-muted); transition: background .15s, color .15s;\n}\n#dqm-gui .tab-btn .tab-label { line-height: 1.2; }\n#dqm-gui .tab-btn.active {\n    background: var(--dqm-accent); color: #fff;\n    box-shadow: 0 0 0 1px rgba(88,101,242,.4), 0 4px 12px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-country-filter-wrap {\n    margin-left: auto; display: flex; flex-direction: column; gap: 4px;\n    align-items: flex-end; min-width: 0; max-width: 180px;\n}\n#dqm-gui .dqm-country-filter-label {\n    font-size: 10px; color: var(--dqm-text-muted); font-weight: 600;\n    white-space: nowrap;\n}\n#dqm-gui .dqm-country-filter {\n    appearance: none; -webkit-appearance: none;\n    width: 100%; max-width: 180px;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 8px;\n    padding: 5px 24px 5px 10px; font-size: 11px; font-weight: 600;\n    cursor: pointer; line-height: 1.3;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-filter:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-filter:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-filter option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui[dir=\"rtl\"] .dqm-country-filter-wrap { margin-left: 0; margin-right: auto; align-items: flex-start; }\n#dqm-gui #dqm-list {\n    padding: 12px 14px; overflow-y: auto; flex: 1;\n    display: flex; flex-direction: column; gap: 10px;\n}\n#dqm-gui #dqm-list::-webkit-scrollbar { width: 8px; }\n#dqm-gui #dqm-list::-webkit-scrollbar-thumb {\n    background: #4e5058; border-radius: 8px;\n}\n#dqm-gui .dqm-empty {\n    text-align: center; color: var(--dqm-text-muted); padding: 36px 16px; font-size: 14px;\n}\n#dqm-gui .dqm-card {\n    background: linear-gradient(180deg, rgba(43,45,49,.95), rgba(35,37,41,.98));\n    padding: 12px 14px; border-radius: 12px;\n    border: 1px solid rgba(255,255,255,.04);\n    border-left: 4px solid var(--dqm-accent);\n    display: flex; flex-direction: column; gap: 8px;\n    box-shadow: 0 6px 18px rgba(0,0,0,.22);\n    transition: border-color .2s, box-shadow .2s, background .2s;\n}\n#dqm-gui .dqm-card:hover {\n    background: linear-gradient(180deg, rgba(48,50,55,.98), rgba(38,40,45,.98));\n    box-shadow: 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--not-enrolled { border-left-color: var(--dqm-warning); }\n#dqm-gui .dqm-card--enrolled { border-left-color: var(--dqm-accent); }\n#dqm-gui .dqm-card--ready-to-launch { border-left-color: var(--dqm-warning); }\n#dqm-gui .dqm-card--running {\n    border-left-color: var(--dqm-success-bright);\n    box-shadow: 0 0 0 1px rgba(87,242,135,.12), 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--running::after {\n    content: \"\"; position: absolute; top: 12px; inset-inline-end: 12px;\n    width: 8px; height: 8px; border-radius: 50%; background: var(--dqm-success-bright);\n    box-shadow: 0 0 0 0 rgba(87,242,135,.55); animation: dqm-pulse 1.6s infinite;\n}\n#dqm-gui .dqm-card { position: relative; }\n#dqm-gui .dqm-card--completed { border-left-color: var(--dqm-info); }\n#dqm-gui .dqm-card--claimed { border-left-color: var(--dqm-success); }\n#dqm-gui .dqm-card--error { border-left-color: var(--dqm-danger); }\n#dqm-gui .dqm-card--stopped { border-left-color: var(--dqm-text-muted); }\n#dqm-gui .dqm-card-name {\n    font-weight: 700; font-size: 14px; color: var(--dqm-text);\n    padding-inline-end: 16px; line-height: 1.3;\n}\n#dqm-gui .dqm-card-meta {\n    display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 12px;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-meta-item { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }\n#dqm-gui .dqm-meta-item b { font-weight: 650; color: var(--dqm-text-muted); }\n#dqm-gui .dqm-type-badge {\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;\n}\n#dqm-gui .dqm-orbs-val { color: var(--dqm-orbs); font-weight: 700; }\n#dqm-gui .dqm-status { font-weight: 700; }\n#dqm-gui .dqm-meta-country { grid-column: 1 / -1; }\n#dqm-gui .dqm-country-val {\n    display: inline-flex; align-items: center; gap: 6px; min-width: 0;\n}\n#dqm-gui .dqm-country-flag {\n    font-size: 14px; line-height: 1; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-label {\n    color: var(--dqm-text); font-weight: 650; font-size: 11px;\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;\n}\n#dqm-gui .dqm-country-extra {\n    color: var(--dqm-text-muted); font-weight: 700; font-size: 10px; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-select {\n    appearance: none; -webkit-appearance: none;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 6px;\n    padding: 2px 22px 2px 8px; font-size: 11px; font-weight: 600;\n    max-width: 100%; cursor: pointer; line-height: 1.4;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-select:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-select:disabled { opacity: 0.65; cursor: wait; }\n#dqm-gui .dqm-country-select:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-select option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui .dqm-progress-wrap { display: flex; flex-direction: column; gap: 4px; }\n#dqm-gui .dqm-progress-labels {\n    display: flex; justify-content: space-between; gap: 8px;\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 600;\n}\n#dqm-gui .dqm-progress-track {\n    width: 100%; height: 8px; background: var(--dqm-bg-secondary);\n    border-radius: 999px; overflow: hidden; direction: ltr;\n    box-shadow: inset 0 1px 3px rgba(0,0,0,.35);\n}\n#dqm-gui .quest-progress-bar {\n    height: 100%; width: 0; border-radius: 999px;\n    background: var(--dqm-accent);\n    transition: width .35s ease, background .25s ease;\n    box-shadow: 0 0 10px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-eta { font-size: 11px; color: var(--dqm-text-muted); }\n#dqm-gui .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }\n#dqm-gui .dqm-action-btn {\n    border: none; padding: 6px 11px; border-radius: 7px; cursor: pointer;\n    font-size: 11px; font-weight: 700; color: #fff; transition: filter .15s, transform .12s;\n}\n#dqm-gui .dqm-action-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }\n#dqm-gui .dqm-action-start { background: var(--dqm-success); }\n#dqm-gui .dqm-action-stop { background: var(--dqm-danger); }\n#dqm-gui .dqm-action-launch { background: var(--dqm-accent); }\n#dqm-gui .dqm-action-activate { background: var(--dqm-warning); color: #1e1f22; }\n#dqm-gui .dqm-action-activate:disabled { opacity: 0.6; cursor: wait; }\n#dqm-gui .dqm-action-claim { background: var(--dqm-orbs); color: #1e1f22; }\n#dqm-gui #dqm-logs {\n    background: var(--dqm-bg-secondary); font-family: Consolas, \"Courier New\", monospace;\n    font-size: 11px; padding: 10px 12px; height: 118px; min-height: 72px;\n    overflow-y: auto; border-top: 1px solid #000; color: var(--dqm-log);\n}\n#dqm-gui .dqm-log-line { margin-bottom: 2px; white-space: pre-wrap; word-break: break-word; }\n#dqm-gui .dqm-log-time { color: #6b7280; }\n#dqm-gui .dqm-log-level { font-weight: 700; }\n#dqm-gui .dqm-log--info .dqm-log-level { color: var(--dqm-info); }\n#dqm-gui .dqm-log--success .dqm-log-level { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-log--warning .dqm-log-level { color: var(--dqm-warning); }\n#dqm-gui .dqm-log--error .dqm-log-level { color: var(--dqm-danger); }\n#dqm-gui .dqm-log--debug .dqm-log-level { color: var(--dqm-text-muted); }\n#dqm-gui .dqm-log--running .dqm-log-level { color: var(--dqm-accent); }\n#dqm-mini-icon {\n    display: none; position: fixed; width: 52px; height: 52px; z-index: 999999;\n    border-radius: 16px; cursor: grab; user-select: none;\n    align-items: center; justify-content: center; font-size: 20px; color: #fff;\n    background: linear-gradient(145deg, var(--dqm-accent), #2d9d55);\n    border: 1px solid rgba(255,255,255,.12);\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 18px rgba(88,101,242,.3);\n    transition: transform .15s ease, box-shadow .15s ease;\n}\n#dqm-mini-icon:hover { transform: scale(1.06); }\n#dqm-mini-icon.dqm-mini--running {\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.5);\n    animation: dqm-pulse-ring 1.8s infinite;\n}\n@keyframes dqm-pulse {\n    0% { box-shadow: 0 0 0 0 rgba(87,242,135,.55); }\n    70% { box-shadow: 0 0 0 8px rgba(87,242,135,0); }\n    100% { box-shadow: 0 0 0 0 rgba(87,242,135,0); }\n}\n@keyframes dqm-pulse-ring {\n    0% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.45); }\n    70% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 12px rgba(87,242,135,0); }\n    100% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,0); }\n}\n@media (prefers-reduced-motion: reduce) {\n    #dqm-gui .dqm-card--running::after,\n    #dqm-mini-icon.dqm-mini--running { animation: none; }\n    #dqm-gui .quest-progress-bar,\n    #dqm-gui .dqm-btn { transition: none; }\n}\n#dqm-gui[dir=\"rtl\"] .dqm-card { border-left: 1px solid rgba(255,255,255,.04); border-right: 4px solid var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--not-enrolled { border-right-color: var(--dqm-warning); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--enrolled { border-right-color: var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--ready-to-launch { border-right-color: var(--dqm-warning); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--running { border-right-color: var(--dqm-success-bright); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--completed { border-right-color: var(--dqm-info); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--claimed { border-right-color: var(--dqm-success); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--error { border-right-color: var(--dqm-danger); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--stopped { border-right-color: var(--dqm-text-muted); }\n\n.dqm-modal-overlay {\n    position: fixed; inset: 0; z-index: 10000000;\n    background: rgba(0, 0, 0, 0.65);\n    display: flex; align-items: center; justify-content: center;\n    padding: 20px;\n}\n.dqm-modal {\n    width: min(480px, 100%); max-height: 90vh; overflow-y: auto;\n    background: var(--dqm-panel, #313338); color: var(--dqm-text, #f2f3f5);\n    border: 1px solid var(--dqm-border, #1e1f22);\n    border-radius: 12px; padding: 20px;\n    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);\n    font-family: \"gg sans\", \"Segoe UI\", Helvetica, Arial, sans-serif;\n}\n.dqm-modal-title {\n    margin: 0 0 8px; font-size: 18px; font-weight: 700;\n}\n.dqm-modal-desc {\n    margin: 0 0 14px; font-size: 13px; color: var(--dqm-text-muted, #b5bac1); line-height: 1.5;\n}\n.dqm-modal-steps {\n    margin: 0 0 16px; padding-left: 20px; font-size: 13px;\n    color: var(--dqm-text, #f2f3f5); line-height: 1.6;\n}\n.dqm-modal-steps li { margin-bottom: 8px; }\n.dqm-modal-error {\n    margin-bottom: 12px; padding: 10px 12px; border-radius: 8px;\n    background: rgba(237, 66, 69, 0.12); border: 1px solid rgba(237, 66, 69, 0.3);\n    color: #ed4245; font-size: 12px;\n}\n.dqm-modal-footer {\n    display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end;\n}\n.dqm-modal-footer .dqm-btn { font-size: 12px; padding: 8px 14px; border-radius: 8px; border: none; cursor: pointer; font-weight: 650; }\n.dqm-modal-footer .dqm-btn-gray { background: var(--dqm-panel-hover, #383a40); color: var(--dqm-text, #f2f3f5); }\n.dqm-modal-footer .dqm-btn-blurple { background: var(--dqm-accent, #5865F2); color: #fff; }\n");
+    injectDqmStyles("#dqm-gui, #dqm-mini-icon {\n    --dqm-bg: #2b2d31;\n    --dqm-bg-secondary: #1e1f22;\n    --dqm-panel: #313338;\n    --dqm-panel-hover: #383a40;\n    --dqm-surface: #2b2d31;\n    --dqm-border: #1e1f22;\n    --dqm-text: #f2f3f5;\n    --dqm-text-muted: #b5bac1;\n    --dqm-accent: #5865F2;\n    --dqm-accent-hover: #4752c4;\n    --dqm-success: #248046;\n    --dqm-success-bright: #57F287;\n    --dqm-warning: #faa61a;\n    --dqm-orbs: #f0b232;\n    --dqm-danger: #ed4245;\n    --dqm-info: #00b0f4;\n    --dqm-log: #4ade80;\n    --dqm-radius: 14px;\n    --dqm-shadow: 0 16px 48px rgba(0,0,0,.55), 0 0 0 1px rgba(88,101,242,.12);\n}\n#dqm-gui {\n    position: fixed; top: 100px; right: 30px; width: 540px; height: 680px;\n    min-width: 420px; min-height: 480px; z-index: 999999; resize: both;\n    display: flex; flex-direction: column; overflow: hidden;\n    color: var(--dqm-text);\n    font-family: \"gg sans\", \"Segoe UI\", \"Helvetica Neue\", Helvetica, Arial, sans-serif;\n    border-radius: var(--dqm-radius);\n    border: 1px solid var(--dqm-border);\n    box-shadow: var(--dqm-shadow);\n    background:\n        linear-gradient(165deg, rgba(88,101,242,.08) 0%, transparent 42%),\n        linear-gradient(180deg, var(--dqm-bg) 0%, var(--dqm-panel) 48%, #2a2c31 100%);\n}\n#dqm-gui * { box-sizing: border-box; }\n#dqm-gui button:focus-visible,\n#dqm-gui .tab-btn:focus-visible {\n    outline: 2px solid var(--dqm-accent);\n    outline-offset: 2px;\n}\n#dqm-gui .dqm-header {\n    display: flex; flex-direction: column; gap: 8px;\n    padding: 12px 14px 10px; background: rgba(30,31,34,.72);\n    border-bottom: 1px solid var(--dqm-border); cursor: grab; user-select: none;\n    backdrop-filter: blur(8px);\n}\n#dqm-gui .dqm-header-top {\n    display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-brand {\n    display: flex; align-items: center; gap: 10px; min-width: 0;\n}\n#dqm-gui .dqm-brand-mark {\n    width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;\n    background: linear-gradient(145deg, var(--dqm-accent), #7289da);\n    box-shadow: 0 0 18px rgba(88,101,242,.35); font-size: 16px; flex-shrink: 0;\n}\n#dqm-gui .dqm-brand-text { display: flex; flex-direction: column; min-width: 0; }\n#dqm-gui #dqm-title {\n    font-weight: 700; font-size: 16px; letter-spacing: .2px; color: var(--dqm-text);\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n}\n#dqm-gui .dqm-subtitle {\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 500;\n}\n#dqm-gui .dqm-win-btns { display: flex; gap: 2px; }\n#dqm-gui .dqm-btn-icon {\n    background: transparent; border: none; color: var(--dqm-text-muted);\n    cursor: pointer; font-size: 16px; width: 32px; height: 28px; border-radius: 6px;\n    line-height: 1;\n}\n#dqm-gui .dqm-btn-icon:hover { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-icon.dqm-close:hover { background: var(--dqm-danger); color: #fff; }\n#dqm-gui .dqm-stats {\n    display: flex; gap: 6px; flex-wrap: wrap;\n}\n#dqm-gui .dqm-chip {\n    display: inline-flex; align-items: center; gap: 5px;\n    background: var(--dqm-bg-secondary); border: 1px solid rgba(255,255,255,.04);\n    padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-chip strong { color: var(--dqm-text); font-weight: 700; }\n#dqm-gui .dqm-chip--orbs { color: var(--dqm-orbs); }\n#dqm-gui .dqm-chip--nitro {\n    color: #f0b132;\n    border-color: rgba(240,177,50,.35);\n}\n#dqm-gui .dqm-chip--run { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-chip--location { color: var(--dqm-info); }\n#dqm-gui .dqm-chip--version {\n    color: var(--dqm-accent);\n    border-color: rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-toolbar {\n    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;\n}\n#dqm-gui .dqm-toolbar-primary .dqm-btn {\n    padding: 8px 14px;\n}\n#dqm-gui .dqm-toolbar-secondary {\n    gap: 5px;\n}\n#dqm-gui .dqm-btn-nitro {\n    background: linear-gradient(180deg, #f0c14b, #c89b2c);\n    color: #1a1a1a;\n    box-shadow: 0 4px 14px rgba(200,155,44,.35);\n}\n#dqm-gui .dqm-btn-nitro:disabled {\n    opacity: .55;\n    cursor: not-allowed;\n    transform: none;\n    box-shadow: none;\n}\n#dqm-gui .dqm-update-group {\n    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;\n    margin-left: auto; min-width: 0; max-width: 100%;\n}\n#dqm-gui .dqm-update-status {\n    min-width: 0; max-width: 200px; font-size: 11px; color: var(--dqm-text-muted);\n    font-weight: 600; line-height: 1.3;\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n}\n#dqm-gui .dqm-update--ok { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-update--warn { color: var(--dqm-warning); }\n#dqm-gui .dqm-update--err { color: var(--dqm-danger); }\n#dqm-gui .dqm-btn-sm { padding: 5px 10px; font-size: 11px; border-radius: 7px; }\n#dqm-gui .dqm-card--claimable {\n    border-color: rgba(0,176,244,.35);\n}\n#dqm-gui .dqm-btn {\n    border: none; cursor: pointer; font-size: 12px; padding: 7px 12px;\n    border-radius: 8px; font-weight: 650; color: #fff;\n    transition: background .15s ease, transform .12s ease, box-shadow .15s ease;\n}\n#dqm-gui .dqm-btn:hover { transform: translateY(-1px); }\n#dqm-gui .dqm-btn:active { transform: translateY(0); }\n#dqm-gui .dqm-btn-green {\n    background: linear-gradient(180deg, #2d9d55, var(--dqm-success));\n    box-shadow: 0 4px 14px rgba(36,128,70,.35);\n}\n#dqm-gui .dqm-btn-danger {\n    background: linear-gradient(180deg, #f04747, var(--dqm-danger));\n}\n#dqm-gui .dqm-btn-gray { background: var(--dqm-panel-hover); color: var(--dqm-text); }\n#dqm-gui .dqm-btn-blurple {\n    background: linear-gradient(180deg, #6a76f4, var(--dqm-accent));\n    box-shadow: 0 4px 14px rgba(88,101,242,.28);\n}\n#dqm-gui .dqm-batch {\n    margin: 0 16px; padding: 8px 12px; border-radius: 8px;\n    background: rgba(88,101,242,.12); border: 1px solid rgba(88,101,242,.25);\n    font-size: 12px; color: var(--dqm-text); font-weight: 600;\n}\n#dqm-gui .dqm-tabs {\n    display: flex; gap: 8px; align-items: center; padding: 8px 14px;\n    background: rgba(30,31,34,.45); border-bottom: 1px solid var(--dqm-border);\n    flex-wrap: wrap;\n}\n#dqm-gui .tab-btn {\n    border: none; padding: 6px 12px; border-radius: 999px; font-size: 11px;\n    font-weight: 650; cursor: pointer; background: var(--dqm-panel-hover);\n    color: var(--dqm-text-muted); transition: background .15s, color .15s;\n}\n#dqm-gui .tab-btn .tab-label { line-height: 1.2; }\n#dqm-gui .tab-btn.active {\n    background: var(--dqm-accent); color: #fff;\n    box-shadow: 0 0 0 1px rgba(88,101,242,.4), 0 4px 12px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-country-filter-wrap {\n    margin-left: auto; display: flex; flex-direction: column; gap: 2px;\n    align-items: flex-end; min-width: 0; max-width: 160px;\n}\n#dqm-gui .dqm-country-filter-label {\n    font-size: 10px; color: var(--dqm-text-muted); font-weight: 600;\n    white-space: nowrap;\n}\n#dqm-gui .dqm-country-filter {\n    appearance: none; -webkit-appearance: none;\n    width: 100%; max-width: 180px;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 8px;\n    padding: 5px 24px 5px 10px; font-size: 11px; font-weight: 600;\n    cursor: pointer; line-height: 1.3;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-filter:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-filter:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-filter option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui[dir=\"rtl\"] .dqm-country-filter-wrap { margin-left: 0; margin-right: auto; align-items: flex-start; }\n#dqm-gui #dqm-list {\n    padding: 12px 14px; overflow-y: auto; flex: 1;\n    display: flex; flex-direction: column; gap: 10px;\n}\n#dqm-gui #dqm-list::-webkit-scrollbar { width: 8px; }\n#dqm-gui #dqm-list::-webkit-scrollbar-thumb {\n    background: #4e5058; border-radius: 8px;\n}\n#dqm-gui .dqm-empty {\n    text-align: center; color: var(--dqm-text-muted); padding: 36px 16px; font-size: 14px;\n}\n#dqm-gui .dqm-card {\n    background: linear-gradient(180deg, rgba(43,45,49,.95), rgba(35,37,41,.98));\n    padding: 12px 14px; border-radius: 12px;\n    border: 1px solid rgba(255,255,255,.04);\n    border-left: 4px solid var(--dqm-accent);\n    display: flex; flex-direction: column; gap: 8px;\n    box-shadow: 0 6px 18px rgba(0,0,0,.22);\n    transition: border-color .2s, box-shadow .2s, background .2s;\n}\n#dqm-gui .dqm-card:hover {\n    background: linear-gradient(180deg, rgba(48,50,55,.98), rgba(38,40,45,.98));\n    box-shadow: 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--not-enrolled { border-left-color: var(--dqm-warning); }\n#dqm-gui .dqm-card--enrolled { border-left-color: var(--dqm-accent); }\n#dqm-gui .dqm-card--ready-to-launch { border-left-color: var(--dqm-warning); }\n#dqm-gui .dqm-card--running {\n    border-left-color: var(--dqm-success-bright);\n    box-shadow: 0 0 0 1px rgba(87,242,135,.12), 0 8px 22px rgba(0,0,0,.28);\n}\n#dqm-gui .dqm-card--running::after {\n    content: \"\"; position: absolute; top: 12px; inset-inline-end: 12px;\n    width: 8px; height: 8px; border-radius: 50%; background: var(--dqm-success-bright);\n    box-shadow: 0 0 0 0 rgba(87,242,135,.55); animation: dqm-pulse 1.6s infinite;\n}\n#dqm-gui .dqm-card { position: relative; }\n#dqm-gui .dqm-card--completed { border-left-color: var(--dqm-info); }\n#dqm-gui .dqm-card--claimed { border-left-color: var(--dqm-success); }\n#dqm-gui .dqm-card--error { border-left-color: var(--dqm-danger); }\n#dqm-gui .dqm-card--stopped { border-left-color: var(--dqm-text-muted); }\n#dqm-gui .dqm-card-name {\n    font-weight: 700; font-size: 14px; color: var(--dqm-text);\n    padding-inline-end: 16px; line-height: 1.3;\n}\n#dqm-gui .dqm-card-meta {\n    display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 12px;\n    color: var(--dqm-text-muted);\n}\n#dqm-gui .dqm-meta-item { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }\n#dqm-gui .dqm-meta-item b { font-weight: 650; color: var(--dqm-text-muted); }\n#dqm-gui .dqm-type-badge {\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;\n}\n#dqm-gui .dqm-orbs-val { color: var(--dqm-orbs); font-weight: 700; }\n#dqm-gui .dqm-status { font-weight: 700; }\n#dqm-gui .dqm-meta-country { grid-column: 1 / -1; }\n#dqm-gui .dqm-country-val {\n    display: inline-flex; align-items: center; gap: 6px; min-width: 0;\n}\n#dqm-gui .dqm-country-flag {\n    font-size: 14px; line-height: 1; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-label {\n    color: var(--dqm-text); font-weight: 650; font-size: 11px;\n    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;\n}\n#dqm-gui .dqm-country-extra {\n    color: var(--dqm-text-muted); font-weight: 700; font-size: 10px; flex-shrink: 0;\n}\n#dqm-gui .dqm-country-select {\n    appearance: none; -webkit-appearance: none;\n    background: var(--dqm-bg-secondary); color: var(--dqm-text);\n    border: 1px solid rgba(255,255,255,.08); border-radius: 6px;\n    padding: 2px 22px 2px 8px; font-size: 11px; font-weight: 600;\n    max-width: 100%; cursor: pointer; line-height: 1.4;\n    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),\n        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);\n    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);\n    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;\n}\n#dqm-gui .dqm-country-select:hover { border-color: rgba(255,255,255,.16); }\n#dqm-gui .dqm-country-select:disabled { opacity: 0.65; cursor: wait; }\n#dqm-gui .dqm-country-select:focus {\n    outline: none; border-color: var(--dqm-accent);\n    box-shadow: 0 0 0 1px rgba(88,101,242,.35);\n}\n#dqm-gui .dqm-country-select option { background: #1e1f22; color: var(--dqm-text); }\n#dqm-gui .dqm-progress-wrap { display: flex; flex-direction: column; gap: 4px; }\n#dqm-gui .dqm-progress-labels {\n    display: flex; justify-content: space-between; gap: 8px;\n    font-size: 11px; color: var(--dqm-text-muted); font-weight: 600;\n}\n#dqm-gui .dqm-progress-track {\n    width: 100%; height: 8px; background: var(--dqm-bg-secondary);\n    border-radius: 999px; overflow: hidden; direction: ltr;\n    box-shadow: inset 0 1px 3px rgba(0,0,0,.35);\n}\n#dqm-gui .quest-progress-bar {\n    height: 100%; width: 0; border-radius: 999px;\n    background: var(--dqm-accent);\n    transition: width .35s ease, background .25s ease;\n    box-shadow: 0 0 10px rgba(88,101,242,.25);\n}\n#dqm-gui .dqm-eta { font-size: 11px; color: var(--dqm-text-muted); }\n#dqm-gui .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }\n#dqm-gui .dqm-action-btn {\n    border: none; padding: 6px 11px; border-radius: 7px; cursor: pointer;\n    font-size: 11px; font-weight: 700; color: #fff; transition: filter .15s, transform .12s;\n}\n#dqm-gui .dqm-action-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }\n#dqm-gui .dqm-action-start { background: var(--dqm-success); }\n#dqm-gui .dqm-action-stop { background: var(--dqm-danger); }\n#dqm-gui .dqm-action-launch { background: var(--dqm-accent); }\n#dqm-gui .dqm-action-link {\n    background: transparent;\n    color: var(--dqm-info);\n    border: 1px solid rgba(0,176,244,.35);\n    box-shadow: none;\n}\n#dqm-gui .dqm-action-link:hover {\n    background: rgba(0,176,244,.12);\n    filter: none;\n}\n#dqm-gui .dqm-action-activate { background: var(--dqm-warning); color: #1e1f22; }\n#dqm-gui .dqm-action-activate:disabled { opacity: 0.6; cursor: wait; }\n#dqm-gui .dqm-action-claim { background: var(--dqm-orbs); color: #1e1f22; }\n#dqm-gui #dqm-logs {\n    background: var(--dqm-bg-secondary); font-family: Consolas, \"Courier New\", monospace;\n    font-size: 11px; padding: 10px 12px; height: 118px; min-height: 72px;\n    overflow-y: auto; border-top: 1px solid #000; color: var(--dqm-log);\n}\n#dqm-gui .dqm-log-line { margin-bottom: 2px; white-space: pre-wrap; word-break: break-word; }\n#dqm-gui .dqm-log-time { color: #6b7280; }\n#dqm-gui .dqm-log-level { font-weight: 700; }\n#dqm-gui .dqm-log--info .dqm-log-level { color: var(--dqm-info); }\n#dqm-gui .dqm-log--success .dqm-log-level { color: var(--dqm-success-bright); }\n#dqm-gui .dqm-log--warning .dqm-log-level { color: var(--dqm-warning); }\n#dqm-gui .dqm-log--error .dqm-log-level { color: var(--dqm-danger); }\n#dqm-gui .dqm-log--debug .dqm-log-level { color: var(--dqm-text-muted); }\n#dqm-gui .dqm-log--running .dqm-log-level { color: var(--dqm-accent); }\n#dqm-mini-icon {\n    display: none; position: fixed; width: 52px; height: 52px; z-index: 999999;\n    border-radius: 16px; cursor: grab; user-select: none;\n    align-items: center; justify-content: center; font-size: 20px; color: #fff;\n    background: linear-gradient(145deg, var(--dqm-accent), #2d9d55);\n    border: 1px solid rgba(255,255,255,.12);\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 18px rgba(88,101,242,.3);\n    transition: transform .15s ease, box-shadow .15s ease;\n}\n#dqm-mini-icon:hover { transform: scale(1.06); }\n#dqm-mini-icon.dqm-mini--running {\n    box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.5);\n    animation: dqm-pulse-ring 1.8s infinite;\n}\n@keyframes dqm-pulse {\n    0% { box-shadow: 0 0 0 0 rgba(87,242,135,.55); }\n    70% { box-shadow: 0 0 0 8px rgba(87,242,135,0); }\n    100% { box-shadow: 0 0 0 0 rgba(87,242,135,0); }\n}\n@keyframes dqm-pulse-ring {\n    0% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,.45); }\n    70% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 12px rgba(87,242,135,0); }\n    100% { box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(87,242,135,0); }\n}\n@media (prefers-reduced-motion: reduce) {\n    #dqm-gui .dqm-card--running::after,\n    #dqm-mini-icon.dqm-mini--running { animation: none; }\n    #dqm-gui .quest-progress-bar,\n    #dqm-gui .dqm-btn { transition: none; }\n}\n#dqm-gui[dir=\"rtl\"] .dqm-card { border-left: 1px solid rgba(255,255,255,.04); border-right: 4px solid var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--not-enrolled { border-right-color: var(--dqm-warning); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--enrolled { border-right-color: var(--dqm-accent); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--ready-to-launch { border-right-color: var(--dqm-warning); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--running { border-right-color: var(--dqm-success-bright); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--completed { border-right-color: var(--dqm-info); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--claimed { border-right-color: var(--dqm-success); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--error { border-right-color: var(--dqm-danger); }\n#dqm-gui[dir=\"rtl\"] .dqm-card--stopped { border-right-color: var(--dqm-text-muted); }\n\n.dqm-modal-overlay {\n    position: fixed; inset: 0; z-index: 10000000;\n    background: rgba(0, 0, 0, 0.65);\n    display: flex; align-items: center; justify-content: center;\n    padding: 20px;\n}\n.dqm-modal {\n    width: min(480px, 100%); max-height: 90vh; overflow-y: auto;\n    background: var(--dqm-panel, #313338); color: var(--dqm-text, #f2f3f5);\n    border: 1px solid var(--dqm-border, #1e1f22);\n    border-radius: 12px; padding: 20px;\n    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);\n    font-family: \"gg sans\", \"Segoe UI\", Helvetica, Arial, sans-serif;\n}\n.dqm-modal-title {\n    margin: 0 0 8px; font-size: 18px; font-weight: 700;\n}\n.dqm-modal-desc {\n    margin: 0 0 14px; font-size: 13px; color: var(--dqm-text-muted, #b5bac1); line-height: 1.5;\n}\n.dqm-modal-steps {\n    margin: 0 0 16px; padding-left: 20px; font-size: 13px;\n    color: var(--dqm-text, #f2f3f5); line-height: 1.6;\n}\n.dqm-modal-steps li { margin-bottom: 8px; }\n.dqm-modal-error {\n    margin-bottom: 12px; padding: 10px 12px; border-radius: 8px;\n    background: rgba(237, 66, 69, 0.12); border: 1px solid rgba(237, 66, 69, 0.3);\n    color: #ed4245; font-size: 12px;\n}\n.dqm-modal-footer {\n    display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end;\n}\n.dqm-modal-footer .dqm-btn { font-size: 12px; padding: 8px 14px; border-radius: 8px; border: none; cursor: pointer; font-weight: 650; }\n.dqm-modal-footer .dqm-btn-gray { background: var(--dqm-panel-hover, #383a40); color: var(--dqm-text, #f2f3f5); }\n.dqm-modal-footer .dqm-btn-blurple { background: var(--dqm-accent, #5865F2); color: #fff; }\n");
 
     const { ok, missing } = await initializeDiscordModules();
     if (!ok) {

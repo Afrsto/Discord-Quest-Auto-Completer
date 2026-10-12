@@ -3,9 +3,9 @@
  * Launch Quest / Activity quest completion — ported from Discord Quest Helper
  */
 
-// Match Discord Quest Helper defaults (new installs; localStorage overrides still win).
-const DEFAULT_CHECKPOINT_MIN_SECS = 180;
-const DEFAULT_CHECKPOINT_MAX_SECS = 300;
+// Minimum safe wait Discord tooling allows (new installs; localStorage overrides still win).
+const DEFAULT_CHECKPOINT_MIN_SECS = 30;
+const DEFAULT_CHECKPOINT_MAX_SECS = 30;
 const CHECKPOINT_MIN_LIMIT = 30;
 const CHECKPOINT_MAX_LIMIT = 600;
 export const STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY = "questHelper_activityCheckpointMin";
@@ -41,6 +41,13 @@ export function getActivityCheckpointSettings() {
     let minSecs = DEFAULT_CHECKPOINT_MIN_SECS;
     let maxSecs = DEFAULT_CHECKPOINT_MAX_SECS;
     try {
+        // Migrate legacy DQH defaults (180–300) to the 30s floor so ETA matches v1.0.4 hotfix.
+        const rawMin = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY);
+        const rawMax = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY);
+        if (rawMin === "180" && (rawMax == null || rawMax === "300")) {
+            localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY, "30");
+            localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY, "30");
+        }
         const savedMin = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY);
         const savedMax = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY);
         if (savedMin != null) {
@@ -253,6 +260,17 @@ const JS_ACTIVITY_HELPERS = `
             && value.code === 4002
             && String(value.message || "").includes("Quest not found");
     }
+
+    function isAuthPendingQuestStartTimerError(value) {
+        if (!value) return false;
+        const code = typeof value === "object" ? value.code : null;
+        const msg = typeof value === "object"
+            ? String(value.message || value.error || "")
+            : String(value);
+        return code === 4005
+            || code === 4006
+            || /not authenticated|invalid scope|"code":\\s*4005|"code":\\s*4006/i.test(msg);
+    }
 `;
 
 export function getTaskConfig(quest) {
@@ -434,6 +452,16 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             // DQH: benign 4002 "Quest not found" with valid iframe quest context → continue.
             if (isKnownBenignQuestStartTimerError(e) && hasRetryableQuestContext) {
                 startTimerIgnored = true;
+            } else if (isAuthPendingQuestStartTimerError(e)) {
+                return JSON.stringify({
+                    success: false,
+                    errorCode: "AUTH_PENDING",
+                    error: "questStartTimer failed: " + startTimerError,
+                    effectiveQuestId,
+                    boundQuestId,
+                    commands,
+                    waitedMs
+                });
             } else {
                 return JSON.stringify({
                     success: false,
@@ -450,6 +478,16 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             startTimerError = describeError(startTimerResult);
             if (isKnownBenignQuestStartTimerError(startTimerResult) && hasRetryableQuestContext) {
                 startTimerIgnored = true;
+            } else if (isAuthPendingQuestStartTimerError(startTimerResult)) {
+                return JSON.stringify({
+                    success: false,
+                    errorCode: "AUTH_PENDING",
+                    error: "questStartTimer returned failure: " + startTimerError,
+                    effectiveQuestId,
+                    boundQuestId,
+                    commands,
+                    waitedMs
+                });
             } else {
                 return JSON.stringify({
                     success: false,
@@ -929,7 +967,7 @@ function isInitRetryableError(initResult) {
     if (isSdkNotReadyError(initResult)) return true;
     if (isQuestNotReadyError(initResult)) return true;
     const err = String(initResult.error || "");
-    return /not authenticated|invalid scope|"code":\s*4006/i.test(err);
+    return /not authenticated|invalid scope|"code":\s*4005|"code":\s*4006/i.test(err);
 }
 
 async function initActivityWithRetry(applicationId, questId, taskState, sleep, log, t, questName, allowedQuestIds = []) {
@@ -1157,12 +1195,21 @@ export function createActivityExecutors(deps) {
             }
 
             if (initResult.startTimerIgnored) {
-                // Match DQH: benign questStartTimer rejection with valid quest context → continue.
+                // Match DQH: benign questStartTimer rejection with valid quest context → retry.
                 log.warn(`[${questName}] ${t("logActivityStartTimerIgnored")}${initResult.startTimerError || ""}`);
-                await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
+                const timerOk = await retryQuestStartTimer(applicationId, questId, sleep, log, t, questName);
+                if (!timerOk) {
+                    // Do not continue to fake checkpoints without an active timer.
+                    log.error(`[${questName}] ${t("logActivityTimerRequired")}`);
+                    log.warn(`[${questName}] ${t("logActivityAuthPending")}`);
+                    return false;
+                }
             }
 
             // Active quest only — do not max() with regional siblings.
+            try {
+                await apiGet({ url: "/quests/@me" });
+            } catch (_) {}
             const freshCompleted = await resolveCompletedCheckpointsAsync(
                 questId, taskName, checkpointCount, QuestsStore, apiGet
             );
