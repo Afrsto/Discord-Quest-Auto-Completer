@@ -1731,9 +1731,8 @@ const NITRO_3DAY_SKU_ID = "1333912750274904064";
 const NITRO_3DAY_ORB_PRICE = 1400;
 const STORAGE_PURCHASE_TOKEN_KEY = "questHelper_purchaseToken";
 
-/** Entitlement types that can represent Nitro Credits (not full PREMIUM_SUBSCRIPTION=2). */
+/** Fractional / Orbs credit redemptions (not bare QUEST_REWARD=10, not full PREMIUM=2). */
 const NITRO_CREDIT_ENTITLEMENT_TYPES = new Set([
-    10, // QUEST_REWARD
     11, // FRACTIONAL_REDEMPTION
     12, // VIRTUAL_CURRENCY_REDEMPTION
 ]);
@@ -1801,9 +1800,10 @@ function isNitroCreditEntitlement(item) {
     const type = Number(item.type);
     if (type === 2) return false;
     if (skuProductLine(item) === 1) return false;
-    if (NITRO_CREDIT_ENTITLEMENT_TYPES.has(type)) return true;
+    // True Nitro Credits only — not every quest reward (type 10).
     if (skuProductLine(item) === SKU_PRODUCT_LINE_FRACTIONAL_PREMIUM) return true;
     if (entitlementSkuId(item) === NITRO_3DAY_SKU_ID) return true;
+    if (NITRO_CREDIT_ENTITLEMENT_TYPES.has(type)) return true;
     return false;
 }
 
@@ -1829,10 +1829,7 @@ function bankedCreditDurationMs(item) {
     const m = label.match(/(\d+)\s*-?\s*day/i);
     if (m) return Math.max(1, Number(m[1])) * MS_PER_DAY;
 
-    const type = Number(item?.type);
-    if (type === 11 || type === 12 || skuProductLine(item) === SKU_PRODUCT_LINE_FRACTIONAL_PREMIUM) {
-        return 3 * MS_PER_DAY;
-    }
+    // No guessed default duration — avoids inflating the chip past Discord's Credits End In.
     return 0;
 }
 
