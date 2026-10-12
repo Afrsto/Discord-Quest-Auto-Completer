@@ -61,7 +61,7 @@ call :step 2 9 "Checking Git ..."
 call :refresh_path
 where git >nul 2>&1
 if not errorlevel 1 (
-    for /f "tokens=3 delims= " %%V in ('git --version 2^>nul') do call :ok "Git %%V"
+    for /f "delims=" %%V in ('git --version 2^>nul') do call :ok "%%V"
     goto :step3
 )
 
@@ -74,7 +74,7 @@ if errorlevel 1 (
 )
 where git >nul 2>&1
 if errorlevel 1 goto :err_git
-for /f "tokens=3 delims= " %%V in ('git --version 2^>nul') do call :ok "Git %%V installed"
+for /f "delims=" %%V in ('git --version 2^>nul') do call :ok "%%V installed"
 goto :step3
 
 :step3
