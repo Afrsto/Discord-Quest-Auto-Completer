@@ -27,7 +27,7 @@ const HEADER = `// Quests Manager — paste into Discord DevTools Console (Ctrl+
 const USERSCRIPT_HEADER = `// ==UserScript==
 // @name         Quests Manager
 // @namespace    https://discord.gg/btRCeujadA
-// @version      1.0.3
+// @version      1.0.4
 // @description  Discord Quest Auto Completer — rework by X2 Salah
 // @author       X2 Salah
 // @match        https://discord.com/*
@@ -253,10 +253,12 @@ async function build() {
     const bootstrap = fs.readFileSync(path.join(__dirname, "userscript-bootstrap.js"), "utf8");
     const extraCss = fs.readFileSync(path.join(__dirname, "userscript-extra.css"), "utf8");
     const activityQuest = fs.readFileSync(path.join(PLUGIN, "activityQuest.ts"), "utf8");
+    const nitroOrbs = fs.readFileSync(path.join(PLUGIN, "nitroOrbs.ts"), "utf8");
     const manager = fs.readFileSync(path.join(PLUGIN, "manager.ts"), "utf8");
     const styles = fs.readFileSync(path.join(PLUGIN, "styles.css"), "utf8");
 
     const activityJs = patchActivityQuestForConsole(activityQuest);
+    const nitroJs = stripTsSource(nitroOrbs);
     const managerJs = patchManagerForConsole(manager);
     const regionsInject = `globalThis.__DQM_REGIONS_SNAPSHOT = ${JSON.stringify(byId)};\n`;
 
@@ -312,6 +314,8 @@ ${runtime}
 ${regionsInject}
 ${activityJs}
 
+${nitroJs}
+
 ${managerJs}
 
 ${consoleFooter}
@@ -327,6 +331,8 @@ ${bootstrap}
 
 ${regionsInject}
 ${activityJs}
+
+${nitroJs}
 
 ${managerJs}
 

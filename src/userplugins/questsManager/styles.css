@@ -82,6 +82,10 @@
 }
 #dqm-gui .dqm-chip strong { color: var(--dqm-text); font-weight: 700; }
 #dqm-gui .dqm-chip--orbs { color: var(--dqm-orbs); }
+#dqm-gui .dqm-chip--nitro {
+    color: #f0b132;
+    border-color: rgba(240,177,50,.35);
+}
 #dqm-gui .dqm-chip--run { color: var(--dqm-success-bright); }
 #dqm-gui .dqm-chip--location { color: var(--dqm-info); }
 #dqm-gui .dqm-chip--version {
@@ -90,6 +94,17 @@
 }
 #dqm-gui .dqm-toolbar {
     display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+}
+#dqm-gui .dqm-btn-nitro {
+    background: linear-gradient(180deg, #f0c14b, #c89b2c);
+    color: #1a1a1a;
+    box-shadow: 0 4px 14px rgba(200,155,44,.35);
+}
+#dqm-gui .dqm-btn-nitro:disabled {
+    opacity: .55;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
 }
 #dqm-gui .dqm-update-group {
     display: flex; gap: 6px; flex-wrap: wrap; align-items: center;

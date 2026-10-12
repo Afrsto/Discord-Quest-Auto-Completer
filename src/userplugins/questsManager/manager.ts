@@ -24,6 +24,11 @@ import {
 } from "./activityQuest";
 import regionsSnapshotFile from "./regions.snapshot.json";
 import {
+    fetchNitroDaysRemaining,
+    NITRO_3DAY_ORB_PRICE,
+    purchaseThreeDayNitroCredit
+} from "./nitroOrbs";
+import {
     applyPluginUpdate,
     checkForPluginUpdate,
     getPluginVersionLabel,
@@ -176,6 +181,10 @@ export function mountQuestsManager() {
     const activeCleanups = new Set();
     let gameDetectHold = null;
     let userOrbsBalance = null;
+    let userNitroDays = null;
+    let nitroPurchaseInFlight = false;
+    /** Quests returned by /quests/@me that are missing from QuestsStore. */
+    const apiQuestOverrides = new Map();
     const claimsInFlight = new Set();
     const acceptsInFlight = new Set();
     const launchesInFlight = new Set();
@@ -216,10 +225,20 @@ export function mountQuestsManager() {
         en: {
             title: "Quests Manager",
             btnComplete: "Complete All",
+            btnGetNitro: "Get 3-day Nitro",
             btnStopAll: "Stop All",
             btnRefresh: "Refresh",
             btnCopy: "Copy logs",
             btnLang: "عربي",
+            statNitro: "Nitro",
+            nitroDaysUnit: "d",
+            logNitroConfirm: "Spend {price} Orbs on 3-day Nitro Credit?",
+            logNitroBuying: "Buying 3-day Nitro with Orbs…",
+            logNitroSuccess: "3-day Nitro Credit purchased.",
+            logNitroFailed: "Nitro purchase failed: ",
+            logNitroAuthRequired: "Discord requires purchase authorization. Check your email, authorize this client, then retry.",
+            logNitroInsufficient: "Not enough Orbs (need {price}).",
+            logBatchSkipLaunch: "Skipping {n} Launch Quest(s) — activate manually.",
             btnMinimize: "Minimize",
             btnClose: "Close",
             tabIncomplete: "Incomplete",
@@ -259,7 +278,7 @@ export function mountQuestsManager() {
             logAlreadyRunning: "Quest already being processed.",
             logCompleted: "Completed!",
             logAPIError: "API error: ",
-            logNoQuests: "No incomplete quests to execute.",
+            logNoQuests: "No incomplete quests to execute (Launch Quests are manual).",
             logBatchStart: "Starting automatic execution for ",
             logBatchEnd: " quest(s)…",
             logAllDone: "All quests processed.",
@@ -390,10 +409,20 @@ export function mountQuestsManager() {
         ar: {
             title: "مدير المهام",
             btnComplete: "إكمال الكل",
+            btnGetNitro: "نيترو 3 أيام",
             btnStopAll: "إيقاف الكل",
             btnRefresh: "تحديث",
             btnCopy: "نسخ السجلات",
             btnLang: "English",
+            statNitro: "نيترو",
+            nitroDaysUnit: "ي",
+            logNitroConfirm: "إنفاق {price} أورب على رصيد نيترو لـ 3 أيام؟",
+            logNitroBuying: "جاري شراء نيترو 3 أيام بالأورب…",
+            logNitroSuccess: "تم شراء رصيد نيترو لـ 3 أيام.",
+            logNitroFailed: "فشل شراء النيترو: ",
+            logNitroAuthRequired: "ديسكورد يتطلب تفويض الشراء. تحقق من بريدك، صرّح لهذا العميل، ثم أعد المحاولة.",
+            logNitroInsufficient: "أورب غير كافٍ (يلزم {price}).",
+            logBatchSkipLaunch: "تخطي {n} من مهام التشغيل — فعّلها يدوياً.",
             btnMinimize: "تصغير",
             btnClose: "إغلاق",
             tabIncomplete: "غير مكتملة",
@@ -433,7 +462,7 @@ export function mountQuestsManager() {
             logAlreadyRunning: "المهمة قيد المعالجة بالفعل.",
             logCompleted: "مكتملة!",
             logAPIError: "خطأ في API: ",
-            logNoQuests: "لا توجد مهام غير مكتملة.",
+            logNoQuests: "لا توجد مهام غير مكتملة للتنفيذ (مهام التشغيل يدوية).",
             logBatchStart: "بدء التنفيذ لـ ",
             logBatchEnd: " مهمة(مهام)…",
             logAllDone: "تمت معالجة جميع المهام.",
@@ -1503,11 +1532,32 @@ export function mountQuestsManager() {
         return { type, label, taskName };
     };
 
+    const resolveQuestDisplayName = (quest) => {
+        const msgs = quest?.config?.messages || {};
+        const name = (
+            msgs.questName
+            || msgs.quest_name
+            || quest?.config?.application?.name
+            || ""
+        ).trim();
+        return name || String(quest?.id || "Unknown");
+    };
+
     const getAllStoreQuests = () => {
         const raw = QuestsStore?.quests;
-        if (!raw) return [];
-        const values = typeof raw.values === "function" ? [...raw.values()] : Object.values(raw);
-        return values.map(q => normalizeQuestUserStatus(q)).filter(Boolean);
+        if (!raw && !apiQuestOverrides.size) return [];
+        const values = raw
+            ? (typeof raw.values === "function" ? [...raw.values()] : Object.values(raw))
+            : [];
+        const byId = new Map();
+        for (const q of values) {
+            const normalized = normalizeQuestUserStatus(q);
+            if (normalized) byId.set(String(normalized.id), normalized);
+        }
+        for (const [id, q] of apiQuestOverrides) {
+            if (!byId.has(id)) byId.set(id, q);
+        }
+        return [...byId.values()];
     };
 
     const isLaunchQuestType = (quest) => {
@@ -1523,10 +1573,15 @@ export function mountQuestsManager() {
         const taskType = resolveTaskType(quest, taskName);
         if (isLaunchQuestType(quest)) {
             const id = quest.id || "";
+            const name = resolveQuestDisplayName(quest).trim().toLowerCase();
             if (!appId) return `launch|noid|${id}|${taskName}|${taskType}`;
-            return `launch|${appId}|${taskType || taskName}`;
+            // Include display name so distinct Launch Quests sharing an app do not collapse.
+            if (!name || name === String(id).toLowerCase()) {
+                return `launch|${appId}|${id}|${taskType || taskName}`;
+            }
+            return `launch|${appId}|${name}|${taskType || taskName}`;
         }
-        const name = (quest.config?.messages?.questName || quest.config?.messages?.quest_name || "").trim().toLowerCase();
+        const name = resolveQuestDisplayName(quest).trim().toLowerCase();
         return `${appId}|${name}|${taskName}`;
     };
 
@@ -1607,23 +1662,34 @@ export function mountQuestsManager() {
 
     const pickDisplayQuest = (duplicates) => {
         if (!duplicates?.length) return null;
-        if (duplicates.length === 1) return duplicates[0];
 
-        const running = duplicates.find(q => dqmTasks.has(q.id));
+        // Prefer non-expired listings so Incomplete cards are not hidden by expired siblings.
+        const active = duplicates.filter(q => !isQuestExpired(q));
+        const pool = active.length ? active : duplicates;
+        if (pool.length === 1) return pool[0];
+
+        const running = pool.find(q => dqmTasks.has(q.id));
         if (running) return running;
 
-        const regionMatches = duplicates.filter(questMatchesUserRegion);
+        const regionMatches = pool.filter(questMatchesUserRegion);
+        const search = regionMatches.length ? regionMatches : pool;
 
-        const enrolledInRegion = regionMatches.find(q => getQuestCompletionFlags(q).isEnrolled);
-        if (enrolledInRegion) return enrolledInRegion;
+        const enrolledIncomplete = search.find(q => {
+            const flags = getQuestCompletionFlags(q);
+            return flags.isEnrolled && !flags.isCompleted && !flags.isClaimed;
+        });
+        if (enrolledIncomplete) return enrolledIncomplete;
 
-        const incompleteInRegion = regionMatches.find(isQuestIncompleteForDisplay);
-        if (incompleteInRegion) return incompleteInRegion;
+        const incomplete = search.find(isQuestIncompleteForDisplay);
+        if (incomplete) return incomplete;
 
-        if (regionMatches.length) return pickCanonicalQuest(regionMatches);
+        const claimable = search.find(q => getQuestCompletionFlags(q).isClaimable);
+        if (claimable) return claimable;
 
-        return pickCanonicalQuest(duplicates);
+        return pickCanonicalQuest(search);
     };
+
+    const getListedQuests = () => dedupeQuests(getAllStoreQuests().filter(q => !isQuestExpired(q)));
 
     const getCanonicalQuest = (quest, allQuests = null) => {
         const group = getQuestDuplicateGroup(quest, allQuests);
@@ -1759,10 +1825,15 @@ export function mountQuestsManager() {
         return !!resolveTaskName(quest) || isLaunchQuestType(quest);
     };
 
+    /** Incomplete non-Launch quests eligible for Complete All (enroll + run). */
     const isBatchRunnableQuest = (quest) => {
-        if (!isRunnableQuest(quest)) return false;
+        if (isExpired(quest)) return false;
+        if (isLaunchQuestType(quest)) return false;
+        if (getQuestBucket(quest) !== "incomplete") return false;
         const taskName = resolveTaskName(quest);
         const taskConfig = getTaskConfig(quest);
+        if (!taskName) return false;
+        if (isLaunchQuestTask(taskName, taskConfig)) return false;
         if (isAchievementActivityTask(taskName, taskConfig)) return false;
         return true;
     };
@@ -1826,7 +1897,7 @@ export function mountQuestsManager() {
         if (!rt) {
             rt = {
                 id: quest.id,
-                name: quest.config.messages?.questName || "Unknown",
+                name: resolveQuestDisplayName(quest),
                 type: "Other",
                 status: "idle",
                 progress: 0,
@@ -1841,7 +1912,7 @@ export function mountQuestsManager() {
         }
         const details = getQuestTypeDetails(quest);
         const { progress: serverProgress, total } = getQuestProgress(quest);
-        rt.name = quest.config.messages?.questName || rt.name;
+        rt.name = resolveQuestDisplayName(quest) || rt.name;
         rt.type = details.type;
         rt.target = total;
         if (rt.running) {
@@ -2474,15 +2545,25 @@ export function mountQuestsManager() {
                     ? body.quests
                     : [];
             for (const q of quests) {
-                const live = QuestsStore.quests.get(q.id);
-                if (!live) continue;
                 const normalized = normalizeQuestUserStatus(q);
-                if (!normalized?.userStatus) continue;
-                live.userStatus = {
-                    ...live.userStatus,
-                    ...normalized.userStatus,
-                    progress: normalized.userStatus.progress ?? live.userStatus?.progress
-                };
+                if (!normalized) continue;
+                const live = QuestsStore.quests.get(q.id);
+                if (live) {
+                    if (normalized.userStatus) {
+                        live.userStatus = {
+                            ...live.userStatus,
+                            ...normalized.userStatus,
+                            progress: normalized.userStatus.progress ?? live.userStatus?.progress
+                        };
+                    }
+                    // Prefer fresher config fields (names) when API provides them.
+                    if (normalized.config && !live.config?.messages?.questName && normalized.config.messages) {
+                        live.config = { ...live.config, ...normalized.config };
+                    }
+                    apiQuestOverrides.delete(String(q.id));
+                } else {
+                    apiQuestOverrides.set(String(q.id), normalized);
+                }
             }
         } catch (_) {}
     };
@@ -2490,7 +2571,7 @@ export function mountQuestsManager() {
     const runAchievementActivityQuest = async (quest, taskState, taskName, taskConfig) => {
         const canonical = getCanonicalQuest(quest);
         const duplicateIds = getDuplicateGroupQuestIds(canonical);
-        const questName = canonical.config.messages?.questName || canonical.id;
+        const questName = resolveQuestDisplayName(canonical);
         const checkpointCount = taskConfig.tasks[taskName]?.target || 3;
         // Match getQuestProgress / DQH: resume from THIS listing only.
         // Maxing progress across regional merge siblings caused Resume 1/1 →
@@ -2545,8 +2626,8 @@ export function mountQuestsManager() {
     const executeQuest = async (quest, onComplete) => {
         const canonical = getCanonicalQuest(quest);
         const questId = canonical.id;
-        const live = QuestsStore.quests.get(questId) || canonical;
-        const questName = live.config.messages?.questName || "Quest";
+        const live = QuestsStore.quests.get(questId) || apiQuestOverrides.get(String(questId)) || canonical;
+        const questName = resolveQuestDisplayName(live);
         const taskConfig = getTaskConfig(live);
         const taskName = resolveTaskName(live);
 
@@ -2555,7 +2636,7 @@ export function mountQuestsManager() {
             if (onComplete) onComplete({ ok: false, skipped: true });
             return;
         }
-        if (!live.userStatus?.enrolledAt) {
+        if (!getQuestCompletionFlags(live).isEnrolled) {
             log.warn(`[${questName}] ${t("logNotEnrolled")}`);
             if (onComplete) onComplete({ ok: false, skipped: true });
             return;
@@ -2651,19 +2732,19 @@ export function mountQuestsManager() {
     const acceptQuest = async (quest) => {
         const canonical = getCanonicalQuest(quest);
         const questId = canonical.id;
-        const name = canonical.config.messages?.questName || questId;
-        const live = QuestsStore.quests.get(questId) || canonical;
+        const name = resolveQuestDisplayName(canonical);
+        const live = QuestsStore.quests.get(questId) || apiQuestOverrides.get(String(questId)) || canonical;
         const group = getQuestDuplicateGroup(canonical);
         const regionPeers = group.filter(questMatchesUserRegion);
         const enrollPool = regionPeers.length ? regionPeers : [canonical];
 
-        if (acceptsInFlight.has(questId)) return;
+        if (acceptsInFlight.has(questId)) return false;
         // Only skip if display listing or a region peer is already enrolled — not an out-of-region sibling.
         if (getQuestCompletionFlags(canonical).isEnrolled
             || enrollPool.some(q => getQuestCompletionFlags(q).isEnrolled)) {
-            return;
+            return true;
         }
-        if (isExpired(live)) return;
+        if (isExpired(live)) return false;
 
         acceptsInFlight.add(questId);
         scheduleRender();
@@ -2688,19 +2769,26 @@ export function mountQuestsManager() {
 
             // Optimistic UI, then confirm via QuestsStore /quests/@me (mirror claim).
             patchQuestEnrollment(questId, new Date().toISOString());
+            const override = apiQuestOverrides.get(String(questId));
+            if (override) {
+                override.userStatus = {
+                    ...(override.userStatus || {}),
+                    enrolledAt: new Date().toISOString()
+                };
+            }
             log.info(`[${name}] ${t("logActivatePending")}`);
 
             const deadline = Date.now() + 5000;
             let confirmed = false;
             while (Date.now() < deadline) {
                 await refreshQuestsFromApi();
-                const updated = QuestsStore.quests.get(questId);
+                const updated = QuestsStore.quests.get(questId) || apiQuestOverrides.get(String(questId));
                 if (updated && getQuestCompletionFlags(updated).isEnrolled) {
                     confirmed = true;
                     break;
                 }
                 if (enrollPool.some(q => {
-                    const liveQ = QuestsStore.quests.get(q.id);
+                    const liveQ = QuestsStore.quests.get(q.id) || apiQuestOverrides.get(String(q.id));
                     return liveQ && getQuestCompletionFlags(liveQ).isEnrolled;
                 })) {
                     confirmed = true;
@@ -2711,14 +2799,15 @@ export function mountQuestsManager() {
 
             if (confirmed) {
                 log.success(`[${name}] ${t("logActivateSuccess")}`);
-            } else {
-                clearOptimisticEnrollment(questId);
-                log.error(`[${name}] ${t("logActivateNotConfirmed")}`);
+                return true;
             }
-            scheduleRender();
+            clearOptimisticEnrollment(questId);
+            log.error(`[${name}] ${t("logActivateNotConfirmed")}`);
+            return false;
         } catch (e) {
             clearOptimisticEnrollment(questId);
             log.error(`[${name}] ${t("logActivateFailed")}${errMsg(e)}`);
+            return false;
         } finally {
             acceptsInFlight.delete(questId);
             scheduleRender();
@@ -2727,8 +2816,8 @@ export function mountQuestsManager() {
 
     const claimQuest = async (quest) => {
         const questId = quest.id;
-        const name = quest.config.messages?.questName || questId;
-        const live = QuestsStore.quests.get(questId) || quest;
+        const name = resolveQuestDisplayName(quest);
+        const live = QuestsStore.quests.get(questId) || apiQuestOverrides.get(String(questId)) || quest;
 
         if (live.userStatus?.claimedAt) {
             log.warn(`[${name}] ${t("logClaimAlready")}`);
@@ -2829,7 +2918,15 @@ export function mountQuestsManager() {
         updateStopAllVisibility();
         updateBatchStrip({ preparing: true });
 
-        const quests = dedupeQuests([...QuestsStore.quests.values()]).filter(isBatchRunnableQuest);
+        const listed = getListedQuests();
+        const launchSkipped = listed.filter(q =>
+            getQuestBucket(q) === "incomplete" && isLaunchQuestType(q)
+        ).length;
+        const quests = listed.filter(isBatchRunnableQuest);
+
+        if (launchSkipped > 0) {
+            log.info(t("logBatchSkipLaunch").replace("{n}", String(launchSkipped)));
+        }
         if (quests.length === 0) {
             log.warn(t("logNoQuests"));
             batchRunning = false;
@@ -2844,9 +2941,18 @@ export function mountQuestsManager() {
         for (let i = 0; i < quests.length; i++) {
             if (batchStopRequested) break;
             const quest = quests[i];
-            const name = quest.config.messages?.questName || quest.id;
+            const name = resolveQuestDisplayName(quest);
             const overall = Math.round((i / quests.length) * 100);
             updateBatchStrip({ i: i + 1, n: quests.length, name, overall });
+
+            const flags = getQuestCompletionFlags(quest);
+            if (!flags.isEnrolled) {
+                const enrolled = await acceptQuest(quest);
+                if (!enrolled) {
+                    skipped++;
+                    continue;
+                }
+            }
 
             const result = await new Promise(resolve => executeQuest(quest, resolve));
             if (!result || result.skipped) skipped++;
@@ -2858,7 +2964,7 @@ export function mountQuestsManager() {
             i: quests.length,
             n: quests.length,
             name: "—",
-            overall: batchStopRequested ? Math.round((ok / quests.length) * 100) : 100
+            overall: batchStopRequested ? Math.round((ok / Math.max(1, quests.length)) * 100) : 100
         });
         log.success(t("logBatchSummary") + ok + t("logBatchSkipped") + skipped + t("logBatchFailed") + failed);
         log.info(t("logAllDone"));
@@ -2886,8 +2992,12 @@ export function mountQuestsManager() {
 
     const sumQuestOrbsForFilter = (filter) => {
         let total = 0;
-        for (const q of dedupeQuests(getAllStoreQuests().filter(quest => !isExpired(quest)))) {
+        for (const q of getListedQuests()) {
             if (getQuestBucket(q) !== filter) continue;
+            if (currentCountryFilter && currentCountryFilter !== "all") {
+                const key = countryFilterKey(resolveQuestCountrySync(q.id));
+                if (key !== currentCountryFilter) continue;
+            }
             const v = getQuestOrbs(q);
             if (v != null) total += v;
         }
@@ -2896,15 +3006,18 @@ export function mountQuestsManager() {
 
     const countQuestsForFilter = (filter) => {
         let count = 0;
-        for (const q of dedupeQuests(getAllStoreQuests().filter(quest => !isExpired(quest)))) {
-            if (getQuestBucket(q) === filter) count++;
+        for (const q of getListedQuests()) {
+            if (getQuestBucket(q) !== filter) continue;
+            if (currentCountryFilter && currentCountryFilter !== "all") {
+                const key = countryFilterKey(resolveQuestCountrySync(q.id));
+                if (key !== currentCountryFilter) continue;
+            }
+            count++;
         }
         return count;
     };
 
-    const countTotalQuests = () => {
-        return dedupeQuests(getAllStoreQuests().filter(q => !isExpired(q))).length;
-    };
+    const countTotalQuests = () => getListedQuests().length;
 
     const updateTabStats = () => {
         const pairs = [
@@ -2920,34 +3033,90 @@ export function mountQuestsManager() {
         }
     };
 
+    const updateNitroButtonState = () => {
+        const btn = document.getElementById("dqm-buy-nitro");
+        if (!btn) return;
+        const need = NITRO_3DAY_ORB_PRICE;
+        const broke = userOrbsBalance != null && userOrbsBalance < need;
+        btn.disabled = nitroPurchaseInFlight || broke;
+        btn.title = broke
+            ? t("logNitroInsufficient").replace("{price}", String(need))
+            : t("btnGetNitro");
+    };
+
+    const fetchUserNitroDays = async () => {
+        const days = await fetchNitroDaysRemaining(apiGet);
+        if (days != null) userNitroDays = days;
+        updateRunningStats();
+    };
+
     const fetchUserOrbsBalance = async () => {
         try {
             const res = await apiGet({ url: "/users/@me/virtual-currency/balance" });
             const body = res?.body;
             if (typeof body === "string" && /^\s*</.test(body)) {
                 log.debug("Orbs balance: invalid API response");
-                return;
+            } else {
+                const bal = body?.balance ?? body?.virtual_currency_balance ?? 0;
+                userOrbsBalance = typeof bal === "number" ? bal : (parseInt(bal, 10) || 0);
             }
-            const bal = body?.balance ?? body?.virtual_currency_balance ?? 0;
-            userOrbsBalance = typeof bal === "number" ? bal : (parseInt(bal, 10) || 0);
         } catch (e) {
             const msg = errMsg(e);
             log.debug(msg.includes("[object Object]")
                 ? "Orbs balance: Discord API module mismatch"
                 : `Orbs balance: ${msg}`);
         }
+        await fetchUserNitroDays();
         updateRunningStats();
+        updateNitroButtonState();
+    };
+
+    const buyThreeDayNitro = async () => {
+        if (nitroPurchaseInFlight) return;
+        const price = NITRO_3DAY_ORB_PRICE;
+        if (userOrbsBalance != null && userOrbsBalance < price) {
+            log.warn(t("logNitroInsufficient").replace("{price}", String(price)));
+            return;
+        }
+        if (!window.confirm(t("logNitroConfirm").replace("{price}", String(price)))) return;
+
+        nitroPurchaseInFlight = true;
+        updateNitroButtonState();
+        log.info(t("logNitroBuying"));
+        try {
+            const result = await purchaseThreeDayNitroCredit(apiPost, { expectedAmount: price });
+            if (result.ok) {
+                log.success(t("logNitroSuccess"));
+                await fetchUserOrbsBalance();
+            } else if (result.code === 100056 || result.error === "purchase_auth_required") {
+                log.error(t("logNitroAuthRequired"));
+            } else {
+                log.error(t("logNitroFailed") + (result.error || "unknown"));
+            }
+        } catch (e) {
+            log.error(t("logNitroFailed") + errMsg(e));
+        } finally {
+            nitroPurchaseInFlight = false;
+            updateNitroButtonState();
+        }
     };
 
     const updateRunningStats = () => {
         const qEl = document.getElementById("dqm-stat-quests");
         const oEl = document.getElementById("dqm-stat-orbs");
+        const nEl = document.getElementById("dqm-stat-nitro");
         const rEl = document.getElementById("dqm-stat-running");
         if (!listContainer) return;
         if (qEl) qEl.textContent = String(countTotalQuests());
         if (oEl) oEl.textContent = userOrbsBalance != null ? String(userOrbsBalance) : "—";
+        if (nEl) {
+            nEl.textContent = userNitroDays != null
+                ? `${userNitroDays}${t("nitroDaysUnit")}`
+                : "—";
+        }
         if (rEl) rEl.textContent = String(dqmTasks.size);
         updateTabStats();
+        updateNitroButtonState();
     };
 
     const updateMiniRunning = () => {
@@ -3210,7 +3379,8 @@ export function mountQuestsManager() {
         if (!listContainer) return;
         if (bustOrbs) orbsCache.clear();
 
-        const allQuests = dedupeQuests(getAllStoreQuests());
+        // Same expire→dedupe pipeline as tab chips so Incomplete counts match cards.
+        const allQuests = getListedQuests();
         const visible = allQuests.filter(matchesFilter);
         const visibleIds = new Set(visible.map(q => q.id));
 
@@ -3260,6 +3430,7 @@ export function mountQuestsManager() {
         const map = {
             "dqm-title": t("title"),
             "dqm-run-all": t("btnComplete"),
+            "dqm-buy-nitro": t("btnGetNitro"),
             "dqm-stop-all": t("btnStopAll"),
             "dqm-refresh": t("btnRefresh"),
             "dqm-copy-logs": t("btnCopy"),
@@ -3301,6 +3472,8 @@ export function mountQuestsManager() {
 
         document.querySelector(".dqm-chip-quests-label") && (document.querySelector(".dqm-chip-quests-label").textContent = t("statQuests"));
         document.querySelector(".dqm-chip-orbs-label") && (document.querySelector(".dqm-chip-orbs-label").textContent = t("statOrbs"));
+        document.querySelector(".dqm-chip-nitro-label") && (document.querySelector(".dqm-chip-nitro-label").textContent = t("statNitro"));
+        updateNitroButtonState();
         document.querySelector(".dqm-chip-run-label") && (document.querySelector(".dqm-chip-run-label").textContent = t("statRunning"));
         updateLocationChip(currentIpCountry);
         refreshCountryFilterOptions();
@@ -3386,12 +3559,14 @@ export function mountQuestsManager() {
             <div class="dqm-stats">
                 <span class="dqm-chip"><span class="dqm-chip-quests-label"></span> <strong id="dqm-stat-quests">0</strong></span>
                 <span class="dqm-chip dqm-chip--orbs"><span class="dqm-chip-orbs-label"></span> <strong id="dqm-stat-orbs">0</strong></span>
+                <span class="dqm-chip dqm-chip--nitro"><span class="dqm-chip-nitro-label"></span> <strong id="dqm-stat-nitro">—</strong></span>
                 <span class="dqm-chip dqm-chip--run"><span class="dqm-chip-run-label"></span> <strong id="dqm-stat-running">0</strong></span>
                 <span class="dqm-chip dqm-chip--location"><span class="dqm-chip-location-label"></span> <strong id="dqm-stat-location">—</strong></span>
                 <span class="dqm-chip dqm-chip--version" title="Plugin version"><strong id="dqm-version">${PLUGIN_VERSION_LABEL}</strong></span>
             </div>
             <div class="dqm-toolbar">
                 <button id="dqm-run-all" class="dqm-btn dqm-btn-green" type="button"></button>
+                <button id="dqm-buy-nitro" class="dqm-btn dqm-btn-nitro" type="button"></button>
                 <button id="dqm-stop-all" class="dqm-btn dqm-btn-danger" type="button" hidden></button>
                 <button id="dqm-refresh" class="dqm-btn dqm-btn-gray" type="button"></button>
                 <button id="dqm-copy-logs" class="dqm-btn dqm-btn-gray" type="button"></button>
@@ -3492,6 +3667,7 @@ export function mountQuestsManager() {
         log.info(t("logRefresh"));
     };
     gui.querySelector("#dqm-run-all").onclick = () => runAllQuests();
+    gui.querySelector("#dqm-buy-nitro").onclick = () => buyThreeDayNitro();
     stopAllBtn.onclick = () => stopAllQuests();
     gui.querySelector("#dqm-copy-logs").onclick = async () => {
         try {
