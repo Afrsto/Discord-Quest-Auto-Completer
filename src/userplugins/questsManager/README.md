@@ -1,4 +1,4 @@
-﻿# Quests Manager (Vencord UserPlugin)
+# Quests Manager (Vencord UserPlugin)
 
 Discord Quest Auto Completer â€” Vencord plugin (`v1.0.4`).
 

@@ -3664,10 +3664,6 @@ export function mountQuestsManager() {
             <button class="tab-btn" data-filter="complete" type="button">
                 <span class="tab-label"></span>
             </button>
-            <div class="dqm-country-filter-wrap">
-                <label class="dqm-country-filter-label" for="dqm-country-filter"></label>
-                <select id="dqm-country-filter" class="dqm-country-filter" aria-label="Filter by country"></select>
-            </div>
         </div>
         <div id="dqm-list"></div>
         <div id="dqm-logs" aria-live="polite"></div>

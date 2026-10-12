@@ -167,33 +167,6 @@
     background: var(--dqm-accent); color: #fff;
     box-shadow: 0 0 0 1px rgba(88,101,242,.4), 0 4px 12px rgba(88,101,242,.25);
 }
-#dqm-gui .dqm-country-filter-wrap {
-    margin-left: auto; display: flex; flex-direction: column; gap: 2px;
-    align-items: flex-end; min-width: 0; max-width: 160px;
-}
-#dqm-gui .dqm-country-filter-label {
-    font-size: 10px; color: var(--dqm-text-muted); font-weight: 600;
-    white-space: nowrap;
-}
-#dqm-gui .dqm-country-filter {
-    appearance: none; -webkit-appearance: none;
-    width: 100%; max-width: 180px;
-    background: var(--dqm-bg-secondary); color: var(--dqm-text);
-    border: 1px solid rgba(255,255,255,.08); border-radius: 8px;
-    padding: 5px 24px 5px 10px; font-size: 11px; font-weight: 600;
-    cursor: pointer; line-height: 1.3;
-    background-image: linear-gradient(45deg, transparent 50%, var(--dqm-text-muted) 50%),
-        linear-gradient(135deg, var(--dqm-text-muted) 50%, transparent 50%);
-    background-position: calc(100% - 10px) calc(50% - 2px), calc(100% - 6px) calc(50% - 2px);
-    background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;
-}
-#dqm-gui .dqm-country-filter:hover { border-color: rgba(255,255,255,.16); }
-#dqm-gui .dqm-country-filter:focus {
-    outline: none; border-color: var(--dqm-accent);
-    box-shadow: 0 0 0 1px rgba(88,101,242,.35);
-}
-#dqm-gui .dqm-country-filter option { background: #1e1f22; color: var(--dqm-text); }
-#dqm-gui[dir="rtl"] .dqm-country-filter-wrap { margin-left: 0; margin-right: auto; align-items: flex-start; }
 #dqm-gui #dqm-list {
     padding: 12px 14px; overflow-y: auto; flex: 1;
     display: flex; flex-direction: column; gap: 10px;
