@@ -3173,6 +3173,9 @@ export function mountQuestsManager() {
             if (result.ok) {
                 log.success(t("logNitroSuccess"));
                 await fetchUserOrbsBalance();
+                // Entitlement may lag the redeem response — refetch once more.
+                await sleep(1200);
+                await fetchUserNitroDays();
             } else if (result.code === 100056 || result.error === "purchase_auth_required") {
                 log.error(t("logNitroAuthRequired"));
             } else {

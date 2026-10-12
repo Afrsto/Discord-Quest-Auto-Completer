@@ -70,16 +70,34 @@ function skuProductLine(item) {
     return line == null ? null : Number(line);
 }
 
+function skuLabel(item) {
+    return String(
+        item?.sku?.name?.default
+        || item?.sku?.name
+        || item?.sku?.slug
+        || ""
+    );
+}
+
+function isQuestNitroCredit(item) {
+    if (Number(item?.type) !== 10) return false;
+    if (skuProductLine(item) === SKU_PRODUCT_LINE_FRACTIONAL_PREMIUM) return true;
+    const label = skuLabel(item);
+    if (/nitro/i.test(label) && /credit/i.test(label)) return true;
+    if (/nitro/i.test(label) && /\d+\s*-?\s*day/i.test(label)) return true;
+    return false;
+}
+
 function isNitroCreditEntitlement(item) {
     if (!item || typeof item !== "object") return false;
     if (item.deleted === true || item.consumed === true) return false;
     const type = Number(item.type);
     if (type === 2) return false;
     if (skuProductLine(item) === 1) return false;
-    // True Nitro Credits only — not every quest reward (type 10).
     if (skuProductLine(item) === SKU_PRODUCT_LINE_FRACTIONAL_PREMIUM) return true;
     if (entitlementSkuId(item) === NITRO_3DAY_SKU_ID) return true;
     if (NITRO_CREDIT_ENTITLEMENT_TYPES.has(type)) return true;
+    if (isQuestNitroCredit(item)) return true;
     return false;
 }
 
@@ -96,22 +114,28 @@ function bankedCreditDurationMs(item) {
 
     if (entitlementSkuId(item) === NITRO_3DAY_SKU_ID) return 3 * MS_PER_DAY;
 
-    const label = String(
-        item?.sku?.name?.default
-        || item?.sku?.name
-        || item?.sku?.slug
-        || ""
-    );
+    const label = skuLabel(item);
     const m = label.match(/(\d+)\s*-?\s*day/i);
     if (m) return Math.max(1, Number(m[1])) * MS_PER_DAY;
 
-    // No guessed default duration — avoids inflating the chip past Discord's Credits End In.
+    // Current Orbs Nitro Credit SKU is always 3 days when metadata is missing.
+    if (Number(item?.type) === 12) return 3 * MS_PER_DAY;
     return 0;
+}
+
+/** UTC calendar days from today to a future instant (Discord "End In X Days"). */
+function utcCalendarDaysUntil(targetMs, now = Date.now()) {
+    if (!targetMs || targetMs <= now) return 0;
+    const a = new Date(now);
+    const b = new Date(targetMs);
+    const aUtc = Date.UTC(a.getUTCFullYear(), a.getUTCMonth(), a.getUTCDate());
+    const bUtc = Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate());
+    return Math.max(0, Math.round((bUtc - aUtc) / MS_PER_DAY));
 }
 
 /**
  * Discord Nitro Home "Credits End In X Days":
- * max(active ends_at remaining) + sum(banked credit durations).
+ * max(active ends_at remaining) + sum(banked credit durations), as calendar days.
  */
 export function computeNitroDaysRemaining(sources, now = Date.now()) {
     const list = (Array.isArray(sources) ? sources : []).filter(isNitroCreditEntitlement);
@@ -138,22 +162,36 @@ export function computeNitroDaysRemaining(sources, now = Date.now()) {
 
     const totalMs = activeMs + bankedMs;
     if (totalMs <= 0) return null;
-    return Math.max(1, Math.ceil(totalMs / MS_PER_DAY));
+    const days = utcCalendarDaysUntil(now + totalMs, now);
+    return days > 0 ? days : null;
 }
 
-export async function fetchNitroDaysRemaining(apiGet) {
-    const bags = [];
-    try {
-        const entRes = await apiGet({
-            url: "/users/@me/entitlements?exclude_ended=true&with_sku=true"
-        });
+async function fetchAllEntitlements(apiGet) {
+    const all = [];
+    let after = null;
+    for (let page = 0; page < 20; page++) {
+        let url = "/users/@me/entitlements?exclude_ended=true&with_sku=true&limit=100";
+        if (after) url += `&after=${encodeURIComponent(after)}`;
+        const entRes = await apiGet({ url });
         const entBody = entRes?.body;
         const entitlements = Array.isArray(entBody)
             ? entBody
             : (Array.isArray(entBody?.entitlements) ? entBody.entitlements : []);
-        for (const e of entitlements) {
-            if (isNitroCreditEntitlement(e)) bags.push(e);
-        }
+        if (!entitlements.length) break;
+        all.push(...entitlements);
+        if (entitlements.length < 100) break;
+        const lastId = entitlements[entitlements.length - 1]?.id;
+        if (!lastId || String(lastId) === String(after)) break;
+        after = lastId;
+    }
+    return all;
+}
+
+export async function fetchNitroDaysRemaining(apiGet) {
+    let bags = [];
+    try {
+        const entitlements = await fetchAllEntitlements(apiGet);
+        bags = entitlements.filter(isNitroCreditEntitlement);
     } catch (_) {}
 
     // Do not merge billing/subscriptions — that is paid Premium period, not Credits.
