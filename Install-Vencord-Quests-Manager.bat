@@ -143,12 +143,12 @@ mkdir "%DL_DIR%"
 if not exist "%DL_DIR%" goto :err_dlmkdir
 
 call :info "Fetching latest release from GitHub..."
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $h=@{ 'User-Agent'='Vencord-QM'; 'Accept'='application/vnd.github+json' }; $r=Invoke-RestMethod -Uri '%RELEASE_API%' -Headers $h; $s=($r.assets | Where-Object { $_.name -eq 'src.zip' } | Select-Object -First 1); $p=($r.assets | Where-Object { $_.name -eq 'patch-discord.mjs' } | Select-Object -First 1); if (-not $s) { throw 'src.zip missing from release' }; Invoke-WebRequest -Uri $s.browser_download_url -OutFile (Join-Path '%DL_DIR%' 'src.zip') -Headers $h; if ($p) { Invoke-WebRequest -Uri $p.browser_download_url -OutFile (Join-Path '%DL_DIR%' 'patch-discord.mjs') -Headers $h }; Write-Host ('    Release: ' + $r.tag_name) -ForegroundColor DarkGray"
-if errorlevel 1 (
-    call :warn "GitHub download reported an error - checking files..."
-)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $dl='%DL_DIR%'; $api='%RELEASE_API%'; $hApi=@{ 'User-Agent'='Vencord-QM'; 'Accept'='application/vnd.github+json' }; $r=Invoke-RestMethod -Uri $api -Headers $hApi; $s=($r.assets | Where-Object { $_.name -eq 'src.zip' } | Select-Object -First 1); $p=($r.assets | Where-Object { $_.name -eq 'patch-discord.mjs' } | Select-Object -First 1); if (-not $s -or -not $s.browser_download_url) { throw 'src.zip missing from release' }; Write-Host ('    Release: ' + $r.tag_name) -ForegroundColor DarkGray; $srcOut=Join-Path $dl 'src.zip'; $patchOut=Join-Path $dl 'patch-discord.mjs'; function Get-Asset([string]$url,[string]$out){ $curl=Get-Command curl.exe -ErrorAction SilentlyContinue; if($curl){ & curl.exe -L --fail --retry 3 -A 'Vencord-QM' -o $out -- $url; if($LASTEXITCODE -ne 0){ throw ('curl failed (' + $LASTEXITCODE + ') for ' + $url) } } else { Invoke-WebRequest -Uri $url -OutFile $out -UserAgent 'Vencord-QM' } }; Get-Asset $s.browser_download_url $srcOut; if($p -and $p.browser_download_url){ Get-Asset $p.browser_download_url $patchOut }; $len=(Get-Item -LiteralPath $srcOut).Length; if($len -le 1024){ throw ('src.zip too small (' + $len + ' bytes)') }; Write-Host ('    src.zip: ' + $len + ' bytes') -ForegroundColor DarkGray"
+if errorlevel 1 goto :err_srczip
 
 if not exist "%DL_DIR%\src.zip" goto :err_srczip
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$f=Get-Item -LiteralPath '%DL_DIR%\src.zip' -ErrorAction Stop; if($f.Length -le 1024){ Write-Host ('  [FAIL] src.zip too small: ' + $f.Length + ' bytes') -ForegroundColor Red; Get-ChildItem -LiteralPath '%DL_DIR%' | ForEach-Object { Write-Host ('    ' + $_.Name + ' ' + $_.Length) }; exit 1 }; exit 0"
+if errorlevel 1 goto :err_srczip
 
 if not exist "%DL_DIR%\patch-discord.mjs" (
     if exist "%LOCAL_PATCH%" (
@@ -162,7 +162,8 @@ call :ok "Assets downloaded"
 if not exist "%VEN_DIR%\src\userplugins" mkdir "%VEN_DIR%\src\userplugins"
 if exist "%VEN_DIR%\_extract" rmdir /s /q "%VEN_DIR%\_extract" >nul 2>&1
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%DL_DIR%\src.zip' -DestinationPath '%VEN_DIR%\_extract' -Force"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$f=Get-Item -LiteralPath '%DL_DIR%\src.zip' -ErrorAction SilentlyContinue; if(-not $f -or $f.Length -le 1024){ Write-Host '  [FAIL] src.zip missing or too small before extract' -ForegroundColor Red; if(Test-Path -LiteralPath '%DL_DIR%'){ Get-ChildItem -LiteralPath '%DL_DIR%' | ForEach-Object { Write-Host ('    ' + $_.Name + ' ' + $_.Length) } }; exit 2 }; Expand-Archive -LiteralPath $f.FullName -DestinationPath '%VEN_DIR%\_extract' -Force"
+if errorlevel 2 goto :err_srczip
 if errorlevel 1 goto :err_extract
 
 if exist "%VEN_DIR%\_extract\src\userplugins\questsManager\index.tsx" (
@@ -291,7 +292,7 @@ call :fail "Could not delete %%USERPROFILE%%\Documents\Vencord. Close Discord an
 :err_dlmkdir
 call :fail "Could not create download folder _dl. Check folder permissions."
 :err_srczip
-call :fail "src.zip missing after download. Check GitHub releases or your network."
+call :fail "src.zip missing, too small, or download failed. Check GitHub releases / network, delete the _dl folder next to this .bat, then retry."
 :err_patchdl
 call :fail "patch-discord.mjs missing and no local copy found next to this .bat."
 :err_extract
