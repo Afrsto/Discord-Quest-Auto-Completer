@@ -50,6 +50,7 @@ const RunningGameStoreLazy = findStoreLazy("RunningGameStore");
 const ApplicationStreamingStoreLazy = findStoreLazy("ApplicationStreamingStore");
 const ChannelStoreLazy = findStoreLazy("ChannelStore");
 const GuildChannelStoreLazy = findStoreLazy("GuildChannelStore");
+const EntitlementStoreLazy = findStoreLazy("EntitlementStore");
 
 type Stores = {
     QuestsStore: any;
@@ -57,6 +58,7 @@ type Stores = {
     ApplicationStreamingStore: any;
     ChannelStore: any;
     GuildChannelStore: any;
+    EntitlementStore: any;
     FluxDispatcher: any;
     api: any;
 };
@@ -68,6 +70,7 @@ function resolveStores(): Stores {
         ApplicationStreamingStore: ApplicationStreamingStoreLazy,
         ChannelStore: ChannelStoreLazy,
         GuildChannelStore: GuildChannelStoreLazy,
+        EntitlementStore: EntitlementStoreLazy,
         FluxDispatcher: FluxDispatcherCommon,
         api: RestAPI,
     };
@@ -137,6 +140,7 @@ export function mountQuestsManager() {
     let QuestsStore = stores.QuestsStore;
     let ChannelStore = stores.ChannelStore;
     let GuildChannelStore = stores.GuildChannelStore;
+    let EntitlementStore = stores.EntitlementStore;
     let FluxDispatcher = stores.FluxDispatcher;
     let api = stores.api;
 
@@ -3131,7 +3135,10 @@ export function mountQuestsManager() {
     };
 
     const fetchUserNitroDays = async () => {
-        userNitroDays = await fetchNitroDaysRemaining(apiGet);
+        userNitroDays = await fetchNitroDaysRemaining(apiGet, {
+            EntitlementStore,
+            FluxDispatcher,
+        });
         updateRunningStats();
     };
 
@@ -3871,6 +3878,18 @@ export function mountQuestsManager() {
         QuestsStore.addChangeListener(onQuestsStoreChange);
         activeCleanups.add(() => {
             try { QuestsStore.removeChangeListener(onQuestsStoreChange); } catch (_) {}
+        });
+    }
+
+    if (FluxDispatcher) {
+        const onEntitlementChange = () => { fetchUserNitroDays().catch(() => {}); };
+        for (const evt of ["ENTITLEMENTS_FETCH_FOR_USER_SUCCESS", "ENTITLEMENT_UPDATE"]) {
+            try { FluxDispatcher.subscribe(evt, onEntitlementChange); } catch (_) {}
+        }
+        activeCleanups.add(() => {
+            for (const evt of ["ENTITLEMENTS_FETCH_FOR_USER_SUCCESS", "ENTITLEMENT_UPDATE"]) {
+                try { FluxDispatcher.unsubscribe(evt, onEntitlementChange); } catch (_) {}
+            }
         });
     }
 
