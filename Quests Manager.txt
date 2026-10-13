@@ -1750,9 +1750,6 @@ const PLAN_INTERVAL_MONTH = 1;
 const PLAN_INTERVAL_YEAR = 2;
 const PLAN_INTERVAL_DAY = 3;
 const MS_PER_DAY = 86400000;
-const NITRO_HOME_PATH = "/store";
-const NITRO_BADGE_WAIT_MS = 2500;
-const NITRO_BADGE_POLL_MS = 100;
 
 function newUuid() {
     try {
@@ -1900,85 +1897,7 @@ function computeNitroDaysRemaining(sources, now = Date.now()) {
     return days > 0 ? days : null;
 }
 
-function currentRoutePath() {
-    return window.location.pathname + window.location.search + window.location.hash;
-}
-
-function getWpRequire() {
-    try {
-        if (typeof webpackChunkdiscord_app === "undefined") return null;
-        const req = webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
-        webpackChunkdiscord_app.pop();
-        return req;
-    } catch (_) {
-        return null;
-    }
-}
-
-function findDiscordRouter() {
-    const wpRequire = getWpRequire();
-    if (!wpRequire?.c) return null;
-    const seen = new Set();
-    const inspect = value => {
-        if (!value || (typeof value !== "object" && typeof value !== "function") || seen.has(value)) return null;
-        seen.add(value);
-        if (typeof value.transitionTo === "function" && (
-            typeof value.replaceWith === "function" || typeof value.navigate === "function"
-        )) return value;
-        if (value.router?.transitionTo) return value.router;
-        return null;
-    };
-    for (const m of Object.values(wpRequire.c)) {
-        try {
-            const exp = m?.exports;
-            if (!exp) continue;
-            const direct = inspect(exp);
-            if (direct) return direct;
-            for (const key of Object.keys(exp)) {
-                const result = inspect(exp[key]);
-                if (result) return result;
-            }
-        } catch (_) {}
-    }
-    return null;
-}
-
-async function navigateToPath(targetPath) {
-    if (currentRoutePath() === targetPath) return true;
-
-    const router = findDiscordRouter();
-    if (router) {
-        for (const method of ["transitionTo", "replaceWith", "navigate"]) {
-            if (typeof router[method] === "function") {
-                try {
-                    await Promise.resolve(router[method](targetPath));
-                    await new Promise(r => setTimeout(r, 500));
-                    if (currentRoutePath() === targetPath) return true;
-                } catch (_) {}
-            }
-        }
-    }
-
-    try {
-        window.history.pushState({}, "", targetPath);
-        window.dispatchEvent(new PopStateEvent("popstate"));
-        await new Promise(r => setTimeout(r, 500));
-        return currentRoutePath() === targetPath;
-    } catch (_) {
-        return false;
-    }
-}
-
-async function navigateToNitroHome() {
-    return navigateToPath(NITRO_HOME_PATH);
-}
-
-async function restoreRoute(savedPath) {
-    if (!savedPath || currentRoutePath() === savedPath) return true;
-    return navigateToPath(savedPath);
-}
-
-/** Parse "Credits End In N Days" from Nitro Home DOM (EN + loose i18n). */
+/** Parse "Credits End In N Days" from Nitro Home DOM if already visible (no navigation). */
 function parseNitroCreditsDaysFromDom(root = document) {
     const doc = root?.documentElement ? root : document;
     const chunks = [];
@@ -2015,46 +1934,6 @@ function parseNitroCreditsDaysFromDom(root = document) {
         }
     }
     return null;
-}
-
-function waitForNitroCreditsBadge(timeoutMs = NITRO_BADGE_WAIT_MS) {
-    return new Promise(resolve => {
-        const started = Date.now();
-        const check = () => {
-            const days = parseNitroCreditsDaysFromDom();
-            if (days != null) {
-                cleanup();
-                resolve(days);
-                return;
-            }
-            if (Date.now() - started >= timeoutMs) {
-                cleanup();
-                resolve(null);
-                return;
-            }
-            timer = setTimeout(check, NITRO_BADGE_POLL_MS);
-        };
-
-        let observer = null;
-        let timer = null;
-        const cleanup = () => {
-            if (observer) {
-                try { observer.disconnect(); } catch (_) {}
-                observer = null;
-            }
-            if (timer) {
-                clearTimeout(timer);
-                timer = null;
-            }
-        };
-
-        try {
-            observer = new MutationObserver(check);
-            observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-        } catch (_) {}
-
-        check();
-    });
 }
 
 function unactivatedUnitDurationMs(unit) {
@@ -2142,36 +2021,17 @@ async function ensureEntitlementsLoaded(FluxDispatcher, EntitlementStore) {
     }
 }
 
-async function fetchNitroDaysFromNitroHome() {
-    const savedPath = currentRoutePath();
-    const alreadyOnStore = savedPath.startsWith(NITRO_HOME_PATH);
-
-    if (!alreadyOnStore) {
-        const ok = await navigateToNitroHome();
-        if (!ok) return null;
-    }
-
-    let days = parseNitroCreditsDaysFromDom();
-    if (days == null) days = await waitForNitroCreditsBadge();
-
-    if (!alreadyOnStore) await restoreRoute(savedPath);
-    return days;
-}
-
+/**
+ * Nitro days without UI navigation:
+ * 1) DOM badge if Nitro Home is already open
+ * 2) EntitlementStore (same client data Nitro Home uses)
+ */
 async function fetchNitroDaysRemaining(_apiGet, {
     EntitlementStore = null,
-    FluxDispatcher = null,
-    navigateForBadge = true
+    FluxDispatcher = null
 } = {}) {
     const fromDomNow = parseNitroCreditsDaysFromDom();
     if (fromDomNow != null) return fromDomNow;
-
-    if (navigateForBadge) {
-        try {
-            const fromNav = await fetchNitroDaysFromNitroHome();
-            if (fromNav != null) return fromNav;
-        } catch (_) {}
-    }
 
     if (EntitlementStore) {
         await ensureEntitlementsLoaded(FluxDispatcher, EntitlementStore);

@@ -120,6 +120,16 @@ if not exist "%USERPROFILE%\Documents" mkdir "%USERPROFILE%\Documents"
 REM Never wipe while cwd is inside the locked tree.
 cd /d "%USERPROFILE%\Documents"
 
+REM Reuse an existing Vencord tree: skip wipe/clone, download plugin + rebuild.
+if exist "%VEN_DIR%\package.json" if exist "%VEN_DIR%\src" (
+    call :info "Existing Vencord found - reusing for plugin update + rebuild"
+    call :pathline "%VEN_DIR%"
+    cd /d "%VEN_DIR%"
+    if errorlevel 1 goto :err_clone
+    call :ok "Reusing existing Vencord"
+    goto :phase6
+)
+
 REM Close apps that commonly lock Documents\Vencord before wipe.
 call :info "Closing Discord / Node processes that may lock the folder..."
 taskkill /f /im Discord.exe >nul 2>&1
@@ -130,7 +140,7 @@ taskkill /f /im pnpm.exe >nul 2>&1
 timeout /t 3 /nobreak >nul
 
 if not exist "%VEN_DIR%" goto :phase5_clone
-call :info "Removing existing Vencord folder..."
+call :info "Removing incomplete Vencord folder..."
 set "WIPE_TRY=0"
 
 :wipe_retry
@@ -218,7 +228,7 @@ goto :phase7
 call :print_step 7 9 "Installing dependencies and building ..."
 cd /d "%VEN_DIR%"
 call :info "pnpm install - this may take a minute..."
-call pnpm install --frozen-lockfile --reporter=append-only
+call pnpm install --frozen-lockfile
 if errorlevel 1 goto :err_install
 call :info "pnpm build ..."
 call pnpm build
