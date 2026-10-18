@@ -50,7 +50,12 @@ const RunningGameStoreLazy = findStoreLazy("RunningGameStore");
 const ApplicationStreamingStoreLazy = findStoreLazy("ApplicationStreamingStore");
 const ChannelStoreLazy = findStoreLazy("ChannelStore");
 const GuildChannelStoreLazy = findStoreLazy("GuildChannelStore");
-const EntitlementStoreLazy = findStoreLazy("EntitlementStore");
+const EntitlementStoreByPropsLazy = findByPropsLazy(
+    "getFractionalPremium",
+    "getUnactivatedFractionalPremiumUnits"
+);
+const EntitlementStoreByNameLazy = findStoreLazy("EntitlementStore");
+const EntitlementActionsLazy = findByPropsLazy("fetchUserEntitlements");
 
 type Stores = {
     QuestsStore: any;
@@ -59,18 +64,21 @@ type Stores = {
     ChannelStore: any;
     GuildChannelStore: any;
     EntitlementStore: any;
+    EntitlementActions: any;
     FluxDispatcher: any;
     api: any;
 };
 
 function resolveStores(): Stores {
+    const entitlementStore = EntitlementStoreByPropsLazy || EntitlementStoreByNameLazy;
     return {
         QuestsStore: QuestsStoreLazy,
         RunningGameStore: RunningGameStoreLazy,
         ApplicationStreamingStore: ApplicationStreamingStoreLazy,
         ChannelStore: ChannelStoreLazy,
         GuildChannelStore: GuildChannelStoreLazy,
-        EntitlementStore: EntitlementStoreLazy,
+        EntitlementStore: entitlementStore,
+        EntitlementActions: EntitlementActionsLazy,
         FluxDispatcher: FluxDispatcherCommon,
         api: RestAPI,
     };
@@ -141,6 +149,7 @@ export function mountQuestsManager() {
     let ChannelStore = stores.ChannelStore;
     let GuildChannelStore = stores.GuildChannelStore;
     let EntitlementStore = stores.EntitlementStore;
+    let EntitlementActions = stores.EntitlementActions;
     let FluxDispatcher = stores.FluxDispatcher;
     let api = stores.api;
 
@@ -3138,6 +3147,7 @@ export function mountQuestsManager() {
         userNitroDays = await fetchNitroDaysRemaining(apiGet, {
             EntitlementStore,
             FluxDispatcher,
+            EntitlementActions,
         });
         updateRunningStats();
     };
@@ -3892,6 +3902,38 @@ export function mountQuestsManager() {
             }
         });
     }
+
+    if (EntitlementStore?.addChangeListener) {
+        const onEntitlementStoreChange = () => { fetchUserNitroDays().catch(() => {}); };
+        EntitlementStore.addChangeListener(onEntitlementStoreChange);
+        activeCleanups.add(() => {
+            try { EntitlementStore.removeChangeListener(onEntitlementStoreChange); } catch (_) {}
+        });
+    }
+
+    // When Nitro Home (/store) is open, re-read the Credits badge without navigating.
+    let lastNitroRoutePath = "";
+    const maybeRefreshNitroFromRoute = () => {
+        const path = String(window.location?.pathname || "");
+        if (!path.startsWith("/store")) {
+            lastNitroRoutePath = path;
+            return;
+        }
+        if (path === lastNitroRoutePath && userNitroDays != null) return;
+        lastNitroRoutePath = path;
+        fetchUserNitroDays().catch(() => {});
+    };
+    window.addEventListener("popstate", maybeRefreshNitroFromRoute);
+    activeCleanups.add(() => {
+        try { window.removeEventListener("popstate", maybeRefreshNitroFromRoute); } catch (_) {}
+    });
+    const nitroRoutePoll = setInterval(() => {
+        if (!mounted || panelHidden) return;
+        maybeRefreshNitroFromRoute();
+    }, 2000);
+    activeCleanups.add(() => {
+        try { clearInterval(nitroRoutePoll); } catch (_) {}
+    });
 
     fetchUserOrbsBalance();
     ensureRegionsCatalog().then(() => {

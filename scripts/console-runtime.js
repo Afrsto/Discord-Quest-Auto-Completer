@@ -50,6 +50,7 @@ async function initializeDiscordModules() {
         ChannelStore: null,
         GuildChannelStore: null,
         EntitlementStore: null,
+        EntitlementActions: null,
         FluxDispatcher: null,
         api: null,
     };
@@ -107,6 +108,10 @@ async function initializeDiscordModules() {
                             modules.EntitlementStore = val;
                         }
 
+                        if (!modules.EntitlementActions && typeof val?.fetchUserEntitlements === "function") {
+                            modules.EntitlementActions = val;
+                        }
+
                         if (typeof val?.get === "function" && typeof val?.post === "function") {
                             if (apiSeen.has(val)) continue;
                             apiSeen.add(val);
@@ -148,6 +153,7 @@ function resolveStores() {
         ChannelStore: null,
         GuildChannelStore: null,
         EntitlementStore: null,
+        EntitlementActions: null,
         FluxDispatcher: null,
         api: null,
     };
@@ -158,6 +164,7 @@ function resolveStores() {
         ChannelStore: m.ChannelStore,
         GuildChannelStore: m.GuildChannelStore,
         EntitlementStore: m.EntitlementStore,
+        EntitlementActions: m.EntitlementActions,
         FluxDispatcher: m.FluxDispatcher,
         api: m.api,
     };
