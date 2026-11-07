@@ -173,6 +173,7 @@ export function mountQuestsManager() {
 
     let currentFilter = "incomplete";
     let currentCountryFilter = "all";
+    let currentTypeFilter = "all";
     let currentLang = "en";
     let batchStopRequested = false;
     let batchRunning = false;
@@ -369,6 +370,8 @@ export function mountQuestsManager() {
             typeStream: "Stream",
             typeLaunch: "Launch Quest",
             typeOther: "Other",
+            typeFilterAll: "All",
+            typeFilterLabel: "Type",
             warnPartialModules: "Some optional modules missing (desktop/stream/activity may be limited).",
             activityLaunchTitle: "Launch Activity Quest",
             activityLaunchDesc: "This quest requires launching a Discord Activity. Follow these steps:",
@@ -402,6 +405,11 @@ export function mountQuestsManager() {
             logActivityStartTimerIgnored: "questStartTimer was skipped but quest context is valid; continuing with checkpoints. ",
             logActivityTimerRequired: "questStartTimer never succeeded. Aborting — Discord will not accept checkpoints without an active quest timer.",
             logActivityLaunching: "Launching quest in Discord…",
+            logActivityRelaunch: "Closing the previous activity and launching this listing again…",
+            logActivityStale: "This activity is still bound to another listing.",
+            logActivitySiblingReported: "Discord reports listing {id} for this activity. The timer for this listing has started.",
+            logActivityAchievementTimer: "questStartTimer does not apply to this achievement listing. Discord confirms it is enrolled in the open activity, so checkpoints will continue.",
+            logActivityQuestPinned: "Checkpoints will be sent for this listing. Discord was reporting the completed one.",
             logActivityDomFound: "Activity iframe visible in Discord — waiting for native frame access…",
             logActivityWaitHint: "If this times out, click Open in Discord, complete Launch Quest + authorization, then try Start again.",
             logActivityCheckpointPlan: "{count} checkpoints × {min}–{max}s ≈ {mins} min total",
@@ -417,7 +425,7 @@ export function mountQuestsManager() {
             settingsCheckpointMin: "Checkpoint min",
             settingsCheckpointMax: "Checkpoint max",
             settingsCheckpointUnit: "s",
-            settingsCheckpointHint: "Activity quest wait between checkpoints (30–600s). Applies on next Start.",
+            settingsCheckpointHint: "Activity quest wait between checkpoints (6–600s). 6s is the fastest reliable pace. Applies on next Start.",
             labelMergedListings: "{n} listings merged"
         },
         ar: {
@@ -554,6 +562,8 @@ export function mountQuestsManager() {
             typeStream: "بث",
             typeLaunch: "تشغيل مهمة",
             typeOther: "أخرى",
+            typeFilterAll: "الكل",
+            typeFilterLabel: "النوع",
             warnPartialModules: "بعض الوحدات الاختيارية غير موجودة (قد يُقيَّد اللعب/البث/النشاط).",
             activityLaunchTitle: "تشغيل مهمة النشاط",
             activityLaunchDesc: "تتطلب هذه المهمة تشغيل نشاط ديسكورد. اتبع الخطوات التالية:",
@@ -587,6 +597,11 @@ export function mountQuestsManager() {
             logActivityStartTimerIgnored: "تم تخطي questStartTimer لكن سياق المهمة صالح؛ متابعة نقاط التفتيش. ",
             logActivityTimerRequired: "فشل questStartTimer. تم الإيقاف — لن يقبل ديسكورد نقاط التفتيش بدون مؤقت مهمة نشط.",
             logActivityLaunching: "جاري تشغيل المهمة في ديسكورد…",
+            logActivityRelaunch: "جاري إغلاق النشاط السابق وتشغيل هذه النسخة مرة أخرى…",
+            logActivityStale: "هذا النشاط ما زال مرتبطًا بنسخة أخرى من المهمة.",
+            logActivitySiblingReported: "يُظهر ديسكورد المهمة {id} لهذا النشاط. بدأ مؤقت هذه النسخة.",
+            logActivityAchievementTimer: "أمر questStartTimer لا ينطبق على مهمة الإنجاز هذه. ديسكورد يؤكد أن هذه النسخة مسجّلة في النشاط المفتوح، لذا ستستمر نقاط التفتيش.",
+            logActivityQuestPinned: "ستُرسل نقاط التفتيش لهذه النسخة. كان ديسكورد يُظهر النسخة المكتملة.",
             logActivityDomFound: "إطار النشاط ظاهر في ديسكورد — بانتظار الوصول الأصلي للإطار…",
             logActivityWaitHint: "إذا انتهت المهلة، انقر على فتح في ديسكورد، أكمل تشغيل المهمة والتفويض، ثم حاول البدء مرة أخرى.",
             logActivityCheckpointPlan: "{count} نقاط تفتيش × {min}–{max}ث ≈ {mins} دقيقة إجمالاً",
@@ -602,7 +617,7 @@ export function mountQuestsManager() {
             settingsCheckpointMin: "الحد الأدنى للنقطة",
             settingsCheckpointMax: "الحد الأقصى للنقطة",
             settingsCheckpointUnit: "ث",
-            settingsCheckpointHint: "انتظار مهام النشاط بين نقاط التفتيش (30–600ث). يُطبَّق عند البدء التالي.",
+            settingsCheckpointHint: "انتظار مهام النشاط بين نقاط التفتيش (6–600ث). 6 ثوانٍ هي أسرع وتيرة موثوقة. يُطبَّق عند البدء التالي.",
             labelMergedListings: "تم دمج {n} قوائم"
         }
     };
@@ -1758,8 +1773,9 @@ export function mountQuestsManager() {
         const display = getCanonicalQuest(quest);
         const displayProgress = getSingleQuestProgress(display);
 
-        // While running, allow max among region-matching peers only.
-        if (!isDuplicateGroupRunning(quest)) {
+        // While running, a Launch Quest card stays on the listing that was
+        // started. Maxing in a completed sibling made 0/5 look like 5/5.
+        if (!isDuplicateGroupRunning(quest) || isLaunchQuestType(quest)) {
             return displayProgress;
         }
 
@@ -1829,7 +1845,40 @@ export function mountQuestsManager() {
             const key = countryFilterKey(resolveQuestCountrySync(quest.id));
             if (key !== currentCountryFilter) return false;
         }
+        if (!matchesTypeFilter(quest)) return false;
         return true;
+    };
+
+    const matchesTypeFilter = (quest) => {
+        if (!currentTypeFilter || currentTypeFilter === "all") return true;
+        return getQuestTypeDetails(quest).type === currentTypeFilter;
+    };
+
+    const refreshTypeFilterOptions = () => {
+        const select = document.getElementById("dqm-type-filter");
+        if (!select) return;
+        const prev = currentTypeFilter || "all";
+        const options = [
+            ["all", t("typeFilterAll")],
+            ["Launch Quest", "🚀 " + t("typeLaunch")],
+            ["Play Game", "🎮 " + t("typePlay")],
+            ["Video", "📺 " + t("typeVideo")],
+            ["Stream", "📡 " + t("typeStream")],
+            ["Other", t("typeOther")]
+        ];
+        select.innerHTML = "";
+        for (const [value, text] of options) {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = text;
+            select.appendChild(opt);
+        }
+        select.value = options.some(([value]) => value === prev) ? prev : "all";
+        currentTypeFilter = select.value;
+        select.setAttribute("aria-label", t("typeFilterLabel"));
+        select.title = t("typeFilterLabel");
+        const label = gui?.querySelector(".dqm-type-filter-label");
+        if (label) label.textContent = t("typeFilterLabel");
     };
 
     const isRunnableQuest = (quest) => {
@@ -3090,10 +3139,11 @@ export function mountQuestsManager() {
         let total = 0;
         for (const q of getListedQuests()) {
             if (getQuestBucket(q) !== filter) continue;
-            if (currentCountryFilter && currentCountryFilter !== "all") {
-                const key = countryFilterKey(resolveQuestCountrySync(q.id));
-                if (key !== currentCountryFilter) continue;
-            }
+        if (currentCountryFilter && currentCountryFilter !== "all") {
+            const key = countryFilterKey(resolveQuestCountrySync(q.id));
+            if (key !== currentCountryFilter) continue;
+        }
+            if (!matchesTypeFilter(q)) continue;
             const v = getQuestOrbs(q);
             if (v != null) total += v;
         }
@@ -3108,6 +3158,7 @@ export function mountQuestsManager() {
                 const key = countryFilterKey(resolveQuestCountrySync(q.id));
                 if (key !== currentCountryFilter) continue;
             }
+            if (!matchesTypeFilter(q)) continue;
             count++;
         }
         return count;
@@ -3572,6 +3623,7 @@ export function mountQuestsManager() {
         document.querySelector(".dqm-chip-run-label") && (document.querySelector(".dqm-chip-run-label").textContent = t("statRunning"));
         updateLocationChip(currentIpCountry);
         refreshCountryFilterOptions();
+        refreshTypeFilterOptions();
 
         gui.querySelectorAll(".dqm-tab-quests-label").forEach(el => { el.textContent = t("statQuests"); });
         gui.querySelectorAll(".dqm-tab-orbs-label").forEach(el => { el.textContent = t("statOrbs"); });
@@ -3684,6 +3736,10 @@ export function mountQuestsManager() {
             <button class="tab-btn" data-filter="complete" type="button">
                 <span class="tab-label"></span>
             </button>
+            <label class="dqm-type-filter">
+                <span class="dqm-type-filter-label"></span>
+                <select id="dqm-type-filter" class="dqm-type-select"></select>
+            </label>
         </div>
         <div id="dqm-list"></div>
         <div id="dqm-logs" aria-live="polite"></div>
@@ -3810,6 +3866,13 @@ export function mountQuestsManager() {
             scheduleRender();
         };
     });
+    const typeFilterEl = gui.querySelector("#dqm-type-filter");
+    if (typeFilterEl) {
+        typeFilterEl.onchange = () => {
+            currentTypeFilter = typeFilterEl.value || "all";
+            scheduleRender();
+        };
+    }
     const countryFilterEl = gui.querySelector("#dqm-country-filter");
     if (countryFilterEl) {
         countryFilterEl.onchange = () => {

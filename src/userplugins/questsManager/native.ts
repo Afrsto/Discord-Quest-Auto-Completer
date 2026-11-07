@@ -63,6 +63,7 @@ interface FrameRef {
     processId: number;
     routingId: number;
     applicationId: string | null;
+    seenAt: number;
 }
 
 const activityFrames: FrameRef[] = [];
@@ -112,6 +113,7 @@ function registerActivityFrame(frame: WebFrameMain): void {
     );
     if (existing) {
         existing.applicationId = extractApplicationId(url);
+        existing.seenAt = Date.now();
         return;
     }
 
@@ -119,7 +121,8 @@ function registerActivityFrame(frame: WebFrameMain): void {
     activityFrames.push({
         processId,
         routingId,
-        applicationId: extractApplicationId(url)
+        applicationId: extractApplicationId(url),
+        seenAt: Date.now()
     });
 }
 
@@ -168,9 +171,16 @@ function scanAllWindowsForActivityFrames(): WebFrameMain[] {
 
 const SDK_PROBE_JS = "!!(window.discordSDK && window.discordSDK.commands && typeof window.discordSDK.commands.questStartTimer === \"function\")";
 
-function frameHasDiscordSdk(frame: WebFrameMain): boolean {
+function frameSeenAt(frame: WebFrameMain): number {
+    const ref = activityFrames.find(
+        item => item.processId === frame.processId && item.routingId === frame.routingId
+    );
+    return ref?.seenAt ?? 0;
+}
+
+async function frameHasDiscordSdk(frame: WebFrameMain): Promise<boolean> {
     try {
-        return frame.executeJavaScript(SDK_PROBE_JS, true) === true;
+        return await frame.executeJavaScript(SDK_PROBE_JS, true) === true;
     } catch {
         return false;
     }
@@ -213,15 +223,16 @@ function collectMatchingFrames(applicationId: string): WebFrameMain[] {
     return matched;
 }
 
-function findMatchingFrame(applicationId: string): WebFrameMain | null {
+async function findMatchingFrame(applicationId: string): Promise<WebFrameMain | null> {
     const matching = collectMatchingFrames(applicationId);
     if (matching.length === 0) return null;
 
-    for (let i = matching.length - 1; i >= 0; i--) {
-        if (frameHasDiscordSdk(matching[i])) return matching[i];
+    const ranked = [...matching].sort((a, b) => frameSeenAt(b) - frameSeenAt(a));
+    for (const frame of ranked) {
+        if (await frameHasDiscordSdk(frame)) return frame;
     }
 
-    return matching[matching.length - 1];
+    return ranked[0];
 }
 
 function attachWindowListeners(win: BrowserWindow): void {
@@ -253,7 +264,7 @@ app.on("browser-window-created", (_, win) => {
 });
 
 export async function hasActivityFrame(_: IpcMainInvokeEvent, applicationId: string): Promise<boolean> {
-    return findMatchingFrame(applicationId) != null;
+    return (await findMatchingFrame(applicationId)) != null;
 }
 
 export async function execInActivityFrame(
@@ -261,7 +272,7 @@ export async function execInActivityFrame(
     applicationId: string,
     jsCode: string
 ): Promise<string | null> {
-    const frame = findMatchingFrame(applicationId);
+    const frame = await findMatchingFrame(applicationId);
     if (!frame) return null;
 
     try {

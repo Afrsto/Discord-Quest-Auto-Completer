@@ -3,10 +3,11 @@
  * Launch Quest / Activity quest completion — ported from Discord Quest Helper
  */
 
-// Minimum safe wait Discord tooling allows (new installs; localStorage overrides still win).
-const DEFAULT_CHECKPOINT_MIN_SECS = 30;
-const DEFAULT_CHECKPOINT_MAX_SECS = 30;
-const CHECKPOINT_MIN_LIMIT = 30;
+// The activity drops a progress update sent sooner than 5s after the previous one.
+// 6s is the fastest gap that still reaches Discord.
+const DEFAULT_CHECKPOINT_MIN_SECS = 6;
+const DEFAULT_CHECKPOINT_MAX_SECS = 6;
+const CHECKPOINT_MIN_LIMIT = 6;
 const CHECKPOINT_MAX_LIMIT = 600;
 export const STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY = "questHelper_activityCheckpointMin";
 export const STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY = "questHelper_activityCheckpointMax";
@@ -41,12 +42,14 @@ export function getActivityCheckpointSettings() {
     let minSecs = DEFAULT_CHECKPOINT_MIN_SECS;
     let maxSecs = DEFAULT_CHECKPOINT_MAX_SECS;
     try {
-        // Migrate legacy DQH defaults (180–300) to the 30s floor so ETA matches v1.0.4 hotfix.
+        // Older installs stored 180–300 or the previous 30s default. Move those to 6s.
         const rawMin = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY);
         const rawMax = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY);
-        if (rawMin === "180" && (rawMax == null || rawMax === "300")) {
-            localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY, "30");
-            localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY, "30");
+        const legacySlow = (rawMin === "180" && (rawMax == null || rawMax === "300" || rawMax === "30"))
+            || (rawMin === "30" && (rawMax == null || rawMax === "30"));
+        if (legacySlow) {
+            localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY, "6");
+            localStorage.setItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY, "6");
         }
         const savedMin = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MIN_KEY);
         const savedMax = localStorage.getItem(STORAGE_ACTIVITY_CHECKPOINT_MAX_KEY);
@@ -353,15 +356,11 @@ export function resolveQuestApplicationId(quest, taskName = null, taskConfig = n
     return "";
 }
 
-function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
+function buildInitActivityQuestJs(questId, _allowedQuestIds = []) {
     const safeQuestId = JSON.stringify(String(questId));
-    const allowed = [...new Set([String(questId), ...allowedQuestIds.map(String)])];
-    const safeAllowed = JSON.stringify(allowed);
     return `
 (async () => {
     const requestedQuestId = ${safeQuestId};
-    const allowedQuestIds = ${safeAllowed};
-    const allowedSet = new Set(allowedQuestIds.map(String));
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     ${JS_ACTIVITY_HELPERS}
 
@@ -417,30 +416,67 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
         }
 
         const boundQuestId = String(questInfoBefore?.quest_id || "");
-        let effectiveQuestId = requestedQuestId;
-        if (boundQuestId && allowedSet.has(boundQuestId)) {
-            effectiveQuestId = boundQuestId;
-        }
+        const effectiveQuestId = requestedQuestId;
+        // getQuest() names the earliest enrolled listing for this application.
+        // questStartTimer only accepts PLAY_ACTIVITY quests. Achievement listings
+        // always get 4002 from that command. Enrollment uses the achievement
+        // application id, so it is the check that this listing belongs here.
+        const questInfoBeforeMatches = boundQuestId !== "" && boundQuestId === requestedQuestId;
 
-        let enrollmentStatusBefore = null;
+        let enrollmentStatus = null;
+        let enrollmentError = null;
         if (typeof sdk.commands.getQuestEnrollmentStatus === "function") {
             try {
-                enrollmentStatusBefore = await withTimeout(
+                enrollmentStatus = await withTimeout(
                     sdk.commands.getQuestEnrollmentStatus({ quest_id: effectiveQuestId }),
                     DQH_COMMAND_TIMEOUT_MS,
                     "getQuestEnrollmentStatus"
                 );
-            } catch (_) {}
+            } catch (e) {
+                enrollmentError = e;
+            }
+        }
+        const enrolledHere = String(enrollmentStatus?.quest_id || "") === requestedQuestId
+            && enrollmentStatus?.is_enrolled === true;
+
+        function timerFailure(errorText, errorCode) {
+            return JSON.stringify({
+                success: false,
+                errorCode: errorCode || undefined,
+                error: errorText,
+                effectiveQuestId,
+                boundQuestId,
+                enrolledHere,
+                commands,
+                waitedMs
+            });
         }
 
-        const questInfoBeforeMatches = boundQuestId !== "" && allowedSet.has(boundQuestId);
-        const enrollmentStatusBeforeMatches = String(enrollmentStatusBefore?.quest_id || "") === String(effectiveQuestId);
-        const enrollmentStatusBeforeEnrolled = enrollmentStatusBeforeMatches && enrollmentStatusBefore?.is_enrolled === true;
-        const hasRetryableQuestContext = questInfoBeforeMatches || enrollmentStatusBeforeEnrolled;
+        function acceptTimerRejection(errorValue) {
+            if (isAuthPendingQuestStartTimerError(errorValue) || isAuthPendingQuestStartTimerError(enrollmentError)) {
+                return timerFailure("questStartTimer failed: " + describeError(errorValue), "AUTH_PENDING");
+            }
+            if (!isKnownBenignQuestStartTimerError(errorValue)) return null;
+            if (enrolledHere || questInfoBeforeMatches) return "accept";
+            if (enrollmentError == null && enrollmentStatus) {
+                return timerFailure(
+                    "questStartTimer failed: " + describeError(errorValue),
+                    "QUEST_NOT_IN_ACTIVITY"
+                );
+            }
+            if (enrollmentError && isKnownBenignQuestStartTimerError(enrollmentError)) {
+                return timerFailure(
+                    "questStartTimer failed: " + describeError(errorValue),
+                    "QUEST_NOT_IN_ACTIVITY"
+                );
+            }
+            return null;
+        }
 
         let startTimerResult = null;
         let startTimerError = null;
         let startTimerIgnored = false;
+        let achievementTimerSkipped = false;
         try {
             startTimerResult = await withTimeout(
                 sdk.commands.questStartTimer({ quest_id: effectiveQuestId }),
@@ -449,54 +485,31 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             );
         } catch (e) {
             startTimerError = describeError(e);
-            // DQH: benign 4002 "Quest not found" with valid iframe quest context → continue.
-            if (isKnownBenignQuestStartTimerError(e) && hasRetryableQuestContext) {
+            const decision = acceptTimerRejection(e);
+            if (decision === "accept") {
                 startTimerIgnored = true;
+                achievementTimerSkipped = enrolledHere && !questInfoBeforeMatches;
+            } else if (decision) {
+                return decision;
             } else if (isAuthPendingQuestStartTimerError(e)) {
-                return JSON.stringify({
-                    success: false,
-                    errorCode: "AUTH_PENDING",
-                    error: "questStartTimer failed: " + startTimerError,
-                    effectiveQuestId,
-                    boundQuestId,
-                    commands,
-                    waitedMs
-                });
+                return timerFailure("questStartTimer failed: " + startTimerError, "AUTH_PENDING");
             } else {
-                return JSON.stringify({
-                    success: false,
-                    error: "questStartTimer failed: " + startTimerError,
-                    effectiveQuestId,
-                    boundQuestId,
-                    commands,
-                    waitedMs
-                });
+                return timerFailure("questStartTimer failed: " + startTimerError);
             }
         }
 
         if (startTimerResult && typeof startTimerResult === "object" && startTimerResult.success === false) {
             startTimerError = describeError(startTimerResult);
-            if (isKnownBenignQuestStartTimerError(startTimerResult) && hasRetryableQuestContext) {
+            const decision = acceptTimerRejection(startTimerResult);
+            if (decision === "accept") {
                 startTimerIgnored = true;
+                achievementTimerSkipped = enrolledHere && !questInfoBeforeMatches;
+            } else if (decision) {
+                return decision;
             } else if (isAuthPendingQuestStartTimerError(startTimerResult)) {
-                return JSON.stringify({
-                    success: false,
-                    errorCode: "AUTH_PENDING",
-                    error: "questStartTimer returned failure: " + startTimerError,
-                    effectiveQuestId,
-                    boundQuestId,
-                    commands,
-                    waitedMs
-                });
+                return timerFailure("questStartTimer returned failure: " + startTimerError, "AUTH_PENDING");
             } else {
-                return JSON.stringify({
-                    success: false,
-                    error: "questStartTimer returned failure: " + startTimerError,
-                    effectiveQuestId,
-                    boundQuestId,
-                    commands,
-                    waitedMs
-                });
+                return timerFailure("questStartTimer returned failure: " + startTimerError);
             }
         }
 
@@ -505,6 +518,8 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
             waitedMs,
             effectiveQuestId,
             boundQuestId,
+            enrolledHere,
+            achievementTimerSkipped,
             startTimerError: startTimerIgnored ? startTimerError : null,
             startTimerIgnored
         });
@@ -513,6 +528,108 @@ function buildInitActivityQuestJs(questId, allowedQuestIds = []) {
     }
 })()
 `;
+}
+
+function buildReadBoundQuestJs() {
+    return `
+(async () => {
+    ${JS_ACTIVITY_HELPERS}
+    try {
+        const sdk = window.discordSDK;
+        if (!sdk?.commands?.getQuest) {
+            return JSON.stringify({ success: true, boundQuestId: "" });
+        }
+        const info = await withTimeout(sdk.commands.getQuest(), DQH_COMMAND_TIMEOUT_MS, "getQuest");
+        return JSON.stringify({ success: true, boundQuestId: String(info?.quest_id || "") });
+    } catch (e) {
+        return JSON.stringify({ success: false, error: describeError(e), boundQuestId: "" });
+    }
+})()`;
+}
+
+function findWebpackExport(testFn) {
+    let wpRequire = null;
+    try {
+        if (typeof webpackChunkdiscord_app !== "undefined") {
+            wpRequire = webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
+            webpackChunkdiscord_app.pop();
+        }
+    } catch (_) {}
+    if (!wpRequire?.c) return null;
+    for (const mod of Object.values(wpRequire.c)) {
+        try {
+            const exp = mod?.exports;
+            if (!exp) continue;
+            if (testFn(exp)) return exp;
+            if (typeof exp === "object") {
+                for (const key of Object.keys(exp)) {
+                    const value = exp[key];
+                    if (value && testFn(value)) return value;
+                }
+            }
+        } catch (_) {}
+    }
+    return null;
+}
+
+function clickLeaveActivityButton() {
+    const leaveText = /leave\s*activity|stop\s*activity|end\s*activity|close\s*activity/i;
+    const candidates = Array.from(document.querySelectorAll(
+        "button, [role='button'], [aria-label]"
+    ));
+    const match = candidates.find(el => {
+        if (isPluginButton(el)) return false;
+        const label = `${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`;
+        return leaveText.test(label);
+    });
+    if (!match) return false;
+    match.click();
+    return true;
+}
+
+export async function readActivityBoundQuestId(applicationId) {
+    if (!applicationId || !isNativeAvailable()) return "";
+    if (!(await nativeHasActivityFrame(applicationId))) return "";
+    try {
+        const result = parseFrameResult(
+            await execInActivityFrame(applicationId, buildReadBoundQuestJs())
+        );
+        return String(result?.boundQuestId || "");
+    } catch (_) {
+        return "";
+    }
+}
+
+export async function closeActivityForApplication(applicationId, dispatcher) {
+    let closed = false;
+    try {
+        const store = findWebpackExport(value => typeof value?.getCurrentEmbeddedActivity === "function");
+        const activities = [];
+        const current = store?.getCurrentEmbeddedActivity?.();
+        if (current) activities.push(current);
+        const selfActivities = store?.getSelfEmbeddedActivities?.();
+        if (selfActivities?.values) {
+            for (const activity of selfActivities.values()) activities.push(activity);
+        }
+        const match = activities.find(activity =>
+            activity?.location
+            && activity?.applicationId
+            && (!applicationId || String(activity.applicationId) === String(applicationId))
+        );
+        if (match && dispatcher?.dispatch) {
+            dispatcher.dispatch({
+                type: "EMBEDDED_ACTIVITY_LEAVE",
+                location: match.location,
+                applicationId: match.applicationId,
+                showFeedback: false,
+                shouldClosePopout: true
+            });
+            closed = true;
+        }
+    } catch (_) {}
+
+    if (clickLeaveActivityButton()) closed = true;
+    return closed;
 }
 
 function buildQuestStartTimerOnlyJs(questId) {
@@ -555,6 +672,39 @@ function buildClickActivityStartJs() {
         } catch (e) {
             return JSON.stringify({ success: false, error: String(e) });
         }
+    })()`;
+}
+
+function buildPinActivityQuestJs(questId) {
+    const safeQuestId = JSON.stringify(String(questId));
+    return `(async () => {
+        const requestedQuestId = ${safeQuestId};
+        const sdk = window.discordSDK;
+        const commands = sdk && sdk.commands;
+        if (!commands || typeof commands.getQuest !== "function") {
+            return JSON.stringify({ success: false, error: "getQuest unavailable" });
+        }
+        if (commands.getQuest.__dqmPinned === requestedQuestId) {
+            return JSON.stringify({ success: true, pinned: true, already: true });
+        }
+        const original = commands.getQuest.bind(commands);
+        let probed = null;
+        try { probed = await original(); } catch (_) {}
+        const redirected = !probed || String(probed.quest_id || "") !== requestedQuestId;
+        async function pinnedGetQuest() {
+            let info = null;
+            try { info = await original(); } catch (_) {}
+            if (info && String(info.quest_id || "") === requestedQuestId) return info;
+            return {
+                quest_id: requestedQuestId,
+                enrolled_at: (info && info.enrolled_at) || new Date().toISOString(),
+                completed_at: null,
+                external_cta_url: (info && info.external_cta_url) || ""
+            };
+        }
+        pinnedGetQuest.__dqmPinned = requestedQuestId;
+        commands.getQuest = pinnedGetQuest;
+        return JSON.stringify({ success: true, pinned: true, redirected });
     })()`;
 }
 
@@ -940,6 +1090,9 @@ export function promptActivityLaunch(quest, t, onNavigateToQuest) {
 }
 
 function formatInitResultError(initResult, t) {
+    if (initResult?.errorCode === "STALE_ACTIVITY") {
+        return t("logActivityStale");
+    }
     if (initResult?.errorCode === "WRONG_ACTIVITY" || initResult?.questInfoMismatched) {
         return t("logActivityWrongApp");
     }
@@ -962,7 +1115,9 @@ function isQuestNotReadyError(initResult) {
 
 function isInitRetryableError(initResult) {
     if (!initResult || initResult.success) return false;
+    if (initResult.errorCode === "STALE_ACTIVITY") return false;
     if (initResult.errorCode === "WRONG_ACTIVITY" || initResult.questInfoMismatched) return false;
+    if (initResult.errorCode === "QUEST_NOT_IN_ACTIVITY") return false;
     if (initResult.errorCode === "AUTH_PENDING" || initResult.errorCode === "QUEST_PENDING") return true;
     if (isSdkNotReadyError(initResult)) return true;
     if (isQuestNotReadyError(initResult)) return true;
@@ -1006,6 +1161,7 @@ async function initActivityWithRetry(applicationId, questId, taskState, sleep, l
 
         if (!taskState.active) return null;
         if (initResult?.success) return initResult;
+        if (initResult?.errorCode === "STALE_ACTIVITY") return initResult;
 
         if (!isInitRetryableError(initResult)) {
             if (taskState.active) {
@@ -1136,9 +1292,9 @@ export function createActivityExecutors(deps) {
                 checkpointCount,
                 Math.max(0, Math.floor(Number(initialCompletedCheckpoints) || 0))
             );
-            // Full regional merge group is ONLY for iframe quest-id binding (allowed set).
-            // Progress / verify must use the active quest id alone — same as DQH.
-            const allowedQuestIds = [...new Set([questId, ...(duplicateQuestIds ?? [])].map(String))];
+            // Sibling ids must not drive the timer or progress. A completed regional
+            // listing stays a different quest even when it shares this activity.
+            void duplicateQuestIds;
 
             const remaining = Math.max(0, checkpointCount - completedCheckpoints);
             if (remaining === 0) {
@@ -1171,31 +1327,63 @@ export function createActivityExecutors(deps) {
                 return false;
             }
 
+            let stallRelaunchUsed = false;
+            const relaunchActivity = async () => {
+                if (!taskState.active || stallRelaunchUsed) return false;
+                stallRelaunchUsed = true;
+
+                log.info(`[${questName}] ${t("logActivityRelaunch")}`);
+                await closeActivityForApplication(applicationId, FluxDispatcher);
+                const goneDeadline = Date.now() + 5000;
+                while (Date.now() < goneDeadline && taskState.active) {
+                    if (!(await hasMatchingActivityFrame(applicationId))) break;
+                    await sleep(300);
+                }
+                if (!taskState.active) return false;
+                await launchQuestInDiscord(quest, log, t);
+                const ready = await waitForActivityIframe(
+                    applicationId,
+                    IFRAME_WAIT_MS,
+                    () => taskState.active,
+                    { log, t, questName }
+                );
+                return !!ready && taskState.active;
+            };
+
             const initResult = await initActivityWithRetry(
-                applicationId, questId, taskState, sleep, log, t, questName, allowedQuestIds
+                applicationId, questId, taskState, sleep, log, t, questName
             );
-            if (!initResult) return false;
+            if (!initResult?.success) return false;
             if (!taskState.active) return false;
 
-            const effectiveFromInit = initResult.effectiveQuestId || initResult.boundQuestId;
-            if (effectiveFromInit && allowedQuestIds.includes(String(effectiveFromInit))) {
-                const boundId = String(effectiveFromInit);
-                const boundProgress = resolveCompletedCheckpoints(
-                    boundId, taskName, checkpointCount, QuestsStore
-                );
-                const boundFlags = getQuestCompletionFlags(QuestsStore.quests.get(boundId));
-                // Adopt iframe-bound id only when that listing still needs work.
-                // Never switch onto a completed sibling and then fake-complete the card.
-                if (
-                    boundId === questId
-                    || (!boundFlags.isCompleted && !boundFlags.isClaimed && boundProgress < checkpointCount)
-                ) {
-                    questId = boundId;
-                }
+            const reportedQuestId = String(initResult.boundQuestId || "");
+            if (reportedQuestId && reportedQuestId !== String(questId)) {
+                log.info(`[${questName}] ${t("logActivitySiblingReported").replace("{id}", reportedQuestId)}`);
+            }
+            if (initResult.achievementTimerSkipped) {
+                log.info(`[${questName}] ${t("logActivityAchievementTimer")}`);
             }
 
-            // Benign SDK 4002 (questStartTimer) with valid iframe context: continue silently.
-            // Discord Launch Quest often already started the real timer; no user-facing warn.
+            let questPinLogged = false;
+            const pinListingQuest = async () => {
+                try {
+                    const pinResult = parseFrameResult(
+                        await execInActivityFrame(applicationId, buildPinActivityQuestJs(questId))
+                    );
+                    if (!questPinLogged && pinResult?.redirected) {
+                        questPinLogged = true;
+                        log.info(`[${questName}] ${t("logActivityQuestPinned")}`);
+                    }
+                    return pinResult;
+                } catch (_) {
+                    return null;
+                }
+            };
+            if (reportedQuestId && reportedQuestId !== String(questId)) {
+                await pinListingQuest();
+            }
+
+            // Timer stays on this listing. getQuest() may still name a sibling.
 
             // Active quest only — do not max() with regional siblings.
             try {
@@ -1274,7 +1462,7 @@ export function createActivityExecutors(deps) {
                 const waitStart = Date.now();
                 // At most 3 remaining logs, spaced at ~25% / 50% / 75% of this wait.
                 const feedbackMarks = [];
-                if (waitSecs >= 4) {
+                if (waitSecs >= 15) {
                     for (let m = 1; m <= CHECKPOINT_REMAINING_LOG_MAX; m++) {
                         feedbackMarks.push(Math.floor((waitSecs * m) / (CHECKPOINT_REMAINING_LOG_MAX + 1)));
                     }
@@ -1310,6 +1498,7 @@ export function createActivityExecutors(deps) {
                 if (!taskState.active) return false;
 
                 log.running(`[${questName}] ${t("logCheckpoint")}${checkpointNum}/${checkpointCount}`);
+                await pinListingQuest();
 
                 let dispatchResult;
                 try {
@@ -1356,6 +1545,25 @@ export function createActivityExecutors(deps) {
                         log.warn(`[${questName}] ${t("logActivityServerProgressPending")}`);
                         if (stalledDispatches >= 2 && confirmedProgress <= progressAtStart) {
                             if (!taskState.active) return false;
+                            if (!stallRelaunchUsed) {
+                                const relaunched = await relaunchActivity();
+                                if (!relaunched || !taskState.active) {
+                                    log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
+                                    return false;
+                                }
+                                const reinited = await initActivityWithRetry(
+                                    applicationId, questId, taskState, sleep, log, t, questName
+                                );
+                                if (!reinited?.success) {
+                                    if (taskState.active) {
+                                        log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
+                                    }
+                                    return false;
+                                }
+                                stalledDispatches = 0;
+                                i -= 1;
+                                continue;
+                            }
                             log.error(`[${questName}] ${t("logActivityProgressStalled")}`);
                             return false;
                         }

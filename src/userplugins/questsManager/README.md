@@ -1,6 +1,6 @@
 # Quests Manager (Vencord UserPlugin)
 
-Discord Quest Auto Completer â€” Vencord plugin (`v1.0.4`).
+Discord Quest Auto Completer — Vencord plugin (`v1.1.0`).
 
 ## Requirements
 
@@ -16,8 +16,8 @@ See: https://docs.vencord.dev/installing/custom-plugins/
 
 1. Double-click `Install-Vencord-Quests-Manager.bat` (works as a normal user or Administrator).
 2. Wait for Vencord clone, plugin install, build, and Discord patch.
-3. Enable **Quests Manager** under Settings â†’ Vencord â†’ Plugins.
-4. Open the Quests tab and click **Quests Manager**.
+3. Enable **Quests Manager** under Settings → Vencord → Plugins.
+4. Click the **Quests Manager** button in the Discord title bar.
 
 ### Manual
 
@@ -28,28 +28,30 @@ See: https://docs.vencord.dev/installing/custom-plugins/
    <Vencord>/src/userplugins/questsManager/
    ```
 4. Rebuild Vencord (`pnpm build`) and restart Discord.
-5. Enable the plugin and open Quests Manager from the Quests tab.
+5. Enable the plugin and open Quests Manager from the title bar.
 
 ## In-plugin updates
 
-The panel shows the current version (`v1.0.4`) and can check GitHub releases for newer builds. Use **Check update** / **Update now** to download `src.zip`, replace plugin files under your Vencord userplugins folder, rebuild, then fully restart Discord â€” no need to re-run the `.bat` for plugin-only updates.
+The panel shows the current version (`v1.1.0`) and can check GitHub releases for newer builds. Use **Check update** / **Update now** to download `src.zip`, replace plugin files under your Vencord userplugins folder, rebuild, then fully restart Discord — no need to re-run the `.bat` for plugin-only updates.
 
-## Tabs
+## Tabs and filters
 
-- **Incomplete** â€” not finished yet
-- **Claimable** â€” completed, waiting for **Claim reward**
-- **Completed** â€” reward already claimed
+- **Incomplete** — not finished yet
+- **Claimable** — completed, waiting for **Claim reward**
+- **Completed** — reward already claimed
+- **Type** filter on every tab, default **All** (Launch Quest, Play Game, Video, Stream, Other)
 
 ## Launch Quest workflow
 
 1. Click **Start** on the quest, then **Start Quest** in the dialog.
-2. If the activity is not already open, Quests Manager will auto-launch it in Discord.
+2. If the activity is not already open, Quests Manager will open it in Discord.
 3. Complete any authorization prompts in Discord when they appear.
-4. Wait up to ~90 seconds for the activity to load â€” checkpoints begin automatically.
+4. Wait for the activity to load. Checkpoints then run about every 6 seconds, the fastest pace Discord’s activity still accepts.
+5. A second listing of the same activity (for example a regional duplicate) stays on the card you started. An already completed sibling is not treated as this run.
 
 ## Notes
 
-- Disabling the plugin removes the button and closes/cleans up the panel.
-- Closing the panel with âœ• only hides it; the plugin stays enabled.
+- Disabling the plugin removes the button and closes the panel.
+- Closing the panel with ✕ only hides it; the plugin stays enabled.
 - Play / Stream quests need the Discord **desktop** app.
 - Launch Quest quests need `native.ts` bundled in your Vencord build.

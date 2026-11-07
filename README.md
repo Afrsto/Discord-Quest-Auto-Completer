@@ -1,44 +1,56 @@
 # Quests Manager
 
-**Discord Quest Auto Completer** — a Vencord userplugin that helps you enroll, track, and complete Discord Quests from a floating panel on the Quests tab.
+**Discord Quest Auto Completer** — a Vencord userplugin that enrolls, tracks, and completes Discord Quests from a panel opened by the **Quests Manager** button in the Discord title bar.
 
-**Current version:** `v1.0.4`
+**Current version:** `v1.1.0`
+
+![Quests Manager panel](docs/images/quests-manager-panel.jpg)
 
 ---
 
-## Features
+## What it does
 
-- Floating Quests Manager panel on Discord’s Quests page
-- Tabs: **Incomplete**, **Claimable** (ready to claim reward), **Completed**
-- Supported quest types: Video, Play on Desktop, Stream, Launch Quest (activity)
-- Batch “Complete All” for eligible enrolled quests
-- Country / region filters and Orbs stats
-- English and Arabic UI
-- **In-plugin updater** — check GitHub releases and install plugin updates without re-running the installer
-- One-click Windows installer (`Install-Vencord-Quests-Manager.bat`) for Vencord + plugin setup
+Open Discord, click the purple **Quests Manager** pill in the title bar, and work from one panel:
+
+- **Incomplete**, **Claimable**, and **Completed** tabs, each with live quest and Orb counts
+- A **Type** filter on every tab (All, Launch Quest, Play Game, Video, Stream, Other). The default is **All**
+- Country and region filtering, Orb totals, and a Nitro credit chip
+- English and Arabic
+- **Complete All** for eligible quests, plus per-quest Start and Stop
+- An in-plugin updater that installs the latest GitHub release without re-running the installer
+
+### Launch Quest
+
+Launch Quest listings (including a second listing for the same activity, such as a regional duplicate) complete from the card you click.
+
+1. Click **Start**, then **Start Quest**.
+2. Allow the activity to open and finish any Discord authorization prompt.
+3. Checkpoints run on their own. The default pace is **6 seconds**, the fastest gap that still reaches Discord. You can raise it in settings (6–600 seconds).
+
+Progress stays on the listing you started. A sibling listing that is already finished does not count as this run, and the card does not borrow that sibling’s progress.
+
+Video, desktop play, and stream quests are still completed from the same panel.
 
 ---
 
 ## Requirements
 
 - Discord **desktop** (Stable) on Windows
-- Custom Vencord built **from source** (userplugins are not loaded by installer-only Vencord)
+- Vencord **built from source** (installer-only Vencord does not load userplugins)
 - Node.js, Git, and pnpm (the `.bat` installer can set these up)
 
-Launch Quest (activity) quests require `native.ts` in a source-built Vencord install.
+Launch Quest needs `native.ts` inside that source build so the plugin can talk to the activity frame.
 
 ---
 
 ## Quick install (Windows)
 
-1. Download **`Install-Vencord-Quests-Manager.bat`** from the [latest release](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases/latest) (or clone this repository).
-2. Double-click **`Install-Vencord-Quests-Manager.bat`**.
-3. The installer works as a **normal user or Administrator**. Match Discord’s privilege level if patching fails.
-4. When finished:
-   - Wait for Discord to load
+1. Download **`Install-Vencord-Quests-Manager.bat`** from the [latest release](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases/latest).
+2. Double-click it. It works as a normal user or as Administrator. If patching fails, run it at the same privilege level as Discord.
+3. When Discord is back:
    - Open **Settings → Vencord → Plugins**
    - Enable **Quests Manager**
-   - Open the **Quests** tab and click **Quests Manager**
+   - Click **Quests Manager** in the title bar
 
 The installer clones Vencord to `%USERPROFILE%\Documents\Vencord`, installs this plugin from the latest GitHub release, builds, and patches Discord.
 
@@ -46,26 +58,23 @@ The installer clones Vencord to `%USERPROFILE%\Documents\Vencord`, installs this
 
 ## Manual install
 
-1. Clone [Vencord](https://github.com/Vencord/Vencord) and install dependencies (`pnpm install`).
-2. Copy `src/userplugins/questsManager/` into your Vencord tree:
-   ```
-   <Vencord>/src/userplugins/questsManager/
-   ```
+1. Clone [Vencord](https://github.com/Vencord/Vencord) and run `pnpm install`.
+2. Copy `src/userplugins/questsManager/` to `<Vencord>/src/userplugins/questsManager/`.
 3. Run `pnpm build` in the Vencord root.
-4. Patch Discord (use `patch-discord.mjs` from this repo, or your usual Vencord patch method).
+4. Patch Discord with `patch-discord.mjs` from this repo, or your usual Vencord patch method.
 5. Restart Discord and enable **Quests Manager**.
 
 ---
 
-## In-plugin updates
+## Updates
 
-The panel shows **`v1.0.4`** and can check [GitHub Releases](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases).
+The panel shows **`v1.1.0`** and checks [GitHub Releases](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases).
 
-1. Click **Check update**
-2. If a newer release has `src.zip`, click **Update now**
-3. Fully **restart Discord** after a successful update
+1. Click **Check update**.
+2. If a newer release includes `src.zip`, click **Update now**.
+3. Fully restart Discord.
 
-This updates plugin sources under your local Vencord userplugins folder and rebuilds Vencord — it does **not** re-run the full `.bat` installer.
+That replaces the plugin under your local Vencord userplugins folder and rebuilds Vencord. It does not re-run the full installer.
 
 ---
 
@@ -75,6 +84,7 @@ This updates plugin sources under your local Vencord userplugins folder and rebu
 ├── Install-Vencord-Quests-Manager.bat  # Windows installer
 ├── patch-discord.mjs                   # Discord Stable patcher
 ├── src/userplugins/questsManager/      # Vencord plugin source
+├── docs/images/                        # Panel screenshots
 ├── scripts/                            # Console / userscript build helpers
 ├── Quests Manager.txt                  # Optional DevTools paste script
 └── Quests Manager.user.js              # Optional Tampermonkey userscript
@@ -82,18 +92,7 @@ This updates plugin sources under your local Vencord userplugins folder and rebu
 
 ---
 
-## Launch Quest notes
-
-1. Click **Start**, then **Start Quest** in the dialog.
-2. Allow Quests Manager to open the quest page and click Discord’s Launch Quest button when needed.
-3. Complete authorization prompts in Discord.
-4. Wait for the activity frame — checkpoints run automatically.
-
-Close other Discord activities first so the correct activity iframe is targeted.
-
----
-
-## Contact & Community
+## Contact
 
 | Channel | Link | Role |
 |---------|------|------|
@@ -110,4 +109,4 @@ Close other Discord activities first so the correct activity iframe is targeted.
 
 ## License
 
-Plugin sources follow Vencord’s GPL-3.0-or-later SPDX headers where present. Use responsibly and at your own risk; this project is not affiliated with Discord.
+Plugin sources follow Vencord’s GPL-3.0-or-later SPDX headers where present. Use responsibly and at your own risk. This project is not affiliated with Discord.
