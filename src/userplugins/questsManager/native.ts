@@ -21,7 +21,7 @@ import { homedir } from "os";
 import path from "path";
 import { pipeline } from "stream/promises";
 import { promisify } from "util";
-import { app, BrowserWindow, IpcMainInvokeEvent, WebFrameMain, webFrameMain } from "electron";
+import { app, BrowserWindow, IpcMainInvokeEvent, WebFrameMain, webContents, webFrameMain } from "electron";
 import https from "https";
 import http from "http";
 
@@ -265,6 +265,23 @@ app.on("browser-window-created", (_, win) => {
 
 export async function hasActivityFrame(_: IpcMainInvokeEvent, applicationId: string): Promise<boolean> {
     return (await findMatchingFrame(applicationId)) != null;
+}
+
+/** Mute only this activity frame. Discord's own sounds stay on. */
+export async function muteActivityFrame(_: IpcMainInvokeEvent, applicationId: string): Promise<boolean> {
+    const frame = await findMatchingFrame(applicationId);
+    if (!frame) return false;
+    try {
+        const fromFrame = (webContents as { fromFrame?: (target: WebFrameMain) => { setAudioMuted?: (muted: boolean) => void } | null }).fromFrame;
+        const contents = typeof fromFrame === "function" ? fromFrame(frame) : null;
+        if (typeof contents?.setAudioMuted === "function") {
+            contents.setAudioMuted(true);
+            return true;
+        }
+    } catch {
+        /* The in-frame mute still runs from the renderer. */
+    }
+    return false;
 }
 
 export async function execInActivityFrame(

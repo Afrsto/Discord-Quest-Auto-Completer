@@ -205,6 +205,7 @@ declare const VencordNative: {
     pluginHelpers?: Record<string, {
         execInActivityFrame?: (applicationId: string, jsCode: string) => Promise<string | null>;
         hasActivityFrame?: (applicationId: string) => Promise<boolean>;
+        muteActivityFrame?: (applicationId: string) => Promise<boolean>;
     }>;
 };
 
@@ -630,6 +631,65 @@ export async function closeActivityForApplication(applicationId, dispatcher) {
 
     if (clickLeaveActivityButton()) closed = true;
     return closed;
+}
+
+/** Keep a Launch Quest activity silent for the whole run. Idempotent inside the frame. */
+function buildMuteActivityJs() {
+    return `(function(){
+        try {
+            var muteEl = function(el) {
+                try { el.muted = true; el.volume = 0; } catch (e) {}
+            };
+            var tick = function() {
+                try {
+                    var nodes = document.querySelectorAll("audio, video");
+                    for (var i = 0; i < nodes.length; i++) muteEl(nodes[i]);
+                    if (window.Howler) {
+                        try { window.Howler.mute(true); } catch (e) {}
+                        try { window.Howler.volume(0); } catch (e) {}
+                    }
+                    var app = window.pc && (window.pc.app || (window.pc.Application && window.pc.Application.getApplication && window.pc.Application.getApplication()));
+                    var sound = app && app.systems && app.systems.sound;
+                    if (sound) {
+                        try { sound.volume = 0; } catch (e) {}
+                        if (sound.manager) { try { sound.manager.volume = 0; } catch (e) {} }
+                    }
+                } catch (e) {}
+            };
+            if (!window.__dqmAudioMuted) {
+                window.__dqmAudioMuted = true;
+                try {
+                    var proto = HTMLMediaElement.prototype;
+                    var play = proto.play;
+                    proto.play = function() {
+                        muteEl(this);
+                        return play.apply(this, arguments);
+                    };
+                } catch (e) {}
+                window.__dqmMuteTimer = setInterval(tick, 500);
+            }
+            tick();
+            return JSON.stringify({ ok: true });
+        } catch (e) {
+            return "fail";
+        }
+    })()`;
+}
+
+export async function muteActivityAudio(applicationId) {
+    if (!applicationId || !isNativeAvailable()) return false;
+    let muted = false;
+    try {
+        const native = getNative();
+        if (typeof native?.muteActivityFrame === "function") {
+            muted = (await native.muteActivityFrame(applicationId)) === true;
+        }
+    } catch (_) {}
+    try {
+        const result = await execInActivityFrame(applicationId, buildMuteActivityJs());
+        if (result?.ok === true) muted = true;
+    } catch (_) {}
+    return muted;
 }
 
 function buildQuestStartTimerOnlyJs(questId) {
@@ -1420,6 +1480,16 @@ export function createActivityExecutors(deps) {
                 return false;
             }
             applicationId = matchedId;
+            if (await muteActivityAudio(applicationId)) {
+                log.info(`[${questName}] ${t("logActivityMuted")}`);
+            }
+
+            const closeFinishedActivity = async () => {
+                try {
+                    await closeActivityForApplication(applicationId, FluxDispatcher);
+                    log.info(`[${questName}] ${t("logActivityClosed")}`);
+                } catch (_) {}
+            };
 
             let stallRelaunchUsed = false;
             const relaunchActivity = async () => {
@@ -1449,6 +1519,7 @@ export function createActivityExecutors(deps) {
             );
             if (!initResult?.success) return false;
             if (!taskState.active) return false;
+            await muteActivityAudio(applicationId);
 
             const reportedQuestId = String(initResult.boundQuestId || "");
             if (reportedQuestId && reportedQuestId !== String(questId)) {
@@ -1654,6 +1725,7 @@ export function createActivityExecutors(deps) {
                                     }
                                     return false;
                                 }
+                                await muteActivityAudio(applicationId);
                                 stalledDispatches = 0;
                                 i -= 1;
                                 continue;
@@ -1684,6 +1756,7 @@ export function createActivityExecutors(deps) {
                 if (status?.completed) {
                     updateQuestProgress(quest.id, checkpointCount, checkpointCount);
                     logActualElapsed();
+                    await closeFinishedActivity();
                     return true;
                 }
 
@@ -1691,6 +1764,7 @@ export function createActivityExecutors(deps) {
                 if (live?.userStatus?.completedAt) {
                     updateQuestProgress(quest.id, checkpointCount, checkpointCount);
                     logActualElapsed();
+                    await closeFinishedActivity();
                     return true;
                 }
 

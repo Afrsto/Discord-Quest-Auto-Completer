@@ -19,6 +19,17 @@ const PLAN_INTERVAL_MONTH = 1;
 const PLAN_INTERVAL_YEAR = 2;
 const PLAN_INTERVAL_DAY = 3;
 const MS_PER_DAY = 86400000;
+const MS_PER_HOUR = 3600000;
+
+/** Discord client application that owns fractional / Orbs Nitro credits. */
+const DISCORD_APPLICATION_ID = "521842831262875670";
+
+/** Shop Orbs exclusives: 1 hour, 1 day, 3 day. Not a paid or gifted subscription. */
+const FRACTIONAL_SKU_MS = {
+    "1271583180566036480": MS_PER_HOUR,
+    "1298745361602449479": MS_PER_DAY,
+    "1333912750274904064": 3 * MS_PER_DAY,
+};
 
 function newUuid() {
     try {
@@ -95,7 +106,7 @@ function isNitroCreditEntitlement(item) {
     if (type === 2) return false;
     if (skuProductLine(item) === 1) return false;
     if (skuProductLine(item) === SKU_PRODUCT_LINE_FRACTIONAL_PREMIUM) return true;
-    if (entitlementSkuId(item) === NITRO_3DAY_SKU_ID) return true;
+    if (FRACTIONAL_SKU_MS[entitlementSkuId(item)]) return true;
     if (NITRO_CREDIT_ENTITLEMENT_TYPES.has(type)) return true;
     if (isQuestNitroCredit(item)) return true;
     return false;
@@ -103,6 +114,9 @@ function isNitroCreditEntitlement(item) {
 
 /** Banked credit duration in ms (unused inventory: no active ends_at yet). */
 function bankedCreditDurationMs(item) {
+    const skuMs = FRACTIONAL_SKU_MS[entitlementSkuId(item)];
+    if (skuMs) return skuMs;
+
     const plan = item?.subscription_plan || item?.subscriptionPlan || item?.sku?.subscription_plan;
     if (plan && Number.isFinite(Number(plan.interval_count ?? plan.intervalCount))) {
         const count = Math.max(0, Number(plan.interval_count ?? plan.intervalCount));
@@ -141,37 +155,57 @@ function utcCalendarDaysUntil(targetMs, now = Date.now()) {
     return Math.max(0, Math.round((bUtc - aUtc) / MS_PER_DAY));
 }
 
+function isPaidOrGiftSubscription(item) {
+    const type = Number(item?.type);
+    if (type === 2) return true;
+    if (skuProductLine(item) === 1) return true;
+    return false;
+}
+
 /**
- * Discord Nitro Home "Credits End In X Days":
- * max(active ends_at remaining) + sum(banked credit durations), as calendar days.
+ * Nitro Home "Credits End In N Days":
+ * the latest active fractional endsAt, plus unused 1-hour / 1-day / 3-day units.
+ * Paid and gifted Nitro subscriptions are ignored.
+ */
+function daysFromCreditEntitlements(records, now = Date.now()) {
+    const credits = [];
+    const seen = new Set();
+    for (const item of records || []) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        if (item.deleted === true || isPaidOrGiftSubscription(item)) continue;
+        const id = String(item.id || "");
+        if (id && seen.has(id)) continue;
+        if (id) seen.add(id);
+        credits.push(item);
+    }
+    if (!credits.length) return null;
+
+    const active = credits
+        .map(item => ({ item, end: endMsFrom(item) }))
+        .filter(entry => entry.end > now)
+        .sort((a, b) => b.end - a.end)[0] || null;
+
+    let extraMs = 0;
+    for (const item of credits) {
+        if (item.consumed === true) continue;
+        if (endMsFrom(item) > now) continue;
+        if (active && String(item.id || "") && String(item.id) === String(active.item.id || "")) continue;
+        extraMs += bankedCreditDurationMs(item);
+    }
+
+    const totalEnd = active ? active.end + extraMs : (extraMs > 0 ? now + extraMs : 0);
+    if (!totalEnd || totalEnd <= now) return null;
+    const days = utcCalendarDaysUntil(totalEnd, now);
+    return days > 0 ? days : 1;
+}
+
+/**
+ * Discord Nitro Home "Credits End In X Days" for Orbs / fractional credits only.
  */
 export function computeNitroDaysRemaining(sources, now = Date.now()) {
     const list = (Array.isArray(sources) ? sources : []).filter(isNitroCreditEntitlement);
     if (!list.length) return null;
-
-    let activeMs = 0;
-    let bankedMs = 0;
-
-    for (const item of list) {
-        const end = parseEndMs(
-            item.ends_at
-            || item.endsAt
-            || item.current_period_end
-            || item.currentPeriodEnd
-            || item.expires_at
-            || item.expiresAt
-        );
-        if (end > now) {
-            activeMs = Math.max(activeMs, end - now);
-            continue;
-        }
-        bankedMs += bankedCreditDurationMs(item);
-    }
-
-    const totalMs = activeMs + bankedMs;
-    if (totalMs <= 0) return null;
-    const days = utcCalendarDaysUntil(now + totalMs, now);
-    return days > 0 ? days : null;
+    return daysFromCreditEntitlements(list, now);
 }
 
 /** Parse "Credits End In N Days" from Nitro Home DOM if already visible (no navigation). */
@@ -214,8 +248,8 @@ export function parseNitroCreditsDaysFromDom(root = document) {
 }
 
 function endMsFrom(obj) {
-    if (!obj || typeof obj !== "object") return 0;
-    return parseEndMs(
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return 0;
+    const direct = parseEndMs(
         obj.ends_at
         || obj.endsAt
         || obj.current_period_end
@@ -227,6 +261,11 @@ function endMsFrom(obj) {
         || obj.entitlement?.expires_at
         || obj.entitlement?.expiresAt
     );
+    if (direct) return direct;
+    const start = parseEndMs(obj.starts_at || obj.startsAt || obj.entitlement?.starts_at || obj.entitlement?.startsAt);
+    const duration = bankedCreditDurationMs(obj.entitlement || obj);
+    if (start && duration) return start + duration;
+    return 0;
 }
 
 function unactivatedUnitDurationMs(unit) {
@@ -270,129 +309,205 @@ function collectStoreEntitlements(store) {
     return out;
 }
 
-/** Mirror Nitro Home via Discord EntitlementStore (same client data source). */
+function fractionalPremiumList(store) {
+    let raw = null;
+    try {
+        raw = store.getFractionalPremium({ includeEnded: false, excludeReverseTrial: true });
+    } catch (_) {
+        try { raw = store.getFractionalPremium(); } catch (_) {}
+    }
+    if (Array.isArray(raw)) return raw.filter(item => item && typeof item === "object");
+    if (raw && typeof raw === "object") return [raw];
+    return [];
+}
+
+/** Mirror Nitro Home via Discord EntitlementStore. getFractionalPremium() returns an array. */
 export function computeNitroDaysFromEntitlementStore(store, now = Date.now()) {
     if (!store || typeof store.getFractionalPremium !== "function") return null;
 
-    let activeMs = 0;
+    const records = [];
     try {
-        const active = store.getFractionalPremium();
-        const end = endMsFrom(active);
-        if (end > now) activeMs = end - now;
+        for (const item of fractionalPremiumList(store)) {
+            if (!isPaidOrGiftSubscription(item)) records.push(item);
+        }
     } catch (_) {}
 
-    let bankedMs = 0;
     try {
         const units = store.getUnactivatedFractionalPremiumUnits?.() ?? [];
         const list = Array.isArray(units) ? units : [];
-        for (const unit of list) bankedMs += unactivatedUnitDurationMs(unit);
+        for (const unit of list) {
+            const ent = unit?.entitlement && typeof unit.entitlement === "object" ? unit.entitlement : unit;
+            if (!isPaidOrGiftSubscription(ent)) records.push(ent);
+        }
     } catch (_) {}
 
-    if (activeMs + bankedMs <= 0) {
-        const fromGet = computeNitroDaysRemaining(collectStoreEntitlements(store), now);
-        if (fromGet != null) return fromGet;
-        return null;
-    }
+    const fromFractional = daysFromCreditEntitlements(records, now);
+    if (fromFractional != null) return fromFractional;
 
-    const days = utcCalendarDaysUntil(now + activeMs + bankedMs, now);
-    return days > 0 ? days : null;
+    const fromGet = computeNitroDaysRemaining(collectStoreEntitlements(store), now);
+    return fromGet != null ? fromGet : null;
 }
 
-function pickEntitlementFetchFn(actions, EntitlementStore) {
-    const candidates = [
-        actions?.fetchUserEntitlements,
-        actions?.fetchEntitlementsForUser,
-        actions?.fetchAllEntitlements,
-        EntitlementStore?.fetchUserEntitlements,
-        EntitlementStore?.fetchEntitlementsForUser,
-        EntitlementStore?.fetchAllEntitlements,
+let fractionalWarmupAt = 0;
+
+function warmEntitlementFetches(actions, EntitlementStore) {
+    const names = [
+        "fetchUserEntitlements",
+        "fetchEntitlementsForUser",
+        "fetchAllEntitlements",
+        "fetchApplicationEntitlements",
+        "fetchEntitlementsForApplication",
     ];
-    for (const fn of candidates) {
-        if (typeof fn === "function") return fn.bind(actions || EntitlementStore);
+    for (const src of [actions, EntitlementStore]) {
+        if (!src || (typeof src !== "object" && typeof src !== "function")) continue;
+        for (const key of names) {
+            let fn;
+            try { fn = src[key]; } catch (_) { continue; }
+            if (typeof fn !== "function") continue;
+            const attempts = [
+                () => fn.call(src),
+                () => fn.call(src, DISCORD_APPLICATION_ID),
+                () => fn.call(src, { applicationId: DISCORD_APPLICATION_ID, entitlementType: 11 }),
+            ];
+            for (const run of attempts) {
+                try {
+                    const result = run();
+                    if (result && typeof result.then === "function") result.catch(() => {});
+                } catch (_) {}
+            }
+        }
     }
-    return null;
 }
 
-export async function ensureEntitlementsLoaded(FluxDispatcher, EntitlementStore, EntitlementActions = null) {
+export async function ensureEntitlementsLoaded(FluxDispatcher, EntitlementStore, EntitlementActions = null, fresh = false) {
     if (!EntitlementStore) return;
+    if (!fresh && Date.now() - fractionalWarmupAt < 8000) return;
+    fractionalWarmupAt = Date.now();
 
-    if (EntitlementStore.fetchedAllEntitlements === true) return;
+    try { warmEntitlementFetches(EntitlementActions, EntitlementStore); } catch (_) {}
+    if (FluxDispatcher?.dispatch) {
+        try { FluxDispatcher.dispatch({ type: "ENTITLEMENTS_FETCH_FOR_USER" }); } catch (_) {}
+    }
 
-    try {
-        const fetchFn = pickEntitlementFetchFn(EntitlementActions, EntitlementStore);
-        if (fetchFn) {
-            await Promise.resolve(fetchFn());
-        } else if (FluxDispatcher?.dispatch) {
-            FluxDispatcher.dispatch({ type: "ENTITLEMENTS_FETCH_FOR_USER" });
-            FluxDispatcher.dispatch({ type: "ENTITLEMENTS_FETCH_ALL" });
-        }
-    } catch (_) {}
-
-    const deadline = Date.now() + 3500;
+    const deadline = Date.now() + 1200;
     while (Date.now() < deadline) {
-        if (EntitlementStore.fetchedAllEntitlements === true) return;
-        if (typeof EntitlementStore.getFractionalPremium === "function") {
-            try {
-                const active = EntitlementStore.getFractionalPremium();
-                const units = EntitlementStore.getUnactivatedFractionalPremiumUnits?.() ?? [];
-                if (active || (Array.isArray(units) && units.length)) return;
-            } catch (_) {}
-        }
+        try {
+            if (fractionalPremiumList(EntitlementStore).length) return;
+        } catch (_) {}
         await new Promise(r => setTimeout(r, 100));
     }
 }
 
-async function fetchAllEntitlements(apiGet) {
-    const all = [];
-    let after = null;
-    for (let page = 0; page < 20; page++) {
-        let url = "/users/@me/entitlements?exclude_ended=true&with_sku=true&limit=100";
-        if (after) url += `&after=${encodeURIComponent(after)}`;
-        const entRes = await apiGet({ url });
-        const entBody = entRes?.body;
-        const entitlements = Array.isArray(entBody)
-            ? entBody
-            : (Array.isArray(entBody?.entitlements) ? entBody.entitlements : []);
-        if (!entitlements.length) break;
-        all.push(...entitlements);
-        if (entitlements.length < 100) break;
-        const lastId = entitlements[entitlements.length - 1]?.id;
-        if (!lastId || String(lastId) === String(after)) break;
-        after = lastId;
-    }
-    return all;
+function entitlementListFromBody(body) {
+    if (Array.isArray(body)) return body;
+    if (Array.isArray(body?.entitlements)) return body.entitlements;
+    if (Array.isArray(body?.user_entitlements)) return body.user_entitlements;
+    return [];
 }
 
+let lastNitroDebug = "";
+export function getLastNitroDebug() {
+    return lastNitroDebug;
+}
+
+async function fetchOrbCreditEntitlements(apiGet) {
+    const skuIds = Object.keys(FRACTIONAL_SKU_MS).join(",");
+    // exclude_consumed defaults to true on the user-application route, which drops
+    // the credit that is already running. Ask for those records explicitly.
+    const urls = [
+        `/users/@me/applications/${DISCORD_APPLICATION_ID}/entitlements?exclude_consumed=false&sku_ids=${skuIds}`,
+        `/users/@me/applications/${DISCORD_APPLICATION_ID}/entitlements?exclude_consumed=false`,
+        `/users/@me/entitlements?with_sku=true&exclude_ended=true&entitlement_type=11`,
+        `/users/@me/entitlements?with_sku=true&exclude_ended=true&entitlement_type=12`,
+        `/users/@me/entitlements?with_sku=true&exclude_ended=false&entitlement_type=11`,
+        `/users/@me/entitlements?with_sku=true&exclude_ended=false&entitlement_type=12`,
+    ];
+    const merged = [];
+    const notes = [];
+    for (const url of urls) {
+        const label = url.includes("/applications/") ? "app" : `type${url.match(/entitlement_type=(\d+)/)?.[1] || "?"}`;
+        const ended = url.includes("exclude_ended=false") ? "-all" : "";
+        try {
+            const res = await apiGet({ url });
+            const list = entitlementListFromBody(res?.body ?? res);
+            merged.push(...list);
+            notes.push(`${label}${ended}:${list.length}`);
+        } catch (e) {
+            const status = e?.status || e?.body?.code || "err";
+            notes.push(`${label}${ended}:${status}`);
+        }
+    }
+    return { list: merged, notes };
+}
+
+let nitroDaysCache = { at: 0, days: null, known: false };
+
 /**
- * Nitro days without UI navigation:
- * 1) DOM badge if Nitro Home is already open
- * 2) EntitlementStore (same client data Nitro Home uses)
- * 3) Strict REST entitlements (background, no route change)
+ * Orbs Nitro credit days, without opening Nitro Home.
+ * Paid and gifted subscriptions are not counted.
+ * 1) EntitlementStore fractional credits
+ * 2) REST fractional / known Orbs SKUs
+ * 3) Nitro Home text only if that page is already open
  */
 export async function fetchNitroDaysRemaining(apiGet, {
     EntitlementStore = null,
     FluxDispatcher = null,
-    EntitlementActions = null
+    EntitlementActions = null,
+    fresh = false
 } = {}) {
-    const fromDomNow = parseNitroCreditsDaysFromDom();
-    if (fromDomNow != null) return fromDomNow;
+    if (!fresh && nitroDaysCache.known) {
+        const ttl = nitroDaysCache.days == null ? 4000 : 15000;
+        if (Date.now() - nitroDaysCache.at < ttl) return nitroDaysCache.days;
+    }
+
+    let days = null;
 
     if (EntitlementStore) {
-        await ensureEntitlementsLoaded(FluxDispatcher, EntitlementStore, EntitlementActions);
-        const fromStore = computeNitroDaysFromEntitlementStore(EntitlementStore);
-        if (fromStore != null) return fromStore;
+        await ensureEntitlementsLoaded(FluxDispatcher, EntitlementStore, EntitlementActions, fresh);
+        days = computeNitroDaysFromEntitlementStore(EntitlementStore);
     }
 
-    if (typeof apiGet === "function") {
+    let notes = [];
+    let matched = [];
+    if (days == null && typeof apiGet === "function") {
         try {
-            const entitlements = await fetchAllEntitlements(apiGet);
-            const bags = entitlements.filter(isNitroCreditEntitlement);
-            const fromRest = computeNitroDaysRemaining(bags);
-            if (fromRest != null) return fromRest;
-        } catch (_) {}
+            const fetched = await fetchOrbCreditEntitlements(apiGet);
+            notes = fetched.notes;
+            matched = fetched.list.filter(isOrbCreditRecord);
+            days = daysFromCreditEntitlements(matched);
+        } catch (e) {
+            notes.push(String(e?.status || e?.message || "fetch-failed"));
+        }
     }
 
-    return null;
+    if (days == null) {
+        days = parseNitroCreditsDaysFromDom();
+    }
+
+    if (days == null) {
+        const sample = matched.slice(0, 3).map(item => {
+            const sku = entitlementSkuId(item);
+            return `t${Number(item?.type) || 0}/${sku ? sku.slice(-4) : "nosku"}/e${endMsFrom(item) ? 1 : 0}/c${item?.consumed ? 1 : 0}`;
+        }).join(",");
+        let storeCount = 0;
+        try { storeCount = EntitlementStore ? fractionalPremiumList(EntitlementStore).length : 0; } catch (_) {}
+        lastNitroDebug = `Nitro credits unavailable (${notes.join(" ") || "no-request"}; match ${sample || "none"}; store ${storeCount})`;
+    } else {
+        lastNitroDebug = "";
+    }
+
+    nitroDaysCache = { at: Date.now(), days, known: true };
+    return days;
+}
+
+function isOrbCreditRecord(item) {
+    if (!item || typeof item !== "object" || item.deleted === true) return false;
+    if (isPaidOrGiftSubscription(item)) return false;
+    if (isNitroCreditEntitlement(item)) return true;
+    const type = Number(item.type);
+    if (type === 11 || type === 12) return true;
+    if (FRACTIONAL_SKU_MS[entitlementSkuId(item)]) return true;
+    return skuProductLine(item) === SKU_PRODUCT_LINE_FRACTIONAL_PREMIUM;
 }
 
 /**

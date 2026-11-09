@@ -25,6 +25,7 @@ import {
 import regionsSnapshotFile from "./regions.snapshot.json";
 import {
     fetchNitroDaysRemaining,
+    getLastNitroDebug,
     NITRO_3DAY_ORB_PRICE,
     purchaseThreeDayNitroCredit
 } from "./nitroOrbs";
@@ -196,6 +197,7 @@ export function mountQuestsManager() {
     let gameDetectHold = null;
     let userOrbsBalance = null;
     let userNitroDays = null;
+    let lastNitroDebugShown = "";
     let nitroPurchaseInFlight = false;
     /** Quests returned by /quests/@me that are missing from QuestsStore. */
     const apiQuestOverrides = new Map();
@@ -397,6 +399,8 @@ export function mountQuestsManager() {
             logActivityMissingAppId: "Activity quest is missing an application ID.",
             logActivityLaunchFirst: "Launching quest in Discord…",
             logActivityClosedOther: "Closed a different activity ({id}) so this Launch Quest can open.",
+            logActivityMuted: "Activity sound muted.",
+            logActivityClosed: "Activity closed.",
             logActivityNativeRequired: "Activity quests require a Vencord rebuild with native.ts. Run pnpm build and restart Discord.",
             logActivityFrameNotReady: "Activity frame not ready. Ensure the activity is fully loaded and authorized in Discord.",
             logActivityWrongApp: "Wrong activity is open. Close other activities and launch this quest's activity first.",
@@ -590,6 +594,8 @@ export function mountQuestsManager() {
             logActivityMissingAppId: "مهمة النشاط تفتقد معرف التطبيق.",
             logActivityLaunchFirst: "جاري تشغيل المهمة في ديسكورد…",
             logActivityClosedOther: "تم إغلاق نشاط مختلف ({id}) حتى تفتح مهمة التشغيل هذه.",
+            logActivityMuted: "تم كتم صوت النشاط.",
+            logActivityClosed: "تم إغلاق النشاط.",
             logActivityNativeRequired: "مهام النشاط تتطلب إعادة بناء Vencord مع native.ts. شغّل pnpm build وأعد تشغيل ديسكورد.",
             logActivityFrameNotReady: "إطار النشاط غير جاهز. تأكد من تحميل النشاط بالكامل والتفويض في ديسكورد.",
             logActivityWrongApp: "نشاط خاطئ مفتوح. أغلق الأنشطة الأخرى وشغّل نشاط هذه المهمة أولاً.",
@@ -3221,16 +3227,26 @@ export function mountQuestsManager() {
             : t("btnGetNitro");
     };
 
-    const fetchUserNitroDays = async () => {
-        userNitroDays = await fetchNitroDaysRemaining(apiGet, {
-            EntitlementStore,
-            FluxDispatcher,
-            EntitlementActions,
-        });
+    const fetchUserNitroDays = async (fresh = false) => {
+        try {
+            userNitroDays = await fetchNitroDaysRemaining(apiGet, {
+                EntitlementStore,
+                FluxDispatcher,
+                EntitlementActions,
+                fresh,
+            });
+            const nitroDebug = getLastNitroDebug();
+            if (nitroDebug && nitroDebug !== lastNitroDebugShown) {
+                lastNitroDebugShown = nitroDebug;
+                log.info(nitroDebug);
+            }
+        } catch (e) {
+            log.info("Nitro credits unavailable (" + errMsg(e) + ")");
+        }
         updateRunningStats();
     };
 
-    const fetchUserOrbsBalance = async () => {
+    const fetchUserOrbsBalance = async (freshNitro = false) => {
         try {
             const res = await apiGet({ url: "/users/@me/virtual-currency/balance" });
             const body = res?.body;
@@ -3246,7 +3262,7 @@ export function mountQuestsManager() {
                 ? "Orbs balance: Discord API module mismatch"
                 : `Orbs balance: ${msg}`);
         }
-        await fetchUserNitroDays();
+        await fetchUserNitroDays(freshNitro);
         updateRunningStats();
         updateNitroButtonState();
     };
@@ -3267,10 +3283,10 @@ export function mountQuestsManager() {
             const result = await purchaseThreeDayNitroCredit(apiPost);
             if (result.ok) {
                 log.success(t("logNitroSuccess"));
-                await fetchUserOrbsBalance();
+                await fetchUserOrbsBalance(true);
                 // Entitlement may lag the redeem response — refetch once more.
                 await sleep(1200);
-                await fetchUserNitroDays();
+                await fetchUserNitroDays(true);
             } else if (result.code === 100056 || result.error === "purchase_auth_required") {
                 log.error(t("logNitroAuthRequired"));
             } else {
@@ -3982,12 +3998,18 @@ export function mountQuestsManager() {
     }
 
     if (FluxDispatcher) {
-        const onEntitlementChange = () => { fetchUserNitroDays().catch(() => {}); };
-        for (const evt of ["ENTITLEMENTS_FETCH_FOR_USER_SUCCESS", "ENTITLEMENT_UPDATE"]) {
+        const onEntitlementChange = () => { fetchUserNitroDays(true).catch(() => {}); };
+        const entitlementEvents = [
+            "ENTITLEMENTS_FETCH_FOR_USER_SUCCESS",
+            "ENTITLEMENT_UPDATE",
+            "ENTITLEMENT_FETCH_APPLICATION_SUCCESS",
+            "VIRTUAL_CURRENCY_REDEEM_SUCCESS"
+        ];
+        for (const evt of entitlementEvents) {
             try { FluxDispatcher.subscribe(evt, onEntitlementChange); } catch (_) {}
         }
         activeCleanups.add(() => {
-            for (const evt of ["ENTITLEMENTS_FETCH_FOR_USER_SUCCESS", "ENTITLEMENT_UPDATE"]) {
+            for (const evt of entitlementEvents) {
                 try { FluxDispatcher.unsubscribe(evt, onEntitlementChange); } catch (_) {}
             }
         });
