@@ -770,6 +770,22 @@ function parseFrameResult(raw) {
     try { return JSON.parse(raw); } catch { return { success: false, error: String(raw) }; }
 }
 
+export function listActivityFrameApplicationIds() {
+    const ids = [];
+    const frames = document.querySelectorAll("iframe");
+    for (const frame of frames) {
+        const src = frame.src || frame.getAttribute("src") || "";
+        if (!src.includes("discordsays.com")) continue;
+        try {
+            const host = new URL(src).hostname;
+            const suffix = ".discordsays.com";
+            const id = host.endsWith(suffix) ? host.slice(0, -suffix.length) : "";
+            if (id && !ids.includes(id)) ids.push(id);
+        } catch (_) {}
+    }
+    return ids;
+}
+
 export function findActivityIframe(applicationId) {
     const iframes = document.querySelectorAll("iframe");
     for (const iframe of iframes) {
@@ -841,11 +857,22 @@ export async function hasMatchingActivityFrame(applicationId) {
     return nativeHasActivityFrame(applicationId);
 }
 
-export async function launchQuestInDiscord(quest, log, t) {
+export async function launchQuestInDiscord(quest, log, t, opts = {}) {
     const questName = quest.config.messages?.questName || quest.id;
+    const allowed = [...new Set(
+        [resolveQuestApplicationId(quest), ...(opts.allowedApplicationIds || [])]
+            .map(id => String(id || "").trim())
+            .filter(Boolean)
+    )];
+    for (const openId of listActivityFrameApplicationIds()) {
+        if (allowed.includes(openId)) continue;
+        log.info(`[${questName}] ${t("logActivityClosedOther").replace("{id}", openId)}`);
+        await closeActivityForApplication(openId, opts.dispatcher);
+        await new Promise(r => setTimeout(r, 600));
+    }
     await navigateToQuestPage(quest.id);
     await new Promise(r => setTimeout(r, 1500));
-    if (clickLaunchQuestButton()) {
+    if (clickLaunchQuestButton(quest)) {
         log.success(`[${questName}] ${t("logLaunchFound")}`);
         return true;
     }
@@ -857,20 +884,27 @@ export async function waitForActivityIframe(applicationId, timeoutMs = IFRAME_WA
     if (!isNativeAvailable()) return null;
 
     const { log, t, questName } = opts;
+    const allowed = [...new Set(
+        (Array.isArray(applicationId) ? applicationId : [applicationId])
+            .map(id => String(id || "").trim())
+            .filter(Boolean)
+    )];
     let domLogged = false;
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
         if (!isActive()) return null;
 
-        if (!domLogged && findActivityIframe(applicationId)) {
-            domLogged = true;
-            if (log && t && questName) {
-                log.info(`[${questName}] ${t("logActivityDomFound")}`);
+        for (const id of allowed) {
+            if (!domLogged && findActivityIframe(id)) {
+                domLogged = true;
+                if (log && t && questName) {
+                    log.info(`[${questName}] ${t("logActivityDomFound")}`);
+                }
             }
+            if (await nativeHasActivityFrame(id)) return id;
         }
 
-        if (await nativeHasActivityFrame(applicationId)) return true;
         await new Promise(r => setTimeout(r, 500));
     }
     return null;
@@ -955,38 +989,74 @@ function isPluginButton(btn) {
         || btn.classList.contains("dqm-action-launch");
 }
 
-export function clickLaunchQuestButton() {
-    const launchText = /launch\s*quest|start\s*quest|ouvrir\s*la\s*qu[eê]te|quest\s*starten|iniciar\s*misi[oó]n|iniciar\s*quest|퀘е?ст|запустить/i;
+const LAUNCH_BUTTON_TEXT = /launch\s*quest|start\s*quest|ouvrir\s*la\s*qu[eê]te|quest\s*starten|iniciar\s*misi[oó]n|iniciar\s*quest|запустить/i;
+const CLAIMED_CARD_TEXT = /you claimed|claimed this reward|reward claimed|لقد حصلت|تم المطالبة/i;
 
-    const allClickable = Array.from(document.querySelectorAll(
+function normalizeQuestLabel(value) {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\bquest\b/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function isLaunchButton(el) {
+    if (!el || isPluginButton(el)) return false;
+    const label = `${el.getAttribute?.("aria-label") || ""} ${el.innerText || el.textContent || ""}`.trim();
+    return LAUNCH_BUTTON_TEXT.test(label);
+}
+
+function findLaunchButtons(root) {
+    if (!root?.querySelectorAll) return [];
+    return Array.from(root.querySelectorAll(
         "button, a[role='button'], div[role='button'], [data-mana-component='button']"
-    )).filter(el => !isPluginButton(el));
+    )).filter(isLaunchButton);
+}
 
-    const byAria = allClickable.find(el => {
-        const label = (el.getAttribute("aria-label") || "").trim();
-        return /launch\s*quest/i.test(label) || /start\s*quest/i.test(label);
+function cardRootForLaunchButton(btn) {
+    let el = btn.parentElement;
+    let card = el;
+    for (let depth = 0; el && depth < 14; depth++) {
+        if (findLaunchButtons(el).length === 1) card = el;
+        const parent = el.parentElement;
+        if (parent && findLaunchButtons(parent).length > 1) break;
+        el = parent;
+    }
+    return card || btn;
+}
+
+export function clickLaunchQuestButton(quest) {
+    const buttons = findLaunchButtons(document);
+    const questId = String(quest?.id || "");
+    const name = normalizeQuestLabel(quest?.config?.messages?.questName || "");
+    if (!quest || (!questId && name.length < 3)) return false;
+
+    const matches = [];
+    for (const btn of buttons) {
+        const card = cardRootForLaunchButton(btn);
+        const text = `${card?.innerText || ""}`;
+        const haystack = `${text} ${card?.innerHTML || ""}`;
+        const nameHit = name.length >= 3 && normalizeQuestLabel(text).includes(name);
+        const idHit = questId.length > 0 && haystack.includes(questId);
+        if (!nameHit && !idHit) continue;
+        matches.push({
+            btn,
+            idHit,
+            claimed: CLAIMED_CARD_TEXT.test(text)
+        });
+    }
+
+    matches.sort((a, b) => {
+        if (a.idHit !== b.idHit) return a.idHit ? -1 : 1;
+        if (a.claimed !== b.claimed) return a.claimed ? 1 : -1;
+        return 0;
     });
-    if (byAria) {
-        byAria.click();
-        return true;
-    }
 
-    const byText = allClickable.find(el => launchText.test((el.innerText || el.textContent || "").trim()));
-    if (byText) {
-        byText.click();
-        return true;
-    }
-
-    // Fallback: any element with launch-quest-ish data attributes used by Discord quest-home
-    const byAttr = document.querySelector(
-        "[aria-label*='Launch Quest' i], [aria-label*='Start Quest' i]"
-    );
-    if (byAttr && !isPluginButton(byAttr)) {
-        byAttr.click();
-        return true;
-    }
-
-    return false;
+    const pick = matches[0];
+    if (!pick) return false;
+    pick.btn.click();
+    return true;
 }
 
 export function generateCheckpointTimes(checkpointCount, minSecs, maxSecs) {
@@ -1284,9 +1354,14 @@ export function createActivityExecutors(deps) {
             return taskState.active;
         },
 
-        async achievementActivity(quest, taskState, taskName, checkpointCount, initialCompletedCheckpoints, duplicateQuestIds = []) {
+        async achievementActivity(quest, taskState, taskName, checkpointCount, initialCompletedCheckpoints, duplicateQuestIds = [], allowedApplicationIds = []) {
             const questName = quest.config.messages?.questName || quest.id;
-            const applicationId = resolveQuestApplicationId(quest, taskName);
+            let applicationId = resolveQuestApplicationId(quest, taskName);
+            const allowedIds = [...new Set(
+                [applicationId, ...(allowedApplicationIds || [])]
+                    .map(id => String(id || "").trim())
+                    .filter(Boolean)
+            )];
             let questId = String(quest.id);
             let completedCheckpoints = Math.min(
                 checkpointCount,
@@ -1313,19 +1388,38 @@ export function createActivityExecutors(deps) {
                 return false;
             }
 
-            log.info(`[${questName}] ${t("logWaitingForActivity")}${applicationId}`);
-            const iframeReady = await waitForActivityIframe(
-                applicationId,
-                IFRAME_WAIT_MS,
+            log.info(`[${questName}] ${t("logWaitingForActivity")}${allowedIds.join(", ")}`);
+            let matchedId = await waitForActivityIframe(
+                allowedIds,
+                20000,
                 () => taskState.active,
                 { log, t, questName }
             );
-            if (!iframeReady) {
+            if (!matchedId && taskState.active) {
+                const foreign = listActivityFrameApplicationIds().find(id => !allowedIds.includes(id));
+                if (foreign) {
+                    log.info(`[${questName}] ${t("logActivityClosedOther").replace("{id}", foreign)}`);
+                    await closeActivityForApplication(foreign, FluxDispatcher);
+                    await sleep(700);
+                    await launchQuestInDiscord(quest, log, t, {
+                        allowedApplicationIds: allowedIds,
+                        dispatcher: FluxDispatcher
+                    });
+                }
+                matchedId = await waitForActivityIframe(
+                    allowedIds,
+                    IFRAME_WAIT_MS,
+                    () => taskState.active,
+                    { log, t, questName }
+                );
+            }
+            if (!matchedId) {
                 // User Stop already logged "Stopped." — do not add a false frame error.
                 if (!taskState.active) return false;
-                log.error(`[${questName}] ${t("logActivityFrameNotReady")} (${applicationId}) ${t("logActivityWaitHint")}`);
+                log.error(`[${questName}] ${t("logActivityFrameNotReady")} (${allowedIds.join(", ")}) ${t("logActivityWaitHint")}`);
                 return false;
             }
+            applicationId = matchedId;
 
             let stallRelaunchUsed = false;
             const relaunchActivity = async () => {

@@ -396,6 +396,7 @@ export function mountQuestsManager() {
             logActivityCheckpointsDone: "All checkpoints already submitted.",
             logActivityMissingAppId: "Activity quest is missing an application ID.",
             logActivityLaunchFirst: "Launching quest in Discord…",
+            logActivityClosedOther: "Closed a different activity ({id}) so this Launch Quest can open.",
             logActivityNativeRequired: "Activity quests require a Vencord rebuild with native.ts. Run pnpm build and restart Discord.",
             logActivityFrameNotReady: "Activity frame not ready. Ensure the activity is fully loaded and authorized in Discord.",
             logActivityWrongApp: "Wrong activity is open. Close other activities and launch this quest's activity first.",
@@ -588,6 +589,7 @@ export function mountQuestsManager() {
             logActivityCheckpointsDone: "تم إرسال جميع نقاط التفتيش مسبقًا.",
             logActivityMissingAppId: "مهمة النشاط تفتقد معرف التطبيق.",
             logActivityLaunchFirst: "جاري تشغيل المهمة في ديسكورد…",
+            logActivityClosedOther: "تم إغلاق نشاط مختلف ({id}) حتى تفتح مهمة التشغيل هذه.",
             logActivityNativeRequired: "مهام النشاط تتطلب إعادة بناء Vencord مع native.ts. شغّل pnpm build وأعد تشغيل ديسكورد.",
             logActivityFrameNotReady: "إطار النشاط غير جاهز. تأكد من تحميل النشاط بالكامل والتفويض في ديسكورد.",
             logActivityWrongApp: "نشاط خاطئ مفتوح. أغلق الأنشطة الأخرى وشغّل نشاط هذه المهمة أولاً.",
@@ -2664,16 +2666,40 @@ export function mountQuestsManager() {
                 .replace("{total}", String(checkpointCount))}`);
         }
 
+        const allowedApplicationIds = [];
+        const targetName = resolveQuestDisplayName(canonical).trim().toLowerCase();
+        for (const candidate of getAllStoreQuests()) {
+            if (!isLaunchQuestType(candidate)) continue;
+            if (resolveQuestDisplayName(candidate).trim().toLowerCase() !== targetName) continue;
+            const candidateId = resolveQuestApplicationId(
+                candidate,
+                resolveTaskName(candidate),
+                getTaskConfig(candidate)
+            );
+            if (candidateId) allowedApplicationIds.push(String(candidateId));
+        }
+        if (applicationId && !allowedApplicationIds.includes(applicationId)) {
+            allowedApplicationIds.unshift(applicationId);
+        }
+        const launchOpts = { allowedApplicationIds, dispatcher: FluxDispatcher };
+
         try {
-            await promptActivityLaunch(canonical, t, (q) => launchQuestInDiscord(q, log, t));
+            await promptActivityLaunch(canonical, t, (q) => launchQuestInDiscord(q, log, t, launchOpts));
         } catch (_) {
             taskState.active = false;
             return false;
         }
 
-        if (!(await hasMatchingActivityFrame(applicationId))) {
+        let alreadyOpen = false;
+        for (const id of allowedApplicationIds) {
+            if (await hasMatchingActivityFrame(id)) {
+                alreadyOpen = true;
+                break;
+            }
+        }
+        if (!alreadyOpen) {
             log.info(`[${questName}] ${t("logActivityLaunching")}`);
-            await launchQuestInDiscord(canonical, log, t);
+            await launchQuestInDiscord(canonical, log, t, launchOpts);
         }
 
         // duplicateIds: iframe binding allow-list only (not progress inflation).
@@ -2683,7 +2709,8 @@ export function mountQuestsManager() {
             taskName,
             checkpointCount,
             completedCheckpoints,
-            duplicateIds
+            duplicateIds,
+            allowedApplicationIds
         );
     };
 

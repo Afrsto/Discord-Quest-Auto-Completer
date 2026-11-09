@@ -2,7 +2,7 @@
 
 **Discord Quest Auto Completer** — a Vencord userplugin that enrolls, tracks, and completes Discord Quests from a panel opened by the **Quests Manager** button in the Discord title bar.
 
-**Current version:** `v1.1.0`
+**Current version:** `v1.1.1`
 
 ![Quests Manager panel](docs/images/quests-manager-panel.jpg)
 
@@ -25,7 +25,7 @@ Launch Quest listings (including a second listing for the same activity, such as
 
 1. Click **Start**, then **Start Quest**.
 2. Allow the activity to open and finish any Discord authorization prompt.
-3. Checkpoints run on their own. The default pace is **6 seconds**, the fastest gap that still reaches Discord. You can raise it in settings (6–600 seconds).
+3. Checkpoints run on their own. The default pace is **6 seconds**, the fastest gap that still reaches Discord. You can raise it in settings (6–600 seconds). The Launch Quest button that gets clicked is the one on this quest’s card. If another activity is already open, it is closed first.
 
 Progress stays on the listing you started. A sibling listing that is already finished does not count as this run, and the card does not borrow that sibling’s progress.
 
@@ -68,7 +68,7 @@ The installer clones Vencord to `%USERPROFILE%\Documents\Vencord`, installs this
 
 ## Updates
 
-The panel shows **`v1.1.0`** and checks [GitHub Releases](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases).
+The panel shows **`v1.1.1`** and checks [GitHub Releases](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases).
 
 1. Click **Check update**.
 2. If a newer release includes `src.zip`, click **Update now**.
