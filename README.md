@@ -2,7 +2,7 @@
 
 **Discord Quest Auto Completer** — a Vencord userplugin that enrolls, tracks, and completes Discord Quests from a panel opened by the **Quests Manager** button in the Discord title bar.
 
-**Current version:** `v1.1.2`
+**Current version:** `v1.1.3`
 
 ![Quests Manager panel](docs/images/quests-manager-panel.jpg)
 
@@ -14,7 +14,7 @@ Open Discord, click the purple **Quests Manager** pill in the title bar, and wor
 
 - **Incomplete**, **Claimable**, and **Completed** tabs, each with live quest and Orb counts
 - A **Type** filter on every tab (All, Launch Quest, Play Game, Video, Stream, Other). The default is **All**
-- Country and region filtering, Orb totals, and a Nitro credit chip that shows Orbs credit days on the account. A paid or gifted Nitro subscription is not included in that number.
+- Country and region filtering. The location chip follows the current IP, including a VPN, rather than the billing country. Orb totals, and a Nitro credit chip that shows Orbs credit days on the account. A paid or gifted Nitro subscription is not included in that number.
 - English and Arabic
 - **Complete All** for eligible quests, plus per-quest Start and Stop
 - An in-plugin updater that installs the latest GitHub release without re-running the installer
@@ -23,7 +23,7 @@ Open Discord, click the purple **Quests Manager** pill in the title bar, and wor
 
 Launch Quest listings (including a second listing for the same activity, such as a regional duplicate) complete from the card you click.
 
-1. Click **Start**, then **Start Quest**.
+1. Click **Activate** if the listing is not enrolled yet, then **Start** and **Start Quest**. Activate enrolls the listing on the card, even when another listing of the same Launch Quest is already enrolled.
 2. Allow the activity to open and finish any Discord authorization prompt.
 3. Checkpoints run on their own. The default pace is **6 seconds**, the fastest gap that still reaches Discord. You can raise it in settings (6–600 seconds). The Launch Quest button that gets clicked is the one on this quest’s card. If another activity is already open, it is closed first. The activity stays muted while it runs, and it closes when Discord confirms the quest is complete.
 
@@ -68,7 +68,7 @@ The installer clones Vencord to `%USERPROFILE%\Documents\Vencord`, installs this
 
 ## Updates
 
-The panel shows **`v1.1.2`** and checks [GitHub Releases](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases).
+The panel shows **`v1.1.3`** and checks [GitHub Releases](https://github.com/Afrsto/Discord-Quest-Auto-Completer/releases).
 
 1. Click **Check update**.
 2. If a newer release includes `src.zip`, click **Update now**.

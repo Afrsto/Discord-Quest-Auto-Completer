@@ -1,6 +1,6 @@
 # Quests Manager (Vencord UserPlugin)
 
-Discord Quest Auto Completer — Vencord plugin (`v1.1.2`).
+Discord Quest Auto Completer — Vencord plugin (`v1.1.3`).
 
 ## Requirements
 
@@ -32,7 +32,7 @@ See: https://docs.vencord.dev/installing/custom-plugins/
 
 ## In-plugin updates
 
-The panel shows the current version (`v1.1.2`) and can check GitHub releases for newer builds. Use **Check update** / **Update now** to download `src.zip`, replace plugin files under your Vencord userplugins folder, rebuild, then fully restart Discord — no need to re-run the `.bat` for plugin-only updates.
+The panel shows the current version (`v1.1.3`) and can check GitHub releases for newer builds. Use **Check update** / **Update now** to download `src.zip`, replace plugin files under your Vencord userplugins folder, rebuild, then fully restart Discord — no need to re-run the `.bat` for plugin-only updates.
 
 ## Tabs and filters
 
@@ -40,10 +40,11 @@ The panel shows the current version (`v1.1.2`) and can check GitHub releases for
 - **Claimable** — completed, waiting for **Claim reward**
 - **Completed** — reward already claimed
 - **Type** filter on every tab, default **All** (Launch Quest, Play Game, Video, Stream, Other)
+- Quest country follows the current IP, including a VPN. The billing country is not used while an IP country is known.
 
 ## Launch Quest workflow
 
-1. Click **Start** on the quest, then **Start Quest** in the dialog.
+1. Click **Activate** when the listing is not enrolled, then **Start** and **Start Quest**. Activate enrolls the listing on the card, even when another listing of the same Launch Quest is already enrolled.
 2. If the activity is not already open, Quests Manager will open it in Discord.
 3. Complete any authorization prompts in Discord when they appear.
 4. Wait for the activity to load. Checkpoints then run about every 6 seconds, the fastest pace Discord’s activity still accepts.

@@ -1074,18 +1074,20 @@ export function mountQuestsManager() {
     };
 
     const readCachedIpCountry = () => {
-        if (ipCountryMemory && (Date.now() - ipCountryMemory.fetchedAt) < IP_COUNTRY_TTL_MS) {
+        if (ipCountryMemory?.source === "ip" && (Date.now() - ipCountryMemory.fetchedAt) < IP_COUNTRY_TTL_MS) {
             return ipCountryMemory.code;
         }
         try {
             const raw = localStorage.getItem(STORAGE_LAST_IP_COUNTRY_KEY);
             if (!raw) return null;
             const parsed = JSON.parse(raw);
+            // Older builds cached the billing country here. That does not follow a VPN.
+            if (parsed?.source !== "ip") return null;
             if (!parsed?.code || !parsed?.fetchedAt) return null;
             if ((Date.now() - Number(parsed.fetchedAt)) >= IP_COUNTRY_TTL_MS) return null;
             const code = normalizeCountryCode(parsed.code);
             if (!code) return null;
-            ipCountryMemory = { code, fetchedAt: Number(parsed.fetchedAt) };
+            ipCountryMemory = { code, fetchedAt: Number(parsed.fetchedAt), source: "ip" };
             return code;
         } catch (_) {
             return null;
@@ -1095,7 +1097,7 @@ export function mountQuestsManager() {
     const writeCachedIpCountry = (code) => {
         const normalized = normalizeCountryCode(code);
         if (!normalized) return;
-        ipCountryMemory = { code: normalized, fetchedAt: Date.now() };
+        ipCountryMemory = { code: normalized, fetchedAt: Date.now(), source: "ip" };
         try {
             localStorage.setItem(STORAGE_LAST_IP_COUNTRY_KEY, JSON.stringify(ipCountryMemory));
         } catch (_) {}
@@ -1103,7 +1105,16 @@ export function mountQuestsManager() {
 
     const extractApiCountryCode = (res) => {
         const body = res?.body ?? res;
-        return normalizeCountryCode(body?.country_code ?? body?.countryCode ?? body?.country);
+        if (!body || typeof body !== "object") return "";
+        return normalizeCountryCode(
+            body.country_code
+            ?? body.countryCode
+            ?? body.geo_country_code
+            ?? body.geoCountryCode
+            ?? body.location?.country_code
+            ?? body.location?.countryCode
+            ?? body.country
+        );
     };
 
     const loadVpnBaseline = () => {
@@ -1156,26 +1167,56 @@ export function mountQuestsManager() {
         chip.title = countryDisplayName(normalized);
     };
 
-    const onIpCountryResolved = (code, { forceBaseline = false } = {}) => {
+    const retargetInferredCountries = (fromCode, toCode) => {
+        const from = normalizeCountryCode(fromCode);
+        const to = normalizeCountryCode(toCode);
+        if (!from || !to || from === to) return;
+        const map = loadInferredCountries();
+        for (const id of Object.keys(map)) {
+            if (normalizeCountryCode(map[id]) !== from) continue;
+            if (getCountryOverride(id) !== null) continue;
+            const catalog = getCatalogCountry(id);
+            if (catalog && catalog.mode !== "unknown") {
+                clearInferredCountry(id);
+                continue;
+            }
+            setInferredCountry(id, to);
+        }
+    };
+
+    const stampNewQuestsForCountry = (code, knownIds) => {
+        const normalized = normalizeCountryCode(code);
+        if (!normalized) return;
+        for (const id of collectCurrentQuestIds()) {
+            if (knownIds.has(id)) continue;
+            if (getCountryOverride(id) !== null) continue;
+            const catalog = getCatalogCountry(id);
+            if (catalog && catalog.mode !== "unknown") continue;
+            setInferredCountry(id, normalized);
+        }
+    };
+
+    const onIpCountryResolved = (code) => {
         const normalized = normalizeCountryCode(code);
         if (!normalized) {
             updateLocationChip(null);
             return;
         }
         const prev = currentIpCountry || loadVpnBaseline()?.country || null;
+        const previousBaseline = new Set(vpnBaselineIds);
         currentIpCountry = normalized;
         updateLocationChip(normalized);
 
         if (!prev) {
             saveVpnBaseline(normalized, collectCurrentQuestIds());
-            return;
+        } else if (prev !== normalized) {
+            // Quests that appeared after the last country are for this VPN exit.
+            stampNewQuestsForCountry(normalized, previousBaseline);
+            // Labels stamped with the previous exit (including a billing country) follow the VPN.
+            retargetInferredCountries(prev, normalized);
+            saveVpnBaseline(normalized, collectCurrentQuestIds());
         }
-        if (prev !== normalized || forceBaseline) {
-            if (prev !== normalized) {
-                // VPN country changed — only brand-new quests after this point infer as the new country.
-                saveVpnBaseline(normalized, collectCurrentQuestIds());
-            }
-        }
+        if (typeof scheduleRender === "function") scheduleRender();
     };
 
     const fetchIpCountry = async ({ force = false } = {}) => {
@@ -1191,24 +1232,24 @@ export function mountQuestsManager() {
 
         ipCountryPromise = (async () => {
             try {
-                try {
-                    const res = await apiGet({ url: "/users/@me/billing/country-code" });
-                    const code = extractApiCountryCode(res);
-                    if (code) {
-                        writeCachedIpCountry(code);
+                // location-metadata follows the current IP, including a VPN.
+                // Billing country is the payment country and stays put when the VPN changes.
+                const lookups = [
+                    "/auth/location-metadata",
+                    "/users/@me/billing/country-code"
+                ];
+                for (const url of lookups) {
+                    try {
+                        const res = await apiGet({ url });
+                        const code = extractApiCountryCode(res);
+                        if (!code) continue;
+                        const fromIp = url.includes("location-metadata");
+                        if (!fromIp && currentIpCountry) continue;
+                        if (fromIp) writeCachedIpCountry(code);
                         onIpCountryResolved(code);
                         return code;
-                    }
-                } catch (_) {}
-                try {
-                    const res = await apiGet({ url: "/auth/location-metadata" });
-                    const code = extractApiCountryCode(res);
-                    if (code) {
-                        writeCachedIpCountry(code);
-                        onIpCountryResolved(code);
-                        return code;
-                    }
-                } catch (_) {}
+                    } catch (_) {}
+                }
                 updateLocationChip(currentIpCountry);
                 return null;
             } finally {
@@ -2622,10 +2663,17 @@ export function mountQuestsManager() {
                 const live = QuestsStore.quests.get(q.id);
                 if (live) {
                     if (normalized.userStatus) {
+                        const incoming = normalized.userStatus;
+                        const previous = live.userStatus || {};
                         live.userStatus = {
-                            ...live.userStatus,
-                            ...normalized.userStatus,
-                            progress: normalized.userStatus.progress ?? live.userStatus?.progress
+                            ...previous,
+                            ...incoming,
+                            progress: incoming.progress ?? previous.progress,
+                            // A refresh that has not caught up yet must not wipe an enrollment
+                            // this panel just submitted.
+                            enrolledAt: incoming.enrolledAt || previous.enrolledAt || null,
+                            completedAt: incoming.completedAt || previous.completedAt || null,
+                            claimedAt: incoming.claimedAt || previous.claimedAt || null
                         };
                     }
                     // Prefer fresher config fields (names) when API provides them.
@@ -2831,16 +2879,12 @@ export function mountQuestsManager() {
         const questId = canonical.id;
         const name = resolveQuestDisplayName(canonical);
         const live = QuestsStore.quests.get(questId) || apiQuestOverrides.get(String(questId)) || canonical;
-        const group = getQuestDuplicateGroup(canonical);
-        const regionPeers = group.filter(questMatchesUserRegion);
-        const enrollPool = regionPeers.length ? regionPeers : [canonical];
+        const flags = getQuestCompletionFlags(live);
 
         if (acceptsInFlight.has(questId)) return false;
-        // Only skip if display listing or a region peer is already enrolled — not an out-of-region sibling.
-        if (getQuestCompletionFlags(canonical).isEnrolled
-            || enrollPool.some(q => getQuestCompletionFlags(q).isEnrolled)) {
-            return true;
-        }
+        // A merged Launch Quest card can show a listing that is not enrolled while a
+        // sibling listing already is. Enroll this listing. Do not treat the sibling as this click.
+        if (flags.isEnrolled || flags.isCompleted || flags.isClaimed) return true;
         if (isExpired(live)) return false;
 
         acceptsInFlight.add(questId);
@@ -2875,19 +2919,12 @@ export function mountQuestsManager() {
             }
             log.info(`[${name}] ${t("logActivatePending")}`);
 
-            const deadline = Date.now() + 5000;
+            const deadline = Date.now() + 1500;
             let confirmed = false;
             while (Date.now() < deadline) {
                 await refreshQuestsFromApi();
                 const updated = QuestsStore.quests.get(questId) || apiQuestOverrides.get(String(questId));
                 if (updated && getQuestCompletionFlags(updated).isEnrolled) {
-                    confirmed = true;
-                    break;
-                }
-                if (enrollPool.some(q => {
-                    const liveQ = QuestsStore.quests.get(q.id) || apiQuestOverrides.get(String(q.id));
-                    return liveQ && getQuestCompletionFlags(liveQ).isEnrolled;
-                })) {
                     confirmed = true;
                     break;
                 }
@@ -2898,9 +2935,10 @@ export function mountQuestsManager() {
                 log.success(`[${name}] ${t("logActivateSuccess")}`);
                 return true;
             }
-            clearOptimisticEnrollment(questId);
-            log.error(`[${name}] ${t("logActivateNotConfirmed")}`);
-            return false;
+            // The enroll request was accepted. Keep this listing enrolled while
+            // Discord's quest list catches up, instead of reverting the button.
+            log.success(`[${name}] ${t("logActivateSuccess")}`);
+            return true;
         } catch (e) {
             clearOptimisticEnrollment(questId);
             log.error(`[${name}] ${t("logActivateFailed")}${errMsg(e)}`);
@@ -3357,8 +3395,15 @@ export function mountQuestsManager() {
             b.className = "dqm-action-btn " + cls;
             b.textContent = label;
             b.setAttribute("aria-label", aria || label);
+            b.type = "button";
             b.disabled = disabled;
-            if (onClick) b.onclick = onClick;
+            if (onClick) {
+                b.onclick = (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    return onClick(event);
+                };
+            }
             actions.appendChild(b);
             return b;
         };
